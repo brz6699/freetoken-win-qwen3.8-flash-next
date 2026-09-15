@@ -66,7 +66,7 @@ ft.exe serve --host 0.0.0.0 --port 8001 `
   --kv-cache-dtype turbo4 --vision-on --moe-prefill-hit-d2d
 ```
 
-- `--num-tokens` — paged KV 池大小；1048576 对应 100 万 token 窗口（turbo4 下约 3 GiB 以内），524288 则换取更大的专家缓存。
+- `--num-tokens` — paged KV 池大小；1048576 对应 100 万 token 窗口（turbo4：≈6.9 KiB/token，满池约 6.8 GiB），524288 则换取更大的专家缓存（约 3.4 GiB）。
 - `--moe-cache-size` — GPU 内常驻专家数量（如上 2048 / 3072）。
 - `--kv-cache-dtype` — 见上文档位表。
 - `--vision-on` — 加载视觉塔（约 1 GiB bf16）；纯文本服务可省略。
@@ -100,7 +100,7 @@ MoE 缓存与解码速度（`ft ctl cache rebuild`，免重启）：槽位 1024 
 
 - **锁定上限**：WDDM 下驱动对 GPU 可访问的 pinned 宿主内存上限约为物理内存的一半；locked（工作集）页与 pinned 页共享同一预算。`FREETOKEN_PIN_BUDGET_GB` 应设为上限减去 locked 层占用之后的余量以下，并可在释放其他内存占用后逐步上调。
 - **locked ≠ pinned**：locked 权重组（头/尾部层）在 CPU 执行器上解码；pinned 权重组向 GPU 流式供数。pinned 越多解码越快；当 pinned 会超出上限时，locked 是兜底。
-- 若最后一个权重组启动时 OOM，先调小 `--num-tokens`（turbo4 在 512k token 下可将 KV 池压在约 3 GiB 以内），再调预算。
+- 若最后一个权重组启动时 OOM，先调小 `--num-tokens`（turbo4：≈6.9 KiB/token，512k 约 3.4 GiB，1M 约 6.8 GiB），再调预算。
 - **MTP 默认关闭**：实测 draft=3 时，验证开销高于主模型直接生成这些 token 的成本——单路解码从约 40–50 tok/s 降到约 30。显存本就紧张的场景下，MTP 机制与专家/KV 预算争夺同一份有限内存，净收益为负。本构建不使用 MTP。
 
 ## 验证套件
