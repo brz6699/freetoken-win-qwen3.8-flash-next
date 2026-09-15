@@ -8,7 +8,7 @@ Upstream is Apache-2.0; this branch keeps its LICENSE and copyright intact. See 
 
 - **1M-token context window** via the turbo4 KV tier
 - **3072 experts resident** in the on-GPU MoE cache
-- **4 concurrent requests** sustained
+- **4-way concurrency as the sweet spot** — aggregate throughput peaks around 77 tokens/s at 4–8 concurrent streams; evaluated on this rig, 4-way sustains stable operation and covers most workloads
 - **400 consecutive images** recognized end-to-end (content-keyed mm KV reuse)
 - **40–50 tokens/s** single-stream decode
 
