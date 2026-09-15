@@ -49,7 +49,9 @@ ft-venv\Scripts\pip install .
 ## Serve
 
 ```powershell
-$env:FREETOKEN_PIN_BUDGET_GB = "120"   # ~half of physical RAM is the WDDM pin ceiling
+# optional: only needed when expert weights exceed the pin budget (~half of RAM under WDDM);
+# omit it when the weights fit fully in RAM
+$env:FREETOKEN_PIN_BUDGET_GB = "120"
 
 # turbo4 + 1M KV + vision — longest-context profile
 ft.exe serve --host 0.0.0.0 --port 8001 `

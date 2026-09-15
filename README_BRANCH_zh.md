@@ -49,7 +49,9 @@ ft-venv\Scripts\pip install .
 ## 启动服务
 
 ```powershell
-$env:FREETOKEN_PIN_BUDGET_GB = "120"   # WDDM 下锁定内存上限约为物理内存的一半
+# 可选：仅当专家权重超出锁定预算（WDDM 下约为物理内存一半）时需要设置；
+# 权重可完全装入内存时无需此变量
+$env:FREETOKEN_PIN_BUDGET_GB = "120"
 
 # turbo4 + 1M KV + vision —— 超长上下文配置
 ft.exe serve --host 0.0.0.0 --port 8001 `
