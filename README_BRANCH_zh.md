@@ -58,14 +58,25 @@ ft-venv\Scripts\pip install .
 
 ```powershell
 $env:FREETOKEN_PIN_BUDGET_GB = "120"   # WDDM 下锁定内存上限约为物理内存的一半
+
+# turbo4 + 1M KV + vision —— 超长上下文配置
 ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model-path ./models/<checkpoint> `
-  --kv-cache-dtype turbo4 --moe-cache-auto --vision-on
+  --model ./models/Qwen3.8-Flash-Next-NVFP4 `
+  --num-tokens 1048576 --moe-cache-size 2048 `
+  --kv-cache-dtype turbo4 --vision-on --moe-prefill-hit-d2d
+
+# turbo4 + 512K KV + vision —— 更大常驻专家缓存（3072）
+ft.exe serve --host 0.0.0.0 --port 8001 `
+  --model ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
+  --num-tokens 524288 --moe-cache-size 3072 `
+  --kv-cache-dtype turbo4 --vision-on --moe-prefill-hit-d2d
 ```
 
+- `--num-tokens` — paged KV 池大小；1048576 对应 100 万 token 窗口（turbo4 下约 3 GiB 以内），524288 则换取更大的专家缓存。
+- `--moe-cache-size` — GPU 内常驻专家数量（如上 2048 / 3072）。
 - `--kv-cache-dtype` — 见上文档位表。
-- `--moe-cache-auto` — 依据剩余内存自动设定 GPU 侧专家 LRU 与 paged KV 池大小。
 - `--vision-on` — 加载视觉塔（约 1 GiB bf16）；纯文本服务可省略。
+- `--moe-prefill-hit-d2d` — prefill 阶段专家命中走 device-to-device 拷贝。
 
 之后按任意 OpenAI 兼容服务器的方式调用 `POST /v1/chat/completions` 即可。
 

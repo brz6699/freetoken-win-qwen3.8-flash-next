@@ -56,14 +56,25 @@ ft-venv\Scripts\pip install .
 
 ```powershell
 $env:FREETOKEN_PIN_BUDGET_GB = "120"   # ~half of physical RAM is the WDDM pin ceiling
+
+# turbo4 + 1M KV + vision — longest-context profile
 ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model-path ./models/<checkpoint> `
-  --kv-cache-dtype turbo4 --moe-cache-auto --vision-on
+  --model ./models/Qwen3.8-Flash-Next-NVFP4 `
+  --num-tokens 1048576 --moe-cache-size 2048 `
+  --kv-cache-dtype turbo4 --vision-on --moe-prefill-hit-d2d
+
+# turbo4 + 512K KV + vision — larger resident expert cache (3072)
+ft.exe serve --host 0.0.0.0 --port 8001 `
+  --model ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
+  --num-tokens 524288 --moe-cache-size 3072 `
+  --kv-cache-dtype turbo4 --vision-on --moe-prefill-hit-d2d
 ```
 
+- `--num-tokens` — paged KV pool size; 1048576 gives the 1M-token window (turbo4 keeps it under ~3 GiB), 524288 trades window for a bigger expert cache.
+- `--moe-cache-size` — number of experts resident on-GPU (2048 / 3072 above).
 - `--kv-cache-dtype` — see tier table above.
-- `--moe-cache-auto` — sizes the GPU-side expert LRU and the paged KV pool from remaining memory.
 - `--vision-on` — loads the vision tower (~1 GiB bf16); omit for text-only serving.
+- `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies.
 
 Then hit `POST /v1/chat/completions` as with any OpenAI-compatible server.
 
