@@ -99,6 +99,7 @@ Vision: with `--vision-on`, image requests cost only **+8ms** over text (cold TT
 - **Pin ceiling**: under WDDM the driver caps GPU-accessible pinned host memory at roughly half of physical RAM; locked (working-set) pages count against the same budget. Keep `FREETOKEN_PIN_BUDGET_GB` below the ceiling minus the locked-layer share, and raise it in steps after freeing other RAM consumers.
 - **Locked ≠ pinned**: locked banks (head/tail layers) decode on the CPU executor; pinned banks stream to the GPU. More pinned = faster decode; locking is the fallback when pinned would exceed the ceiling.
 - If startup OOMs on the last bank, lower `--num-tokens` first (turbo4 keeps the KV pool under ~3 GiB at 512k tokens), then the budget.
+- **MTP is off by design**: with draft=3, measured verification overhead exceeds the cost of the main model generating those tokens directly — single-stream decode drops from ~40–50 tok/s to ~30. Under a VRAM-constrained setup the MTP machinery competes with the expert/KV budgets for the same scarce memory, so net gain is negative. This build ships without MTP.
 
 ## Verification suite
 
