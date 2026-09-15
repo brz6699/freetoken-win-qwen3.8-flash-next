@@ -33,36 +33,36 @@ inline constexpr auto get_mem_package() {
     }
 }
 
-__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+__forceinline__ __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
 }
 
-__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+__forceinline__ __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
 }
 
-__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+__forceinline__ __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
 }
 
-__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+__forceinline__ __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
 }
 
-__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+__forceinline__ __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     asm volatile("st.global.wt.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
 }
 
-__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+__forceinline__ __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     uint32_t tmp2 = value.z;
@@ -70,7 +70,7 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
 
-__always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
+__forceinline__ __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
@@ -86,7 +86,7 @@ template <std::size_t kUnit>
 using mem_package_t = decltype(get_mem_package<kUnit>());
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads>
-__always_inline __device__ auto load_vec(const void* __restrict__ src) {
+__forceinline__ __device__ auto load_vec(const void* __restrict__ src) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -106,7 +106,7 @@ __always_inline __device__ auto load_vec(const void* __restrict__ src) {
 }
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads, typename Tp>
-__always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
+__forceinline__ __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -268,7 +268,7 @@ inline auto get_sync_flag_ptr(
 ) -> int32_t* {
     auto flag_dtype = host::SymbolicDType{};
     host::TensorMatcher({1})
-        .with_dtype<int32_t>(flag_dtype)
+        .with_dtype(flag_dtype)
         .with_device<kDLCUDA>(device)
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
@@ -353,7 +353,7 @@ struct FastIndexCopyKernel {
         .verify(dst);
 
         TensorMatcher({L})
-        .with_dtype<int32_t, int64_t>(indices_dtype)
+        .with_dtype(indices_dtype)
         .with_device<kDLCUDA>(device)
         .verify(src_indices)
         .verify(dst_indices);
@@ -362,7 +362,7 @@ struct FastIndexCopyKernel {
         if (num_indices.has_value()) {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
-                .with_dtype<int64_t>(num_indices_dtype)
+                .with_dtype(num_indices_dtype)
                 .with_device<kDLCUDA>(device)
                 .verify(num_indices_tensor);
 
@@ -529,14 +529,14 @@ struct MultiIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
 
-        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_dtype(ptr_dtype).with_device<kDLCUDA>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
-        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_dtype(indices_dtype).with_device<kDLCUDA>(device)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_dtype(num_indices_dtype).with_device<kDLCUDA>(device)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }

@@ -193,6 +193,25 @@ class LinearStatePool:
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
 
+    def snapshot_state(self, src: int) -> tuple:
+        """Host-RAM copy of one slot's whole-sequence state (conv + recurrent + declared
+        slot_states) -- the GDN half of the mm RAM tier. Small enough (~MB) to park next to
+        the KV rows without touching the pool's slot accounting."""
+        conv = self.conv_states[:, src].cpu().clone()
+        rec = self.recurrent_states[:, src].cpu().clone()
+        extras = {name: t[:, src].cpu().clone() for name, t in self.slot_states.items()}
+        return (conv, rec, extras)
+
+    def restore_state(self, dst: int, snap: tuple) -> None:
+        """Write a ``snapshot_state`` payload into slot ``dst`` (host -> device). Runs on the
+        engine stream before the first forward that reads ``dst``."""
+        conv, rec, extras = snap
+        self.conv_states[:, dst].copy_(conv)
+        self.recurrent_states[:, dst].copy_(rec)
+        for name, t in extras.items():
+            if name in self.slot_states:
+                self.slot_states[name][:, dst].copy_(t)
+
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
 

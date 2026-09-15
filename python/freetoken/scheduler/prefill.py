@@ -43,6 +43,10 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    # The FRESH-pass budget this adder was seeded from. A multimodal prompt only ever
+    # overruns THIS pass's leftover budget (admission already rejects ones over the
+    # full budget), so against this number "will fit on a fresh pass" is decidable.
+    full_budget: int = 0
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
@@ -90,6 +94,15 @@ class PrefillAdder:
                 return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
+        # mm RAM tier: an exact content-key hit whose boundary beats the tree match promotes
+        # the parked KV/GDN state into fresh pages here (after the budget gates and the
+        # table_idx claim, so every bail path above stays leak-free).
+        if req.mm_embeds is not None and req.mm_cache_key is not None:
+            mr = self.cache_manager.restore_mm(req, mr)
+            handle = mr.cuda_handle
+            cached_len = handle.cached_len
+            extend_len = req.input_len - cached_len
+            req.mm_gdn = mr.gdn_host
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             device_ids.copy_(_maybe_pinned(req.input_ids[:cached_len]), non_blocking=True)
@@ -172,10 +185,27 @@ class PrefillAdder:
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
         if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
+            # An mm prompt's vision soft tokens splice at the pad span, so it must be
+            # admitted whole in one chunk. A prompt over the FRESH-pass budget can never
+            # be scheduled and was already rejected at admission (scheduler
+            # _process_one_msg -> ErrorReplyMsg); reaching this point means only THIS
+            # pass's leftover budget or the swa cap is short. Give the charges back and
+            # let it retry at the head of a fresh pass instead of dying mid-pass (the
+            # old raise took the whole scheduler process down with it).
+            self.token_budget += chunk_size
+            self.reserved_size -= remain_len + pending_req.output_len
+            if self.cache_manager.swa_paged:
+                ps = self.cache_manager.page_size
+                self.reserved_swa -= (
+                    div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
+                ) * ps
+            if remain_len > self.full_budget:
+                raise NotImplementedError(
+                    "Multimodal prompt over the single-chunk prefill limit reached the "
+                    "adder; admission should have rejected it (increase "
+                    "--max-extend-tokens or shrink the prompt)."
+                )
+            return None
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -185,6 +215,11 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            mm_mrope=pending_req.mm_mrope,
+            mm_cache_key=pending_req.mm_cache_key,
+            mm_mrope_base=(
+                int(pending_req.mm_mrope.max()) + 1 if pending_req.mm_mrope is not None else 0
+            ),
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -192,6 +227,7 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
+        req.mm_gdn = pending_req.mm_gdn  # mm RAM tier host state (None unless a tier hit)
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -245,7 +281,14 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                mm_mrope=getattr(req, "mm_mrope", None),
+                mm_cache_key=getattr(req, "mm_cache_key", None),
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
@@ -258,6 +301,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            full_budget=prefill_budget,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

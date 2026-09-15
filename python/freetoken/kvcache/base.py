@@ -25,13 +25,23 @@ def spec_kv_bytes_per_token(spec, config) -> int:
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
-    per_token = (
-        (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
-        * spec.num_layers
-    )
+    slabs = 1 if spec.mla else 2  # MLA latent groups store one slab (V aliases K)
+    heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+    if getattr(config, "kv_cache_dtype", "bf16") == "turbo4":
+        # 4-bit TurboQuant: head_dim/2 packed-nibble BYTES plus one bf16 dequant scale per
+        # (token, head, slab). uint8's itemsize would double-count the nibbles, so the
+        # arithmetic is spelled out; the engine gate keeps turbo4 off MLA/DSA/BSA pools.
+        per_token = slabs * (spec.head_dim // 2 + 2) * heads * spec.num_layers
+    else:
+        # paged-KV STORAGE itemsize: fp8 (--kv-cache-dtype) halves this term; the trailing
+        # index-key term below stays bf16 (indexer keys are never quantized).
+        per_token = (
+            slabs
+            * spec.head_dim
+            * heads
+            * getattr(config, "kv_dtype", config.dtype).itemsize
+            * spec.num_layers
+        )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 
@@ -194,6 +204,9 @@ class MatchResult(NamedTuple):
     # Hybrid (GDN) models: the restored GDN state snapshot slot for this prefix (None = cold /
     # non-hybrid). Surfaced by HybridRadixCache via CacheManager.match_req.
     mamba_value: int | None = None
+    # mm RAM tier: host-side GDN state snapshot (LinearStatePool.snapshot_state payload)
+    # paired with a tier-restored KV prefix; written into the live slot on the first forward.
+    gdn_host: object = None
     # TODO: support HiCache
 
 

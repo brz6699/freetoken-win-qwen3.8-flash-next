@@ -63,6 +63,8 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_dtype: torch.dtype | None = None,
+        kv_quant: str | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -98,6 +100,8 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_dtype=kv_dtype,
+            kv_quant=kv_quant,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -178,6 +182,20 @@ class QSAKVCache(MHAKVCache):
         )
         return kv + slab // tokens, swa
 
+    def snapshot_rows(self, slots: torch.Tensor) -> dict[str, torch.Tensor]:
+        # The compressed index rows are a 1/ratio shadow of the K/V slots (slot // ratio),
+        # so they must ride the tier together with the K/V rows. The pending ring is
+        # transient (rebuilt per forward, and a page-aligned boundary never splits a group).
+        out = super().snapshot_rows(slots)
+        rows = slots.to(torch.int64).to(self._device) // self._index_ratio
+        out["cmp"] = self._cmp_k_buffer[:, rows].cpu()
+        return out
+
+    def restore_rows(self, slots: torch.Tensor, data: dict[str, torch.Tensor]) -> None:
+        super().restore_rows(slots, data)
+        rows = slots.to(torch.int64).to(self._device) // self._index_ratio
+        self._cmp_k_buffer.index_copy_(1, rows, data["cmp"])
+
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""
         return self._cmp_k_buffer[slot]
@@ -191,6 +209,13 @@ class QSAKVCache(MHAKVCache):
         """First scratch row of ``cmp_k_cache``; row ``cmp_scratch_base + table_idx`` sinks a
         forward whose group does not close."""
         return self._cmp_scratch_base
+
+    @property
+    def index_dtype(self) -> torch.dtype:
+        """Compute dtype of the index tiers (slab/ring), even when the paged K/V slabs
+        are fp8 (--kv-cache-dtype): callers sizing pooled/indexer scratch use this,
+        never the pool-wide ``dtype`` (which follows the K/V storage)."""
+        return self._index_dtype
 
     @property
     def index_ratio(self) -> int:

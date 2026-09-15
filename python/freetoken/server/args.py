@@ -227,6 +227,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["bf16", "fp8_e4m3", "turbo4"],
+        help=(
+            "Paged KV pool storage dtype. 'fp8_e4m3' halves the KV pool (write-side "
+            "saturating quantization, attention compute stays bf16). 'turbo4' halves it "
+            "again (TurboQuant 4-bit: nibble-packed codebook indices + per-token dequant "
+            "scale, rotspace Hadamard rotation). QSA models (Qwen3.8-Flash-Next) only. "
+            "Indexer keys always stay bf16."
+        ),
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,
@@ -478,16 +492,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--ple-backend",
-        default=ServerArgs.ple_backend,
-        choices=["pinned", "disk"],
-        help=(
-            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
-            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
-        ),
-    )
-
-    parser.add_argument(
         "--nvfp4-backend",
         default=ServerArgs.nvfp4_backend,
         choices=["auto", "marlin", "flashinfer", "triton"],
@@ -626,6 +630,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--vision-on",
+        action="store_true",
+        help=(
+            "Load the vision tower for multimodal checkpoints (e.g. Qwen3.8-Flash-Next): "
+            "accepts image inputs and adds ~0.84 GiB of ViT weights to VRAM. Off by default "
+            "(text-only, the VRAM goes to KV / expert cache). FREETOKEN_LOAD_VISION=1 also works."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -643,6 +657,11 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if kwargs.pop("vision_on"):
+        # The vision gate is a plain env read (vision_load_enabled); set it here, in this
+        # serve process, so the spawned scheduler/tokenizer workers inherit it too.
+        os.environ["FREETOKEN_LOAD_VISION"] = "1"
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

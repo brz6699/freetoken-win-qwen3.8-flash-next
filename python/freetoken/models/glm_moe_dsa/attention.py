@@ -93,16 +93,14 @@ class GlmDsaIndexer(BaseOP):
 
     def compute(
         self, x: torch.Tensor, q_resid: torch.Tensor, positions: torch.Tensor
-    ) -> "DSAIndexerInputs":
-        """Per-token indexer projections: q [T, H, D], k [T, D], weights [T, H] fp32."""
-        from freetoken.attention.dsa import DSAIndexerInputs
-
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-token indexer projections: (q [T, H, D], k [T, D], weights [T, H] fp32)."""
         t = x.shape[0]
         q = self.wq_b.forward(q_resid).view(t, self.n_heads * self.head_dim)
         k = self.k_norm.forward(self.wk.forward(x)).view(t, self.head_dim)
         q, k = self._rope.forward(positions, q, k)
         w = self.weights_proj.forward(x).float() * (self.n_heads**-0.5)
-        return DSAIndexerInputs(q=q.view(t, self.n_heads, self.head_dim), k=k, w=w)
+        return q.view(t, self.n_heads, self.head_dim), k, w
 
 
 class GlmMoeDsaAttention(BaseOP):
@@ -215,7 +213,7 @@ class GlmMoeDsaAttention(BaseOP):
         # DSA: full layers hand the backend this token's indexer projections (the
         # backend caches the keys, scores the history, and selects top-k); shared
         # layers pass None and reuse their group leader's selection.
-        indexer_inputs = (
+        indexer_qkw = (
             self.indexer.compute(x, q_a_resid, ctx.batch.positions)
             if self.indexer is not None and getattr(ctx.attn_backend, "dsa_enabled", False)
             else None
@@ -225,7 +223,7 @@ class GlmMoeDsaAttention(BaseOP):
         # concatenated latent copy on the hot path.
         o_latent = ctx.attn_backend.mla_forward(
             q_absorbed.contiguous(), q_rope.contiguous(), c_kv.contiguous(),
-            k_rope.contiguous(), self.layer_id, ctx.batch, indexer_inputs=indexer_inputs,
+            k_rope.contiguous(), self.layer_id, ctx.batch, indexer_qkw=indexer_qkw,
         )  # [T, H, kv_lora_rank]
 
         # Absorb kv_b's v-part onto the output: o_latent[H,T,lora] @ W_uv_t[H,lora,v].

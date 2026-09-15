@@ -25,19 +25,35 @@ class SingleInstance:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
-
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock(fd)
         except OSError as exc:
             os.close(fd)
             raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())
+        pid_bytes = f"{os.getpid()}\n".encode()
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, pid_bytes)
+        # never truncate below the locked range (Windows byte-range locks die with their bytes)
+        os.ftruncate(fd, len(pid_bytes))
         os.fsync(fd)
         self._fd = fd
+
+    @staticmethod
+    def _lock(fd: int) -> None:
+        try:
+            import fcntl
+        except ImportError:
+            # Windows: no fcntl — lock the pidfile's first byte with msvcrt instead.
+            import msvcrt
+
+            if os.lseek(fd, 0, os.SEEK_END) == 0:
+                os.write(fd, b" ")  # give the lock a byte to hold
+                os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def release(self) -> None:
         if self._fd is not None:

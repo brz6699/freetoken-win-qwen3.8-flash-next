@@ -386,7 +386,8 @@ class ServeManager:
             if not child.reaped.is_set():
                 self._signal(child.pid, signal.SIGTERM)
                 if not child.reaped.wait(timeout=grace):
-                    self._signal(child.pid, signal.SIGKILL)
+                    # no SIGKILL on Windows; SIGTERM there already terminates via TerminateProcess
+                    self._signal(child.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
                     if not child.reaped.wait(timeout=self._reap_wait_s):
                         raise RuntimeError(
                             f"serve pid={child.pid} did not exit after SIGKILL"

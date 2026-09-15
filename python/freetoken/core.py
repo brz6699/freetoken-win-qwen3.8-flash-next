@@ -43,6 +43,18 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # M-RoPE 3-channel positions ([prompt_len, 3] int32 cpu: t/h/w per prompt token)
+    # for image-bearing requests; None for text-only. Decode steps past the prompt use
+    # mm_mrope_base + (index - prompt_len) on all three channels (HF rope_deltas rule).
+    mm_mrope: torch.Tensor | None = None
+    mm_mrope_base: int = 0
+    # P4: content-addressed prefix-cache key (input_ids with image_pad runs -> payload-hash
+    # id); the cache manager keys mm match/insert on this so identical images reuse KV and
+    # different images never false-match. None for text and for keyless offline mm.
+    mm_cache_key: torch.Tensor | None = None
+    # mm RAM tier: host GDN state snapshot (LinearStatePool.snapshot_state payload) paired
+    # with a tier-restored KV prefix; consumed by Scheduler._restore_linear_states.
+    mm_gdn: tuple | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -135,6 +147,10 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Per-token M-RoPE positions [T, 3] int32 (t/h/w channels) when ANY request in this
+    # batch carries an image; None (text fast path) otherwise. positions stays the 1-D
+    # logical/token-slot index regardless -- rope consumers read this instead.
+    mrope_positions: torch.Tensor | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

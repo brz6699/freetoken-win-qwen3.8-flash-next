@@ -118,6 +118,20 @@ def signal_group(pid: int, sig: int) -> None:
     (the group-leader invariant of our own spawn) before ``killpg``; on any mismatch or lookup
     failure it falls back to signalling just the pid, so a re-adopted process with an unexpected
     group is never able to make us nuke an innocent group."""
+    if os.name == "nt":
+        # No process groups/signals on Windows: terminate the whole tree (mp-spawned workers
+        # survive a bare TerminateProcess of the parent and would leak RAM/VRAM).
+        import subprocess
+
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):  # pragma: no cover - defensive
+            pass
+        return
     pgid = proc_pgid(pid)
     try:
         if pgid is not None and pgid == pid:

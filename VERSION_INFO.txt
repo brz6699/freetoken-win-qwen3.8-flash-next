@@ -1,0 +1,3 @@
+FreeToken 0.1.2+g816c324d0  (P4 stage deliverable)
+kernel cache wheel: freetoken_kernel_cache-0.1.2+cu130.g816c324d0 (unchanged, separate)
+packed: 2026-09-14 (Round-6: mm RAM tier KV swap-in/out); P4 changes are pure Python.

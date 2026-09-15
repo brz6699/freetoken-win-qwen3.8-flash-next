@@ -216,19 +216,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 "Use --attention-backend fi (or triton) instead."
             )
 
-    if required & {AttnType.MLA, AttnType.DSA}:
-        # Plain MLA/DSA runs on page_size 1; the kpool indexer layout needs 64.
-        _kpool_ratio = max(
-            (s.index_ratio for s in model_config.kv_cache_group_specs() if s.mla),
-            default=1,
+    if required & {AttnType.MLA, AttnType.DSA} and config.page_size != 1:
+        # The MLA backend's row addressing (latent scatter, DSA index keys, sparse
+        # top-k page indices) assumes page_size == 1 throughout; reject explicitly
+        # like the SWA models do rather than corrupting addressing silently.
+        raise ValueError(
+            f"latent-KV MLA models require --page-size 1, got {config.page_size}."
         )
-        want_page = 64 if _kpool_ratio > 1 else 1
-        if config.page_size != want_page:
-            logger.warning_rank0(
-                f"Page size {config.page_size} is auto-adjusted to {want_page} "
-                f"for latent-KV attention."
-            )
-            override("page_size", want_page)
 
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -309,6 +303,24 @@ class Engine:
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
+        # --kv-cache-dtype fp8_e4m3 (storage-only KV quantization: compute stays bf16, the
+        # pool clamps on write and the attention kernels dequant on read) is implemented for
+        # the QSA pool family only -- the quantize-on-write hook lives in MHAKVCache.store_kv
+        # and the dequant on read in the QSA triton kernels. Any other pool must keep
+        # storage dtype == compute dtype.
+        if getattr(config, "kv_dtype", config.dtype) != config.dtype:
+            from freetoken.kvcache.qsa_pool import QSAKVCache
+
+            if self._pool_cls is not QSAKVCache:
+                raise ValueError(
+                    f"--kv-cache-dtype {config.kv_cache_dtype!r} is implemented for QSA "
+                    "models (Qwen3.8-Flash-Next) only; this model resolves to "
+                    f"{self._pool_cls.__name__}"
+                )
+            logger.info_rank0(
+                f"KV pool storage: {config.kv_cache_dtype} (compute stays {config.dtype}, "
+                "indexer keys stay bf16)"
+            )
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -923,9 +935,11 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        with self.ctx.forward_batch(batch):
+            if self.graph_runner.can_use_cuda_graph(batch):
+                logits = self.graph_runner.replay(batch)
+            else:
+                logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1141,7 +1155,6 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
 )
 
 

@@ -91,11 +91,11 @@ def _tokenize_requests(
     only when the scheduler later confirms first-prefill admission.
     """
     ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
+    ok_results: List[Any] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            result = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -109,7 +109,7 @@ def _tokenize_requests(
             continue
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
-        if tokens.numel() == 0:
+        if result.input_ids.numel() == 0:
             errors.append(
                 UserReply(
                     uid=msg.uid,
@@ -120,8 +120,8 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        ok_results.append(result)
+    return ok_msgs, ok_results, errors
 
 
 @torch.inference_mode()
@@ -245,7 +245,7 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
+                ok_msgs, ok_results, errors = _tokenize_requests(
                     tokenize_manager, tokenize_msg, logger
                 )
                 if errors:
@@ -254,8 +254,25 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        UserMsg(
+                            uid=msg.uid,
+                            input_ids=r.input_ids,
+                            sampling_params=msg.sampling_params,
+                            # The serializer carries 1-D CPU tensors only: flatten the
+                            # [P, 3] mrope table here (the scheduler views it back).
+                            mm_mrope=(
+                                r.mm_mrope.contiguous().view(-1).to(torch.int32)
+                                if r.mm_mrope is not None
+                                else None
+                            ),
+                            mm_data_path=r.mm_data_path,
+                            mm_cache_key=(
+                                r.mm_cache_key.contiguous().to(torch.int32)
+                                if r.mm_cache_key is not None
+                                else None
+                            ),
+                        )
+                        for msg, r in zip(ok_msgs, ok_results, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

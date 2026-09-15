@@ -82,6 +82,7 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
+            kv_pool=self.engine.kv_cache,
             sliding_window_size=next(
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
@@ -467,6 +468,49 @@ class Scheduler(SchedulerIOMixin):
         total = cm.swa_pool.swa_num_tokens - 1
         return total - cm.swa_available_size, total
 
+    def _attach_multimodal(self, msg) -> str | None:
+        """Turn an image-bearing UserMsg into its GPU soft tokens + mrope table.
+
+        The tokenizer worker (CPU process) ran the HF processor and staged
+        ``{"pixel_values", "image_grid_thw"}`` as a .pt file (the only sane
+        cross-process carrier of tens of MB); this process owns the vision tower, so
+        the encode happens here. ``mm_embeds`` then rides PendingReq -> Req and both
+        the prefill splice and the prefix-cache multimodal guards key off it. Returns
+        a client-visible error string on failure; None means proceed.
+        """
+        if msg.mm_mrope is not None and msg.mm_mrope.dim() == 1:
+            msg.mm_mrope = msg.mm_mrope.view(-1, 3)
+        path = getattr(msg, "mm_data_path", None)
+        if path is None:
+            return None
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            pixels = payload["pixel_values"].to(self.device)
+            grids = payload["image_grid_thw"]
+            if grids.dim() == 1:  # single-image payloads arrive unbatched
+                grids = grids.view(1, -1)
+            rows = grids.prod(dim=1)
+            # The tower encodes ONE image per call (its merger/rope assume a single
+            # grid); split the stacked patches in image order and concatenate.
+            outs = []
+            off = 0
+            for i in range(grids.shape[0]):
+                n = int(rows[i].item())
+                outs.append(self.engine.model.encode_images(pixels[off : off + n], grids[i : i + 1]))
+                off += n
+            assert off == pixels.shape[0], "staged pixel rows do not match the grid thw"
+            msg.mm_embeds = torch.cat(outs, 0)
+            return None
+        except Exception as exc:  # noqa: BLE001 — surface to the client, never kill the scheduler
+            return f"failed to process image inputs: {exc!r}"
+        finally:
+            try:
+                import os
+
+                os.remove(path)
+            except OSError:
+                pass
+
     def _gpu_mem_bytes(self) -> int:
         """Bytes this engine process holds on the GPU (torch's reserved caching-allocator
         pool: weights + KV + MoE cache + graphs). 0 on CPU. Cheap, no device sync."""
@@ -520,6 +564,41 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if (
+                getattr(msg, "mm_data_path", None) is not None
+                and input_len > self.prefill_budget
+            ):
+                # An mm prompt is admitted in exactly ONE prefill chunk (the vision soft
+                # tokens splice at the pad span and cannot split across chunks), so a prompt
+                # over the full budget can never be scheduled -- reject it here, where a
+                # client error is cheap, instead of letting the prefill adder die on it
+                # mid-pass (that raise used to take the whole scheduler process down).
+                logger.warning_rank0(
+                    f"Multimodal prompt of {input_len} tokens exceeds the "
+                    f"{self.prefill_budget}-token single-chunk prefill limit; "
+                    f"request {msg.uid} is rejected."
+                )
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error=(
+                                f"multimodal prompt is {input_len} tokens, over the "
+                                f"{self.prefill_budget}-token single-chunk prefill limit; "
+                                f"send a smaller image or increase --max-extend-tokens"
+                            ),
+                            code="context_length_exceeded",
+                        )
+                    ]
+                )
+                return
+            error = self._attach_multimodal(msg)
+            if error is not None:
+                logger.warning_rank0(
+                    f"Multimodal payload rejected for request {msg.uid}: {error}"
+                )
+                self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -593,6 +672,10 @@ class Scheduler(SchedulerIOMixin):
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
+            elif getattr(req, "mm_gdn", None) is not None:
+                # mm RAM tier hit: write the parked host state straight into the live slot
+                pool.restore_state(req.linear_slot_idx, req.mm_gdn)
+                req.mm_gdn = None
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
@@ -781,6 +864,7 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -888,6 +972,40 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
+    """Per-token [T, 3] (t/h/w) M-RoPE positions when any padded request carries an
+    image; None keeps every rope consumer on the unchanged 1-D ``positions`` path.
+    Text requests broadcast their logical arange to the three equal channels (which is
+    numerically identical to 1-D rope under the interleaved mrope layout)."""
+    reqs = batch.padded_reqs
+    if not any(req.mm_mrope is not None for req in reqs):
+        return None
+    needed_size = sum(req.extend_len for req in reqs)
+    host = torch.empty(needed_size, 3, dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in reqs:
+        length = req.extend_len
+        span = slice(offset, offset + length)
+        if req.mm_mrope is None:
+            host[span] = torch.arange(
+                req.cached_len, req.device_len, dtype=torch.int32
+            )[:, None]
+        else:
+            table = req.mm_mrope
+            prompt_len = table.shape[0]
+            end = min(req.device_len, prompt_len)
+            fill_end = end - req.cached_len
+            if fill_end > 0:
+                host[offset : offset + fill_end] = table[req.cached_len : end]
+            if fill_end < length:  # decode steps past the prompt: base + k on all channels
+                k = torch.arange(
+                    req.cached_len, req.device_len, dtype=torch.int32
+                ) - prompt_len + req.mm_mrope_base
+                host[offset + fill_end : offset + length] = k[:, None]
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

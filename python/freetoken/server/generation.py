@@ -189,8 +189,9 @@ def resolve_sampling(
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    content parts to a string (image parts keep their order as a part list, for the
+    vision pipeline) and decode tool-call arguments from JSON. Raises ValueError on
+    an unknown part type. Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -230,15 +231,70 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
-    texts: list[str] = []
+def _flatten_text_parts(parts: list[Any]) -> "str | list[dict[str, Any]]":
+    """Flatten text content parts; keep image parts for the vision path.
+
+    Text-only content flattens to a plain string exactly as before. When an
+    ``image_url`` / ``video``(``_url``) part is present the part list survives
+    (in original order) as template-shaped dicts: ``{"type": "text", "text": ...}``,
+    ``{"type": "image", "image": <url>}`` and
+    ``{"type": "video", "video": <url or frame-list>}`` -- the chat template's
+    render_content matches parts carrying an ``image`` / ``video`` key, and the
+    tokenizer worker extracts them (data: URI, http(s) URL, local path, or an
+    ordered frame-reference list for video) to run the HF image processor.
+    """
+    rendered: list[dict[str, Any]] = []
+    has_media = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
-            texts.append((part.get("text") if isinstance(part, dict) else None) or "")
+            rendered.append(
+                {"type": "text", "text": (part.get("text") if isinstance(part, dict) else None) or ""}
+            )
+        elif ptype == "image_url":
+            url = _image_part_url(part)
+            if url is None:
+                raise ValueError("image_url content part is missing its url")
+            rendered.append({"type": "image", "image": url})
+            has_media = True
+        elif ptype in ("video", "video_url"):
+            url = _video_part_url(part)
+            if url is None:
+                raise ValueError("video content part is missing its url")
+            rendered.append({"type": "video", "video": url})
+            has_media = True
         else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
-    return "".join(texts)
+            raise ValueError(
+                f"Unsupported content part type: {ptype!r} (text, image_url and video are supported)"
+            )
+    if not has_media:
+        return "".join(p["text"] for p in rendered)
+    return rendered
+
+
+def _image_part_url(part: dict[Any, Any]) -> "str | None":
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if isinstance(url, str) and url:
+        return url
+    return None
+
+
+def _video_part_url(part: dict[Any, Any]) -> "str | list[str] | None":
+    """Video reference(s) from a video/video_url part: a single url string or an
+    ordered list of frame references. Both OpenAI (``video_url``) and template
+    (``video``) spellings are read."""
+    url = part.get("video_url")
+    if url is None:
+        url = part.get("video")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if isinstance(url, str) and url:
+        return url
+    if isinstance(url, (list, tuple)) and url:
+        return [str(u) for u in url if isinstance(u, str) and u]
+    return None
 
 
 def split_tool_lists(

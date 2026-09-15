@@ -6,7 +6,9 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``).
+The vision tower (``model.visual.*``) is opt-in: text-only serving (the default) drops it;
+``FREETOKEN_LOAD_VISION=1`` loads it as ``vision_tower.*`` (see ``vision_load_enabled``).
 """
 
 from __future__ import annotations
@@ -27,9 +29,11 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+from .config import parse_config
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -98,10 +102,21 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
-def _rename(raw_name: str) -> str | None:
+_VISUAL_PREFIXES = ("model.visual.", "visual.")
+
+
+def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
+    for prefix in _VISUAL_PREFIXES:
+        if raw_name.startswith(prefix):
+            # Vision is opt-in (FREETOKEN_LOAD_VISION=1): with the gate off the tower is
+            # never built, so its tensors must not reach load_state_dict. With it on they
+            # land under ``vision_tower.``, the engine-wide VISION_KEY_PREFIXES namespace.
+            if not include_vision:
+                return None
+            return "vision_tower." + raw_name[len(prefix) :]
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -161,6 +176,9 @@ def iter_weights(
         raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
+    # is_multimodal bakes in vision_load_enabled(): the tower is built iff the env gate is
+    # on AND the checkpoint ships a vision_config, and model.py gates on the same flag.
+    include_vision = parse_config(cached_load_hf_config(model_path)).is_multimodal
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
@@ -170,7 +188,7 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)

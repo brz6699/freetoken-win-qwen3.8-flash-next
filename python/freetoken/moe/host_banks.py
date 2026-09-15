@@ -147,7 +147,10 @@ class HostBank:
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        if hasattr(self._buf, "madvise"):  # POSIX only; Windows mmap.mmap has no madvise
+            self._buf.madvise(mmap.MADV_DONTNEED)
+        # Windows: leave the pageable mapping in place; the OS trims working-set pages
+        # under memory pressure. Contract (address space stays valid) holds either way.
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
@@ -377,11 +380,67 @@ class LayerCompletionTracker:
             self._on_layer(layer_id, {name: per[layer_id] for name, per in self._banks.items()})
 
 
+def _portable_copy_range(path: str, mv: memoryview, file_offset: int, nbytes: int,
+                         dest_offset: int, block: int = _DEFAULT_CHUNK) -> None:
+    """Sequential buffered read of ``path[file_offset:file_offset+nbytes]`` into ``mv[dest_offset:]``."""
+    with open(path, "rb") as f:
+        f.seek(file_offset)
+        remaining = nbytes
+        pos = dest_offset
+        while remaining > 0:
+            want = min(block, remaining)
+            data = f.read(want)
+            got = len(data)
+            if got == 0:
+                raise OSError(f"short read at file offset {file_offset + (nbytes - remaining)}: "
+                              f"want {want} bytes, reached EOF")
+            mv[pos:pos + got] = data
+            pos += got
+            remaining -= got
+
+
+def _portable_read_into(buf, path: str, *, file_offset: int = 0, nbytes: int | None = None,
+                        dest_offset: int = 0, workers: int = 8) -> int:
+    """Reader for platforms without O_DIRECT/preadv (e.g. Windows).
+
+    Reads ``nbytes`` from ``path[file_offset:file_offset+nbytes]`` into ``buf`` at
+    ``dest_offset``. When ``workers > 1`` and the range is large, splits it across
+    threads; each owns a disjoint byte window and Python releases the GIL during the
+    blocking read, so the disk I/O overlaps. The best-effort page-cache drop
+    (posix_fadvise) is simply skipped where unavailable. Returns ``nbytes``.
+    """
+    mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
+    if nbytes is None:
+        nbytes = os.path.getsize(path)
+    if dest_offset + nbytes > len(mv):
+        raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
+    if workers and workers > 1 and nbytes > _DEFAULT_CHUNK:
+        from concurrent.futures import ThreadPoolExecutor
+        n = max(1, min(workers, 16))
+        base = nbytes // n
+        rem = nbytes - base * n
+        off = 0
+        jobs = []
+        for i in range(n):
+            s = base + (1 if i < rem else 0)
+            jobs.append((off, s))
+            off += s
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            list(ex.map(lambda o_s: _portable_copy_range(path, mv, file_offset + o_s[0],
+                                                         o_s[1], dest_offset + o_s[0]), jobs))
+    else:
+        _portable_copy_range(path, mv, file_offset, nbytes, dest_offset)
+    return nbytes
+
+
 def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
                    chunk: int = _DEFAULT_CHUNK, drop_cache: bool = True) -> int:
     """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
+    if not hasattr(os, "preadv"):  # Windows: O_DIRECT/preadv/posix_fadvise unavailable
+        return _portable_read_into(buf, path, file_offset=0, nbytes=size,
+                                   dest_offset=0, workers=workers)
     if drop_cache:
         try:
             fd0 = os.open(path, os.O_RDONLY)
@@ -432,6 +491,9 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
     if dest_offset + nbytes > len(mv):
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
+    if not hasattr(os, "preadv"):  # Windows: O_DIRECT/preadv/posix_fadvise unavailable
+        return _portable_read_into(buf, path, file_offset=file_offset, nbytes=nbytes,
+                                   dest_offset=dest_offset, workers=workers)
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
         try:

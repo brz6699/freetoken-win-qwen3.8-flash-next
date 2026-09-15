@@ -79,11 +79,16 @@ class Gemma4Model(BaseOP):
             return x
         mask = input_ids == self._image_token_id
         n_slots = int(mask.sum().item())
-        assert n_slots == mm_embeds.shape[0], (
-            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
-            "image tokens must not be split across prefill chunks"
-        )
-        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+        if n_slots == mm_embeds.shape[0]:
+            return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+        if n_slots != 0:
+            raise RuntimeError(
+                f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
+                "a pad run split across the prefix-cache boundary"
+            )
+        # n_slots == 0: the cached prefix cleared the whole pad run -- its KV is in the
+        # cached pages and nothing needs scattering (see CacheManager.match_req).
+        return x
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)

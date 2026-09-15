@@ -227,3 +227,13 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# --- windows single-GPU build branch additions ---
+# Prebuilt Windows kernel extensions (cp312, platform-bound): ship via Releases, not source.
+*.pyd
+# Packaged artifacts / release bundles kept out of source (zips carry the whole package).
+*.zip
+# pip install metadata captured inside unpacked package trees.
+*.dist-info/
+# Local rollback backups.
+_backups/

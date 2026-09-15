@@ -187,6 +187,11 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        # M-RoPE requests decode eager: the captured graphs bake the 1-D positions
+        # buffer and the flashinfer rope lookup, so image-bearing rows would replay
+        # with wrong (text-channel-only) rotations. Text serving is unaffected.
+        if any(getattr(r, "mm_mrope", None) is not None for r in batch.reqs):
+            return False
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:

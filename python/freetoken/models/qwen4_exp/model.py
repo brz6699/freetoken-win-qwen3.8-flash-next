@@ -89,6 +89,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.hc_count = config.qwen4_args.hc_count
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -106,7 +107,29 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = self.embed_tokens.forward(input_ids)
+        mm_embeds = getattr(batch, "mm_embeds", None)
+        if mm_embeds is not None:
+            # Splice the vision soft tokens at the image_pad positions, BEFORE the hc
+            # repeat (one [T, hidden] scatter, not hc_count of them). The scheduler keeps
+            # multimodal requests out of the shared prefix cache and out of chunked
+            # prefill, so every image_pad of this request is in this batch's rows and the
+            # count invariant below holds.
+            assert self._image_token_id is not None, "image_pad id missing from the model config"
+            img_mask = input_ids.eq(self._image_token_id)
+            n_pads = img_mask.sum().item()
+            if n_pads == mm_embeds.shape[0]:
+                hidden = hidden.masked_scatter(img_mask.unsqueeze(-1), mm_embeds.to(hidden.dtype))
+            elif n_pads != 0:
+                raise RuntimeError(
+                    f"multimodal splice mismatch: {n_pads} image_pad token(s) in the batch rows "
+                    f"but {mm_embeds.shape[0]} soft-token row(s) -- a pad run split across the "
+                    f"prefix-cache boundary"
+                )
+            # n_pads == 0: the cached prefix cleared the whole pad run, so its KV is in the
+            # cached pages and there is nothing to scatter (the match is only admitted to
+            # cross a pad run when it clears it -- CacheManager.match_req).
+        hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -141,7 +164,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        # Opt-in vision tower (FREETOKEN_LOAD_VISION=1, see vision_load_enabled): off means
+        # is_multimodal False, the tower is never built and its weights are never loaded.
+        if config.is_multimodal:
+            from .vision import Qwen4ExpVisionModel
+
+            self.vision_tower = Qwen4ExpVisionModel(config.vision_config)
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Vision tower for ONE image: [t*h*w, in_ch*kt*p*p] pixels -> [h*w/merge^2, text_hidden]."""
+        return self.vision_tower.forward(pixel_values, grid_thw)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
@@ -167,36 +201,6 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
-            return 0
-
-        if engine_config.ple_backend == "disk":
-            from freetoken.utils import download_hf_weight
-
-            from .ple_disk import DiskRowTable, resolve_row_source
-
-            folder = download_hf_weight(engine_config.model_path)
-            # one WAIT node per captured graph: the flag protocol supports a single consume
-            assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
-            emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
-            # hash with the state-dict-loaded constants, the same source the pinned path reads
-            constants = {
-                "num_ngram_heads": args.num_ngram_heads,
-                "layer_multipliers": emb.layer_multipliers.tolist(),
-                "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
-                "per_head_offsets": emb.ngram_heads_offsets.tolist(),
-                "eos_token_id": args.ngram_boundary_token_id,
-            }
-            disk_table = DiskRowTable(
-                resolve_row_source(folder),
-                constants,
-                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
-                max_extend_tokens=engine_config.max_extend_tokens,
-            )
-            self._ple_table = disk_table
-            for ple in ple_layers:
-                ple.ple_embedding.attach_table(disk_table)
-            # engine enters this around every dispatch; the graph itself never waits on the disk
-            self.forward_host_ctx = disk_table.forward_host_ctx
             return 0
 
         from .weight import load_ple_table

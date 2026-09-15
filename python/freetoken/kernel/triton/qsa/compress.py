@@ -111,9 +111,12 @@ def _index_norm_rope_kernel(
     weight_ptr,
     out_ptr,
     dest_rows_ptr,
+    pos3_ptr,  # [rows/HEADS, 3] int32 (t/h/w); only read when USE_MROPE
+    sel_ptr,  # [ROTARY_HALF] int64 channel per frequency (interleaved mrope layout)
     stride_x_row,
     stride_out_row,
     stride_cos_sin_row,
+    stride_pos3_row,
     num_rows,
     eps,
     HEADS: tl.constexpr,
@@ -122,6 +125,7 @@ def _index_norm_rope_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_DEST_ROWS: tl.constexpr,
+    USE_MROPE: tl.constexpr,
 ) -> None:
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     live = rows < num_rows
@@ -147,10 +151,25 @@ def _index_norm_rope_kernel(
     y_partner = x_partner * rrms[:, None] * weight_partner[None, :]
 
     position = tl.load(positions_ptr + rows // HEADS, mask=live, other=0).to(tl.int64)
-    cos_base = cos_sin_ptr + position[:, None] * stride_cos_sin_row
     rotary_mask = live[:, None] & in_rotary[None, :]
-    cos = tl.load(cos_base + pair[None, :], mask=rotary_mask, other=1.0)
-    sin = tl.load(cos_base + ROTARY_HALF + pair[None, :], mask=rotary_mask, other=0.0)
+    if USE_MROPE:
+        # Interleaved mrope: frequency `pair` rotates by the channel (t/h/w) its
+        # section assigns, so the three cos/sin lookups use three different rows.
+        tok = rows // HEADS
+        p_t = tl.load(pos3_ptr + tok * stride_pos3_row, mask=live, other=0).to(tl.int64)
+        p_h = tl.load(pos3_ptr + tok * stride_pos3_row + 1, mask=live, other=0).to(tl.int64)
+        p_w = tl.load(pos3_ptr + tok * stride_pos3_row + 2, mask=live, other=0).to(tl.int64)
+        chan = tl.load(sel_ptr + pair)
+        pos_sel = tl.where(
+            (chan == 1)[None, :], p_h[:, None], tl.where((chan == 2)[None, :], p_w[:, None], p_t[:, None])
+        )
+        cos_base = cos_sin_ptr + pos_sel * stride_cos_sin_row
+        cos = tl.load(cos_base + pair[None, :], mask=rotary_mask, other=1.0)
+        sin = tl.load(cos_base + ROTARY_HALF + pair[None, :], mask=rotary_mask, other=0.0)
+    else:
+        cos_base = cos_sin_ptr + position[:, None] * stride_cos_sin_row
+        cos = tl.load(cos_base + pair[None, :], mask=rotary_mask, other=1.0)
+        sin = tl.load(cos_base + ROTARY_HALF + pair[None, :], mask=rotary_mask, other=0.0)
     sign = tl.where(dims < ROTARY_HALF, -1.0, 1.0)
     result = tl.where(in_rotary[None, :], y * cos + sign[None, :] * y_partner * sin, y)
 
@@ -259,8 +278,13 @@ def qsa_index_norm_rope(
     out: torch.Tensor,
     heads: int = 1,
     dest_rows: torch.Tensor | None = None,
+    pos3: torch.Tensor | None = None,
+    mrope_sel: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Zero-centered RMSNorm then partial NeoX rope on [rows, head_dim] indexer rows."""
+    """Zero-centered RMSNorm then partial NeoX rope on [rows, head_dim] indexer rows.
+
+    ``pos3`` ([rows/heads, 3] int32 t/h/w) + ``mrope_sel`` (channel per frequency)
+    switch the rope lookup to interleaved M-RoPE (image-bearing forwards only)."""
 
     rows, head_dim = x.shape
     rotary_dim = cos_sin_cache.shape[1]
@@ -270,6 +294,8 @@ def qsa_index_norm_rope(
         raise ValueError("QSA indexer norm+rope needs unit-stride rows")
     if rows % heads:
         raise ValueError("QSA indexer rows must be a whole number of head groups")
+    if (pos3 is None) != (mrope_sel is None):
+        raise ValueError("mrope rope needs both pos3 and mrope_sel (or neither)")
     if not rows:
         return out
     block_r = 8 if head_dim >= 128 else 16
@@ -280,9 +306,12 @@ def qsa_index_norm_rope(
         norm_weight,
         out,
         dest_rows,
+        pos3 if pos3 is not None else positions,
+        mrope_sel if mrope_sel is not None else positions,
         x.stride(0),
         out.stride(0),
         cos_sin_cache.stride(0),
+        pos3.stride(0) if pos3 is not None else 0,
         rows,
         eps,
         HEADS=heads,
@@ -291,6 +320,7 @@ def qsa_index_norm_rope(
         BLOCK_R=block_r,
         BLOCK_D=triton.next_power_of_2(head_dim),
         HAS_DEST_ROWS=dest_rows is not None,
+        USE_MROPE=pos3 is not None,
         num_warps=4,
     )
     return out

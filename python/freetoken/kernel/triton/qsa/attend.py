@@ -15,6 +15,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_dscale_ptr,
+    v_dscale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -29,6 +31,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_dscale_row,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -36,6 +39,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_rows,
     num_cache_blocks,
     num_requests,
+    codebook_c0,
+    codebook_step,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -46,6 +51,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PACKED4: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -58,18 +64,42 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     dim_offsets = tl.arange(0, HEAD_DIM)
     column_offsets = tl.arange(0, BLOCK_N)
     first_head = kv_head * GROUP_SIZE
-    query = tl.load(
-        q_ptr
-        + row * stride_q_row
-        + (first_head + head_offsets[:, None]) * stride_q_head
-        + dim_offsets[None, :],
-        mask=head_offsets[:, None] < GROUP_SIZE,
-        other=0.0,
-    )
+    if PACKED4:
+        # turbo4 stores nibble pairs (even in the low nibble); split the query the same
+        # way and run the two-way split dot, SGLang tq-decode precedent. Q arrives
+        # already rotated (rotspace: dot(q,k) == dot(Rq,Rk)).
+        half_offsets = tl.arange(0, HEAD_DIM // 2)
+        query_even = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + (half_offsets * 2)[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
+        query_odd = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + (half_offsets * 2 + 1)[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
+    else:
+        query = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + dim_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    accumulator_even = tl.zeros((BLOCK_M, HEAD_DIM // 2), dtype=tl.float32)
+    accumulator_odd = tl.zeros((BLOCK_M, HEAD_DIM // 2), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
@@ -101,25 +131,43 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        scores = tl.dot(query, keys)
+        if PACKED4:
+            # The scale buffers are token-linear (slot = page * PAGE_SIZE + offset); a
+            # never-written slot dequant-scales to 0, keeping masked reads finite.
+            slot = safe_page * PAGE_SIZE + page_offset
+            packed_k = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + half_offsets[:, None],
+                mask=valid[None, :],
+                other=0,
+            )
+            k_lo = (
+                (packed_k & 0x0F).to(tl.float32) * codebook_step + codebook_c0
+            ).to(tl.bfloat16)
+            k_hi = (
+                ((packed_k >> 4) & 0x0F).to(tl.float32) * codebook_step + codebook_c0
+            ).to(tl.bfloat16)
+            k_scale = tl.load(
+                k_dscale_ptr + slot * stride_dscale_row + kv_head,
+                mask=valid,
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.dot(query_even, k_lo) + tl.dot(query_odd, k_hi)
+            scores *= k_scale[None, :]
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)  # fp8 KV storage dequant; no-op for bf16 caches
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -128,56 +176,156 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if PACKED4:
+            packed_v = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + half_offsets[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            v_lo = (
+                (packed_v & 0x0F).to(tl.float32) * codebook_step + codebook_c0
+            ).to(tl.bfloat16)
+            v_hi = (
+                ((packed_v >> 4) & 0x0F).to(tl.float32) * codebook_step + codebook_c0
+            ).to(tl.bfloat16)
+            v_scale = tl.load(
+                v_dscale_ptr + slot * stride_dscale_row + kv_head,
+                mask=valid,
+                other=0.0,
+            ).to(tl.float32)
+            # The per-token scale folds into the probabilities once (linearity of the
+            # dot); the normalizer must stay UNSCALED (it is the softmax denominator).
+            scaled_probabilities = (probabilities * v_scale[None, :]).to(tl.bfloat16)
+            accumulator_even = tl.dot(
+                scaled_probabilities, v_lo, acc=accumulator_even * alpha[:, None]
+            )
+            accumulator_odd = tl.dot(
+                scaled_probabilities, v_hi, acc=accumulator_odd * alpha[:, None]
+            )
+        else:
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)  # fp8 KV storage dequant; no-op for bf16 caches
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
     has_values = normalizer > 0
-    normalized_output = tl.where(
-        has_values[:, None],
-        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
-        0.0,
-    )
+    safe_normalizer = tl.maximum(normalizer, 1.0e-20)[:, None]
     output_mask = head_offsets[:, None] < GROUP_SIZE
-    if NUM_SPLITS == 1:
-        tl.store(
-            output_ptr
-            + row * stride_output_row
-            + (first_head + head_offsets[:, None]) * stride_output_head
-            + dim_offsets[None, :],
-            normalized_output,
-            mask=output_mask,
+    if PACKED4:
+        # The wrapper inverts the rotation on the FULL attention output, so partials and
+        # direct output both stay in the rotated domain, interleaved back into HEAD_DIM.
+        normalized_even = tl.where(
+            has_values[:, None], accumulator_even / safe_normalizer, 0.0
         )
-    else:
-        partial_lse = tl.where(
-            has_values,
-            max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
-            -float("inf"),
+        normalized_odd = tl.where(
+            has_values[:, None], accumulator_odd / safe_normalizer, 0.0
         )
-        tl.store(
-            partial_output_ptr
-            + (
-                (split_id.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
-                + first_head
-                + head_offsets[:, None]
+        if NUM_SPLITS == 1:
+            output_base = (
+                output_ptr
+                + row * stride_output_row
+                + (first_head + head_offsets[:, None]) * stride_output_head
             )
-            * HEAD_DIM
-            + dim_offsets[None, :],
-            normalized_output,
-            mask=output_mask,
+            tl.store(
+                output_base + (half_offsets * 2)[None, :],
+                normalized_even.to(output_ptr.dtype.element_ty),
+                mask=output_mask,
+            )
+            tl.store(
+                output_base + (half_offsets * 2 + 1)[None, :],
+                normalized_odd.to(output_ptr.dtype.element_ty),
+                mask=output_mask,
+            )
+        else:
+            partial_lse = tl.where(
+                has_values,
+                max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
+                -float("inf"),
+            )
+            partial_base = (
+                partial_output_ptr
+                + (
+                    (split_id.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
+                    + first_head
+                    + head_offsets[:, None]
+                )
+                * HEAD_DIM
+            )
+            tl.store(
+                partial_base + (half_offsets * 2)[None, :],
+                normalized_even,
+                mask=output_mask,
+            )
+            tl.store(
+                partial_base + (half_offsets * 2 + 1)[None, :],
+                normalized_odd,
+                mask=output_mask,
+            )
+            tl.store(
+                partial_lse_ptr
+                + (split_id.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
+                + first_head
+                + head_offsets,
+                partial_lse,
+                mask=head_offsets < GROUP_SIZE,
+            )
+    else:
+        normalized_output = tl.where(
+            has_values[:, None],
+            accumulator / safe_normalizer,
+            0.0,
         )
-        tl.store(
-            partial_lse_ptr
-            + (split_id.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
-            + first_head
-            + head_offsets,
-            partial_lse,
-            mask=head_offsets < GROUP_SIZE,
-        )
+        if NUM_SPLITS == 1:
+            tl.store(
+                output_ptr
+                + row * stride_output_row
+                + (first_head + head_offsets[:, None]) * stride_output_head
+                + dim_offsets[None, :],
+                normalized_output,
+                mask=output_mask,
+            )
+        else:
+            partial_lse = tl.where(
+                has_values,
+                max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
+                -float("inf"),
+            )
+            tl.store(
+                partial_output_ptr
+                + (
+                    (split_id.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
+                    + first_head
+                    + head_offsets[:, None]
+                )
+                * HEAD_DIM
+                + dim_offsets[None, :],
+                normalized_output,
+                mask=output_mask,
+            )
+            tl.store(
+                partial_lse_ptr
+                + (split_id.to(tl.int64) * num_rows + row) * NUM_QUERY_HEADS
+                + first_head
+                + head_offsets,
+                partial_lse,
+                mask=head_offsets < GROUP_SIZE,
+            )
 
 
 @triton.jit
@@ -232,9 +380,13 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_dscale: torch.Tensor | None = None,
+    v_dscale: torch.Tensor | None = None,
+    tq=None,  # kvcache.turboquant.TurboQuantConstants, required for packed uint8 caches
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16/FP8/TurboQuant-4bit K/V caches."""
 
+    packed4 = k_cache.dtype == torch.uint8
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
     if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:
@@ -243,11 +395,25 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention metadata has invalid shapes")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    kv_dim = k_cache.shape[3] * 2 if packed4 else k_cache.shape[3]
+    if q.shape[2] != kv_dim or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    # Compute stays bf16; the paged storage may be fp8 (clamped float8_e4m3fn) or turbo4
+    # (nibble-packed uint8 + per-token dequant scales) and the kernel dequants on read.
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype == v_cache.dtype
+    assert k_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+    if packed4:
+        assert tq is not None and k_dscale is not None and v_dscale is not None, (
+            "turbo4 (uint8) KV caches need tq constants and dequant scale buffers"
+        )
+        assert k_dscale.dtype == v_dscale.dtype == torch.bfloat16
+        assert k_dscale.stride(1) == v_dscale.stride(1) == 1
+        assert k_dscale.shape == v_dscale.shape
+    else:
+        assert k_dscale is None and v_dscale is None
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -258,6 +424,12 @@ def qsa_sparse_paged_attention(
     assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
     if not q.shape[0]:
         return out
+
+    if packed4:
+        # Rotspace equivalence: the pool stored K/V rotated by R, so rotate Q by R and
+        # invert the FULL attention output by R^T. The kernel itself never unrotates.
+        q = tq.rotate(q)
+        out = torch.empty_like(q)
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
@@ -303,6 +475,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_dscale if packed4 else k_cache,
+        v_dscale if packed4 else v_cache,
         logical_indices,
         block_table,
         token_to_req,
@@ -317,6 +491,7 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        k_dscale.stride(0) if packed4 else 0,
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -324,6 +499,8 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
+        tq.c0 if packed4 else 0.0,
+        tq.step if packed4 else 1.0,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -334,26 +511,27 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        PACKED4=packed4,
         num_warps=partial_warps,
         num_stages=2,
     )
-    if num_splits == 1:
-        return out
-
-    _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
-        partial_output,
-        partial_lse,
-        out,
-        out.stride(0),
-        out.stride(1),
-        q.shape[0],
-        HEAD_DIM=q.shape[2],
-        NUM_QUERY_HEADS=q.shape[1],
-        NUM_SPLITS=num_splits,
-        BLOCK_SPLITS=triton.next_power_of_2(num_splits),
-        num_warps=2,
-        num_stages=1,
-    )
+    if num_splits > 1:
+        _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
+            partial_output,
+            partial_lse,
+            out,
+            out.stride(0),
+            out.stride(1),
+            q.shape[0],
+            HEAD_DIM=q.shape[2],
+            NUM_QUERY_HEADS=q.shape[1],
+            NUM_SPLITS=num_splits,
+            BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+            num_warps=2,
+            num_stages=1,
+        )
+    if packed4:
+        out = tq.unrotate(out)
     return out
 
 

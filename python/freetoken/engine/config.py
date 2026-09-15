@@ -23,8 +23,6 @@ class EngineConfig:
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
-    ple_backend: str = "disk"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -82,6 +80,24 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Paged KV pool STORAGE dtype: "bf16" (default) | "fp8_e4m3" | "turbo4". fp8 halves the
+    # KV pool at a one-time write-side quantization; turbo4 (TurboQuant/PolarQuant 4-bit,
+    # kvcache/turboquant.py) halves it again -- nibble-packed uint8 buffers plus a per
+    # (token, head) bf16 dequant scale. Attention compute stays bf16 either way and QSA
+    # index keys stay bf16. QSA models (Qwen3.8-Flash-Next) only -- enforced by the engine.
+    # Every per-byte budget formula must price kv_dtype/kv_cache_dtype, never dtype.
+    kv_cache_dtype: str = "bf16"
+
+    @cached_property
+    def kv_dtype(self) -> torch.dtype:
+        if self.kv_cache_dtype in ("fp8_e4m3", "fp8"):
+            return torch.float8_e4m3fn
+        if self.kv_cache_dtype == "turbo4":
+            # uint8 is the PACKED carrier: two 4-bit indices per byte, head_dim halved.
+            return torch.uint8
+        if self.kv_cache_dtype not in ("bf16", "bfloat16"):
+            raise ValueError(f"unknown --kv-cache-dtype {self.kv_cache_dtype!r}")
+        return self.dtype
 
     @cached_property
     def hf_config(self):

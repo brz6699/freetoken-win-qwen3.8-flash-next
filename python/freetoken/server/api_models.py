@@ -11,6 +11,10 @@ class MessageContent(BaseModel):
     text: str | None = None
     image_url: Any | None = None
     audio_url: Any | None = None
+    # Video parts ride the vision pipeline (frames are sampled by the tokenizer
+    # worker). Both the OpenAI (video_url) and template (video) spellings are kept.
+    video: Any | None = None
+    video_url: Any | None = None
 
 
 class Function(BaseModel):

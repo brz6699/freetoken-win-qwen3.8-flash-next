@@ -214,8 +214,19 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
+                # Image blocks ride the vision pipeline: base64 sources become data:
+                # URIs, url sources pass through -- the tokenizer worker decodes them.
+                url = _anthropic_image_url(block)
+                if url is None:
+                    continue
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            elif block.type == "video":
+                # Video blocks ride the same vision pipeline (the tokenizer worker
+                # samples frames); base64/url sources decode exactly like images.
+                url = _anthropic_image_url(block)
+                if url is None:
+                    continue
+                content_parts.append({"type": "video_url", "video_url": {"url": url}})
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -331,6 +342,22 @@ def _content_text(content) -> str:
     if isinstance(content, str):
         return content
     return "".join(b.text for b in content if getattr(b, "type", None) == "text" and b.text)
+
+
+def _anthropic_image_url(block) -> "str | None":
+    """A fetchable URL/data-URI for an Anthropic image block, or None to skip it.
+
+    base64 sources become ``data:`` URIs (the tokenizer worker decodes them); url
+    sources pass through untouched."""
+    src = block.source or {}
+    stype = src.get("type")
+    if stype == "base64":
+        data = src.get("data")
+        media = src.get("media_type") or "image/png"
+        return f"data:{media};base64,{data}" if data else None
+    if stype == "url":
+        return src.get("url")
+    return None
 
 
 def _tool_result_text(content) -> str:

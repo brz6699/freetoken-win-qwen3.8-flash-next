@@ -88,6 +88,12 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # M-RoPE (image batches only; None keeps every indexer rope on 1-D logical positions).
+    # pos3 is the [T, 3] triple of each row's CLOSING group's first token (host-built:
+    # mm_mrope rows below the prompt, base + k above it); rows_pos3 is the batch's own
+    # [T, 3] table for the indexer query rows.
+    pos3:             torch.Tensor | None = None  # [T, 3] int32, group-first triples
+    rows_pos3:        torch.Tensor | None = None  # [T, 3] int32, this forward's rows
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -108,7 +114,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        # Indexer/pooled scratch rides the COMPUTE dtype (index_dtype), not the pool-wide
+        # dtype -- with fp8 KV storage the pool dtype is float8 and would poison the
+        # pooled q/index scratch and the graph staging buffers.
+        self.dtype = self.kvcache.index_dtype
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -129,11 +138,39 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._idx_slot = {lid: i for i, lid in enumerate(group.layer_ids)}
         self.rotary_config = group.rotary_config
         self._index_cos_sin: torch.Tensor | None = None
+        # turbo4 packed storage (uint8 nibble cache): the attend wrapper rotates Q and
+        # unrotates the output with the SAME rotation the pool quantized with -- built
+        # independently from the same seed, so constants match without sharing state.
+        self._tq = None
+        if self.kvcache.dtype == torch.uint8:
+            from freetoken.kvcache.turboquant import TurboQuantConstants
+
+            self._tq = TurboQuantConstants(self.head_dim, self.device)
+            logger.info(
+                "QSA attend: turbo4 packed KV (4-bit nibble rotspace, "
+                "Q rotated / output unrotated)"
+            )
 
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        # Interleaved M-RoPE channel per indexer frequency (built once from the group's
+        # rotary config; None on text-only checkpoints, where mrope never activates).
+        self._mrope_sel: torch.Tensor | None = self._build_mrope_sel(group, self.device)
+
+    @staticmethod
+    def _build_mrope_sel(group, device) -> torch.Tensor | None:
+        section = group.rotary_config.mrope_section
+        if not section:
+            return None
+        half = group.rotary_config.rotary_dim // 2
+        # kernel pointer: must live on the compute device (a CPU copy is a Triton
+        # launch-time error on the first image-bearing forward)
+        sel = torch.zeros(half, dtype=torch.int64, device=device)
+        for d, offset in ((1, 1), (2, 2)):
+            sel[offset : 3 * section[d] : 3] = d
+        return sel
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -290,12 +327,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_dscale=self.kvcache.k_dscale(layer_id),
+            v_dscale=self.kvcache.v_dscale(layer_id),
+            tq=self._tq,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        md.rows_pos3 = getattr(batch, "mrope_positions", None)
+        md.pos3 = self._plan_group_mrope(md, batch)
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -314,6 +356,46 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.ring_rows = torch.where(keep, ring_row, torch.full_like(ring_row, -1)).to(
             torch.int32
         )
+
+    def _plan_group_mrope(self, md: QSASparseMetadata, batch: Batch) -> torch.Tensor | None:
+        """The [T, 3] M-RoPE triple of each row's closing group's FIRST token, host-built
+        (no GPU sync): below the prompt the request's mm_mrope table owns the triple,
+        past it every decode step is ``mm_mrope_base + (f - prompt_len)`` on all three
+        channels (HF's rope_deltas rule). Non-closing rows land on scratch rows the
+        score path never reads, so their triples are unconstrained. None (the whole
+        batch text) keeps the indexer on the 1-D logical path."""
+        reqs = batch.padded_reqs
+        if not any(r.mm_mrope is not None for r in reqs):
+            return None
+        T = md.positions.numel()
+        host = torch.empty(T, 3, dtype=torch.int32, pin_memory=True)
+        offset = 0
+        for req in reqs:
+            n = req.extend_len
+            first = torch.arange(
+                req.cached_len, req.device_len, dtype=torch.int32
+            ) - (self.ratio - 1)
+            if req.mm_mrope is None:
+                host[offset : offset + n] = first.clamp_(min=0)[:, None]
+            else:
+                prompt_len = req.mm_mrope.shape[0]
+                base = req.mm_mrope_base
+                # Out-of-place clamp, BOTH ends: an in-place clamp_ would alias
+                # `first` and make `in_table` trivially true (dead base+k branch).
+                # min=0: the first group starts before index 0 (its real first token
+                # IS 0). max=prompt_len-1: groups past the prompt (decode, or the
+                # prompt's last partial group) take the base+k rule below instead.
+                idx = torch.clamp(first, min=0, max=prompt_len - 1)
+                in_table = (first < prompt_len)[:, None]
+                values = torch.where(
+                    in_table,
+                    req.mm_mrope[idx],
+                    (base + (first - prompt_len).clamp_(min=0))[:, None],
+                )
+                host[offset : offset + n] = values
+            offset += n
+        assert offset == T
+        return host.to(self.device, non_blocking=True)
 
     def _update_index_cache(self, index, md: QSASparseMetadata, slot: int) -> None:
         """Compress each closing group into the slab, then refresh the pending ring."""
@@ -346,6 +428,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
             index.eps,
             self.kvcache.cmp_k_cache(slot),
             dest_rows=md.cmp_rows,
+            pos3=md.pos3,
+            # the kernel needs pos3 and mrope_sel together (or neither): a text-only
+            # forward (incl. every CUDA-graph capture) has md.pos3 None, so drop the sel
+            mrope_sel=self._mrope_sel if md.pos3 is not None else None,
         )
         # After the compression read: the ring rows this forward overwrites are exactly the
         # ones a straddling group just consumed.
@@ -372,6 +458,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             index.eps,
             q_index.view(-1, self.index_head_dim),
             heads=self.index_heads,
+            pos3=md.rows_pos3,
+            mrope_sel=self._mrope_sel if md.rows_pos3 is not None else None,
         )
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size

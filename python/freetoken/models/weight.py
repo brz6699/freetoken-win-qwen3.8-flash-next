@@ -122,9 +122,10 @@ def iter_expert_tensors_parallel(
                 path = os.path.join(model_path, shard)
                 if drop_cache:
                     try:
-                        fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        os.close(fd)
+                        if hasattr(os, "posix_fadvise"):  # Windows: no posix_fadvise (AttributeError, not OSError)
+                            fd = os.open(path, os.O_RDONLY)
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            os.close(fd)
                     except OSError:
                         pass
                 buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
