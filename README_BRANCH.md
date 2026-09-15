@@ -1,16 +1,10 @@
 # FreeToken — Windows single-GPU build
 
+Chinese version: [README_BRANCH_zh.md](README_BRANCH_zh.md).
+
 A patched branch of [FreeToken](https://github.com/FlashML-org/FreeToken) (base: `0.1.2+g816c324d0`, upstream main `58f4b9e`) tuned for **one consumer GPU + lots of system RAM** — e.g. RTX 5090 32 GB with ~250 GB RAM — serving large MoE checkpoints through an OpenAI-/Anthropic-compatible HTTP API.
 
 Upstream is Apache-2.0; this branch keeps its LICENSE and copyright intact. See [Provenance](#provenance).
-
-**Measured on one consumer rig** — single RTX 5090 (32 GB) + 256 GB DDR5 (4×64 GB) over PCIe 5.0, serving Qwen3.8-Flash-Next:
-
-- **1M-token context window** via the turbo4 KV tier
-- **3072 experts resident** in the on-GPU MoE cache
-- **4-way concurrency as the sweet spot** — aggregate throughput peaks around 77 tokens/s at 4–8 concurrent streams; evaluated on this rig, 4-way sustains stable operation and covers most workloads
-- **400 consecutive images** recognized end-to-end (content-keyed mm KV reuse)
-- **40–50 tokens/s** single-stream decode
 
 ## Why this branch
 
@@ -77,6 +71,28 @@ ft.exe serve --host 0.0.0.0 --port 8001 `
 - `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies.
 
 Then hit `POST /v1/chat/completions` as with any OpenAI-compatible server.
+
+## Measured numbers
+
+All figures below are measured on the reference rig (RTX 5090 32 GB + ~254 GiB RAM, Qwen3.8-Flash-Next-NVFP4, launched with `--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --vision-on --moe-prefill-hit-d2d`). Reproduce with a ThreadPoolExecutor ladder script, text legs at `max_tokens=96`, concurrency 1/2/4/6/8.
+
+Concurrency ladder (text, `max_tokens=96`):
+
+| concurrency | aggregate tok/s | per-stream tok/s | latency |
+|---|---|---|---|
+| 1 | 26.2 | 26.2 | — |
+| 2 | 47.5 | ~24 | — |
+| 4 | 66.9 | 17.2 | p50 ≈ 5.0s, p95 5.2s |
+| 6 | 64.6 | ~11 | — |
+| 8 | 68.8 | 9.9 | p95 climbs back |
+
+The sweet spot is **concurrency 4**: the batching gain from 1→4 is real (+155%), while 4→8 just slices the same throughput finer (aggregate +3%, per-stream halved). The aggregate has a soft ceiling ≈65–77 tok/s set by PCIe bandwidth and per-step expert fetch volume — not compute — so raising it needs more bandwidth, not more concurrency. Adding `--max-running-requests 8` lets bs=6 fill the captured bs=8 graph and lifts the c6 aggregate to 76.9, at the cost of p95 rising to 7s (c8 tail 24.8s); use only for throughput-first scenarios.
+
+MoE cache vs decode speed (`ft ctl cache rebuild`, no restart): slots 1024 → 2048 → 3072 give long-text steady-state decode ≈62 → 75 → 84 char/s (≈33 → 40 → 44 tok/s; short text ≈52), cumulatively **+36% with zero quality loss** — the cache stores exact weights, so every gain comes from hit rate. Past ~3072 the curve flattens (another +5–8%, but it eats into the KV pool); stop there.
+
+Long context (turbo4 tier): needle retrieval 6/6 exact (322k/450k tokens × depth 30/60/90%, worst case depth-90% at 35.2s, the rest 5–12s, answers are verbatim random 4-digit numbers). Measured KV ≈6.9 KiB/token → the full 1M-token pool ≈6.8 GiB; TTFT at 901k context is 32.5s with prefill overlap (51s without). Steady-state decode speed is length-independent (same kernel; every length band lands in the same range).
+
+Vision: with `--vision-on`, image requests cost only **+8ms** over text (cold TTFT medians: text 1518ms vs image 1526ms) — the ViT forward (weights ~0.84 GiB, GPU-side) is not the dominant cost; the ~1.5s floor is fixed MoE expert-cache cold-start overhead, which text pays too. A large image (19200 patches) peaks VRAM +984 MiB with first token at 2.9–4.2s. Repeated same-content requests refill from the mm RAM tier (warm TTFT below cold); different images get zero false hits (content keys 13/13 plus adversarial 174/174 green). Beyond 32768 patches the guard returns a clean 400 (`context_length_exceeded`); streaming mode carries it as an in-stream error frame.
 
 ## Tuning notes
 
