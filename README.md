@@ -4,6 +4,14 @@ A patched branch of [FreeToken](https://github.com/FlashML-org/FreeToken) (base:
 
 Upstream is Apache-2.0; this branch keeps its LICENSE and copyright intact. See [Provenance](#provenance).
 
+**Measured on one consumer rig** — single RTX 5090 (32 GB) + 256 GB DDR5 (4×64 GB) over PCIe 5.0, serving Qwen3.8-Flash-Next:
+
+- **1M-token context window** via the turbo4 KV tier
+- **3072 experts resident** in the on-GPU MoE cache
+- **4 concurrent requests** sustained
+- **400 consecutive images** recognized end-to-end (content-keyed mm KV reuse)
+- **40–50 tokens/s** single-stream decode
+
 ## Why this branch
 
 Upstream FreeToken already targets MoE-offload inference, but its Windows path and KV-storage options were thin. The problems this branch solves, in one chain: tiered KV storage (turbo4 ≈ 4× smaller per token than bf16) frees GPU-side room for the MoE expert LRU; a larger expert cache means more hot experts stay on-GPU; and with `--vision-on`, the content-keyed mm tier keeps repeated images/videos from being re-prefilled, so one 32 GB card holds a large MoE, 100k+ tokens of context, and a rich multimodal history at the same time. Concretely, this branch adds or stabilizes:

@@ -6,6 +6,14 @@
 
 上游采用 Apache-2.0 许可证；本分支完整保留其 LICENSE 与版权声明，见 [Provenance](#provenance)。
 
+**单机实测数据** — 单张 RTX 5090（32 GB）+ 256 GB DDR5（4×64 GB）、PCIe 5.0 通道，服务 Qwen3.8-Flash-Next：
+
+- **100 万 token 上下文窗口**（turbo4 KV 档位）
+- **3072 个专家常驻** GPU 内 MoE 缓存
+- **4 路并发**稳定运行
+- **连续识别 400 张图像**全流程通过（内容哈希 mm KV 复用）
+- **单路解码 40–50 tokens/s**
+
 ## 为什么做这个分支
 
 上游 FreeToken 已经面向 MoE-offload 推理，但 Windows 路径和 KV 存储选项较薄弱。本分支解决的问题可以串成一条主线：KV 分级存储（turbo4 每 token 约为 bf16 的 1/4）腾出显存给 MoE 专家缓存；专家缓存越大，热专家越能留在 GPU 上；开启 `--vision-on` 后，内容哈希前缀缓存 + mm RAM 层级让重复的图像/视频不再重新 prefill——于是单张 32 GB 显卡可以同时跑大 MoE、十万级以上上下文和大量图像/视频历史。具体来说，本分支新增或加固了：
