@@ -69,7 +69,7 @@ ft.exe serve --host 0.0.0.0 --port 8001 `
 - `--num-tokens` — paged KV pool size; 1048576 gives the 1M-token window (turbo4: ≈6.9 KiB/token → ≈6.8 GiB at full pool), 524288 trades window for a bigger expert cache (≈3.4 GiB).
 - `--moe-cache-size` — number of experts resident on-GPU (2048 / 3072 above).
 - `--kv-cache-dtype` — see tier table above.
-- `--vision-on` — loads the vision tower (~1 GiB bf16); omit for text-only serving.
+- `--vision-on` — loads the vision tower (bf16 weights ≈0.84 GiB, measured at load); omit for text-only serving.
 - `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies.
 
 Then hit `POST /v1/chat/completions` as with any OpenAI-compatible server.

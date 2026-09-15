@@ -69,7 +69,7 @@ ft.exe serve --host 0.0.0.0 --port 8001 `
 - `--num-tokens` — paged KV 池大小；1048576 对应 100 万 token 窗口（turbo4：≈6.9 KiB/token，满池约 6.8 GiB），524288 则换取更大的专家缓存（约 3.4 GiB）。
 - `--moe-cache-size` — GPU 内常驻专家数量（如上 2048 / 3072）。
 - `--kv-cache-dtype` — 见上文档位表。
-- `--vision-on` — 加载视觉塔（约 1 GiB bf16）；纯文本服务可省略。
+- `--vision-on` — 加载视觉塔（bf16 权重约 0.84 GiB，加载日志实测）；纯文本服务可省略。
 - `--moe-prefill-hit-d2d` — prefill 阶段专家命中走 device-to-device 拷贝。
 
 之后按任意 OpenAI 兼容服务器的方式调用 `POST /v1/chat/completions` 即可。
