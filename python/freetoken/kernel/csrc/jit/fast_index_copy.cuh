@@ -33,36 +33,36 @@ inline constexpr auto get_mem_package() {
     }
 }
 
-__forceinline__ __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
 }
 
-__forceinline__ __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
 }
 
-__forceinline__ __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
 }
 
-__forceinline__ __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
 }
 
-__forceinline__ __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     asm volatile("st.global.wt.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
 }
 
-__forceinline__ __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     uint32_t tmp2 = value.z;
@@ -70,7 +70,7 @@ __forceinline__ __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
 
-__forceinline__ __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
+__always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
@@ -86,7 +86,7 @@ template <std::size_t kUnit>
 using mem_package_t = decltype(get_mem_package<kUnit>());
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads>
-__forceinline__ __device__ auto load_vec(const void* __restrict__ src) {
+__always_inline __device__ auto load_vec(const void* __restrict__ src) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -106,7 +106,7 @@ __forceinline__ __device__ auto load_vec(const void* __restrict__ src) {
 }
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads, typename Tp>
-__forceinline__ __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
+__always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;

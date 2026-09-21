@@ -30,7 +30,8 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     if getattr(config, "kv_cache_dtype", "bf16") == "turbo4":
         # 4-bit TurboQuant: head_dim/2 packed-nibble BYTES plus one bf16 dequant scale per
         # (token, head, slab). uint8's itemsize would double-count the nibbles, so the
-        # arithmetic is spelled out; the engine gate keeps turbo4 off MLA/DSA/BSA pools.
+        # arithmetic is spelled out; the engine gate keeps turbo4 on the QSA and MLA-latent
+        # families only -- an MLA row is heads=1, so the formula prices its one scale/row.
         per_token = slabs * (spec.head_dim // 2 + 2) * heads * spec.num_layers
     else:
         # paged-KV STORAGE itemsize: fp8 (--kv-cache-dtype) halves this term; the trailing

@@ -90,6 +90,19 @@ Concurrency ladder (text, `max_tokens=96`):
 
 The sweet spot is **concurrency 4**: the batching gain from 1→4 is real (+155%), while 4→8 just slices the same throughput finer (aggregate +3%, per-stream halved). The aggregate has a soft ceiling ≈65–77 tok/s set by PCIe bandwidth and per-step expert fetch volume — not compute — so raising it needs more bandwidth, not more concurrency. Adding `--max-running-requests 8` lets bs=6 fill the captured bs=8 graph and lifts the c6 aggregate to 76.9, at the cost of p95 rising to 7s (c8 tail 24.8s); use only for throughput-first scenarios.
 
+Qwen3.8-Flash-Next-ABLITERATED-NVFP4 (0.1.3, launched with `--num-tokens 262144 --moe-cache-size 5120 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d --host 0.0.0.0 --port 8000`, 127 completion tokens per generation, two passes, zero failures):
+
+| concurrency | pass 1 tok/s | pass 2 tok/s | pass 1 avg latency | pass 2 avg latency |
+|---|---|---|---|---|
+| bs=1 | 24.5 | 15.1 | 5.17s | 8.40s |
+| bs=2 | 41.2 | 26.9 | 6.17s | 9.40s |
+| bs=4 | 92.2 | 28.4 | 5.50s | 16.84s |
+| bs=8 | 67.3 | 32.8 | 14.23s | 29.28s |
+
+Pass-1 throughput scales well from bs=1→4 (peak 92.2 tok/s at bs=4), then drops at bs=8 — consistent with the server's `max_running_req=4` cap: bs=8 requests queue in two waves (max latency 31.9s). Pass 2 was uniformly slower rather than faster, which is unusual for a warm cache; another client held two established connections to the server during testing, so the second pass likely shared the GPU with that traffic. For a clean isolation number, close the other client and re-run.
+
+Model choice: GLM-5.3-Flash is heavy on a single 5090 (32 GB) — ≈10–12 tok/s per stream; prefer the Qwen3.8-Flash-Next class for snappier single-stream responses on the same rig.
+
 MoE cache vs decode speed (`ft ctl cache rebuild`, no restart): slots 1024 → 2048 → 3072 give long-text steady-state decode ≈62 → 75 → 84 char/s (≈33 → 40 → 44 tok/s; short text ≈52), cumulatively **+36% with zero quality loss** — the cache stores exact weights, so every gain comes from hit rate. Past ~3072 the curve flattens (another +5–8%, but it eats into the KV pool); stop there.
 
 Long context (turbo4 tier): needle retrieval 6/6 exact (322k/450k tokens × depth 30/60/90%, worst case depth-90% at 35.2s, the rest 5–12s, answers are verbatim random 4-digit numbers). Measured KV ≈6.9 KiB/token → the full 1M-token pool ≈6.8 GiB; TTFT at 901k context is 32.5s with prefill overlap (51s without). Steady-state decode speed is length-independent (same kernel; every length band lands in the same range).

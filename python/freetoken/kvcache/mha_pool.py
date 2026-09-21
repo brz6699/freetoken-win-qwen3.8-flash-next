@@ -63,8 +63,11 @@ class MHAKVCache(BaseKVCachePool):
         else:
             storage_head_dim = head_dim
             self._tq_dim = 0
+        # Quantizing-store limit: saturating clamp at the storage max (scale 1.0). Set for any
+        # quantized non-turbo storage (fp8) so store_kv takes the clamp+scatter path; turbo4 has
+        # its own packed store and plain bf16 (storage == dtype) needs no clamp.
         self._quant_limit = None
-        if self._kv_quant is None and storage_dtype != dtype:
+        if storage_dtype != dtype and self._kv_quant != "turbo4":
             self._quant_limit = float(torch.finfo(storage_dtype).max)
         self._kv_buffer = torch.empty(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, storage_head_dim),
@@ -176,9 +179,11 @@ class MHAKVCache(BaseKVCachePool):
         idx = slots.to(torch.int64).to(self._device)
         rows = self._kv_buffer.shape[1] * 2
         tokens = self._storage_shape[0]
-        self._kv_buffer.view(rows, tokens, -1).index_copy_(1, idx, data["kv"])
+        # a text-prefix restore trims the boundary below the stored length; slice the parked
+        # rows to the destination count (no-op when they already match, e.g. mm exact hits).
+        self._kv_buffer.view(rows, tokens, -1).index_copy_(1, idx, data["kv"][:, : idx.shape[0]])
         if self._dscale_buffer is not None and "ds" in data:
-            self._dscale_buffer.view(rows, tokens, -1).index_copy_(1, idx, data["ds"])
+            self._dscale_buffer.view(rows, tokens, -1).index_copy_(1, idx, data["ds"][:, : idx.shape[0]])
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[self._dense(index)]

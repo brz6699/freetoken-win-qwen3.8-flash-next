@@ -2,7 +2,7 @@
 
 README 面向使用者（功能、安装、参数）；本文件面向维护者，按轮次记录改造思路、改动文件与验证过程。
 
-版本: freetoken 0.1.2+g816c324d0 (P4 = 多模态图像请求的内容哈希前缀缓存键 + 拼贴(splice)不变量修复)
+版本: freetoken 0.1.3+gafd99cb (merged-src, 打包于 2026-09-21; 上一阶段 P4 = 内容哈希前缀缓存键 + 拼贴(splice)不变量修复, 见 Round-4~6)
 
 ## 本阶段功能 (P4)
 1. 内容键缓存: tokenizer worker 用图像像素负载的 sha1 生成 content id, mm 请求的前缀
@@ -77,3 +77,56 @@ MANIFEST.sha256 为包内全部文件的逐文件 SHA256; zip 整体摘要见 SH
 写回); vision 两套回归全绿; live serve (:8001) 冒烟全绿 — 同内容重复请求走 restore 路径答对,
 image_url+video 混合腿正确判定 (绿静图 ∉ {红,蓝} 动画), prompt_tokens=238。
 注: reasoning 腿预算需 ≥512 (推理文本可超 500 token, content 在其后)。
+
+## Round-7 (2026-09-21): 0.1.3 merged-src — 新模型家族 + mm 管线独立化 + 量化/MoE/权重流式框架
+
+来源: freetoken-0.1.3+gafd99cb-merged-src-2026-09-21.zip，覆盖到 python/ 源码路径（含随包的
+tvm_ffi_cpp_extension_py/，对应 apache-tvm-ffi==0.1.13.post3 的 C++ 扩展）。共约 165 个文件变更。
+
+### 本阶段功能
+
+1. 新模型家族
+   - glm5_next (GLM-5.3-Flash): 完整支持 (attention/moe/mlp/kda/vision/weight)。线性注意力走
+     KDA fused recurrent 内核 (kernel/fla/: fused_recurrent、kda、chunk_delta_h、solve_tril)；
+     残差流采用 mHC — Manifold-Constrained Hyper-Connections (layers/mhc.py + Triton fused 内核
+     kernel/triton/mhc.py)：hc_mult 条并行流由单次 fp32 GEMM 产生 pre/post/comb 三组混合映射，
+     comb 经 softmax + Sinkhorn 近似双随机投影（"流形约束"：混合既不放大也不损失残差质量）。
+     torch 实现为正确性基线，Triton 内核逐位对齐后接管 CUDA 路径。
+   - qwen3_vl: 新增视觉语言模型支持 (config/model/vision/weight)。
+   - minimax_m3、muse_glimmer: 各补 vision.py，接入多模态路径。
+
+2. kpool DSA 索引 (attention/dsa_indexer_kpool.py + kernel/triton/kpool_compress.py)
+   indexer K 缓存按 pool 粒度打分：每 index_kpool(=4) 个连续 token 折叠为一条 entry（逐通道
+   softmax(gate+APE) 加权和），indexer 计算与 top-k 缩小 4 倍；选择 index_topk//kpool 个 pool 后
+   展开回 token 行，请求尾部不满 pool 强制选入 (index_kpool_always_select_tail)，稀疏 MLA 内核用
+   -1 gather-only 哨兵补齐宽度 (kpool-1) + select_k*kpool。
+
+3. 多模态管线独立成包 (mm/: config、media、processor+processors、encoder_cache)
+   调度侧新增 scheduler/mm.py：mm chunk 规划（gather 哪些 embedding 行、编码哪些 item），chunk
+   边界在切断 image span 前回撤到 align 倍数——延续 Round-4 的 pad 不变量。新增启动参数:
+   --mm-disable / --mm-embed-cache-device / --mm-encoder-weights / --mm-processor-kwargs /
+   --image-min-tokens / --image-max-tokens / --allowed-media-domains /
+   --allowed-local-media-path / --text-model-only。
+
+4. 量化框架 (layers/quantization/)
+   registry + scheme + backend 三层结构。linear: fp8_block / fp8_tensor / mxfp8 / nvfp4 /
+   unquantized；moe: fp8_block / mxfp4 / mxfp8 / nvfp4 / unquantized；configs: compressed_tensors /
+   fp8 / modelopt / mxfp4。启动参数 --quant-backend。
+
+5. MoE 主机 bank 与权重流式
+   - moe/expert_pieces.py: checkpoint 侧 build_expert_banks 的流式 piece 格式
+     (bank_layer, e0, e1, 各投影含 _scale/_global 伴随量或已融合 gate_up)，由 expert kernel 的
+     pack 决定 bank 布局；moe/legacy_format.py 兼容旧格式。参数 --moe-backend / --moe-strategy。
+   - models/weight_stream.py: 块权重从 pinned host bank 经双 staging buffer 流式上传——block i
+     计算时 copy stream 并行填充 block i+1。
+   - qwen4_exp/ple_disk.py + kernel/csrc/ple_store (C++ 扩展): PLE 落盘后端，参数 --ple-backend。
+
+6. API 层
+   - responses_api: 输入项支持结构化 content（list 形态）；tool 输出含图像时，图像挂在随后的
+     user 轮上（chat template 只渲染文本，与 Anthropic 路径行为一致）；GenerationError 透传
+     HTTP 状态码。
+   - anthropic_api / openai_api / tokenizer server 相应适配与精简。
+
+### 与本仓库既有约定的衔接
+- 版本号唯一来源仍是 python/freetoken/version.py (0.1.3)，pyproject 经 attr 指令读取。
+- kernel cache wheel (freetoken-kernel-cache/) 保持独立打包，不随本 zip 变动。

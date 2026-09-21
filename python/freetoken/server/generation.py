@@ -23,6 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -42,12 +43,14 @@ from .reasoning_parser import (
 )
 
 
-class GenerationError(Exception):
+class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
     adapter turns this into its own wire-level error instead of hanging on a reply that never
     arrives. ``code`` carries the stable class (``UserReply.error_code``) when the failure has
-    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose."""
+    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose.
+
+    Subclasses ValueError so every adapter's invalid-request handler maps it to a 400."""
 
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
@@ -163,6 +166,7 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -179,7 +183,7 @@ def resolve_sampling(
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        max_tokens=default_max_tokens if max_tokens is None else max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
@@ -189,9 +193,8 @@ def resolve_sampling(
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string (image parts keep their order as a part list, for the
-    vision pipeline) and decode tool-call arguments from JSON. Raises ValueError on
-    an unknown part type. Shared by all adapters."""
+    content parts to a string and decode tool-call arguments from JSON. Raises
+    ValueError on a non-text content part (text-only server). Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -231,70 +234,50 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> "str | list[dict[str, Any]]":
-    """Flatten text content parts; keep image parts for the vision path.
-
-    Text-only content flattens to a plain string exactly as before. When an
-    ``image_url`` / ``video``(``_url``) part is present the part list survives
-    (in original order) as template-shaped dicts: ``{"type": "text", "text": ...}``,
-    ``{"type": "image", "image": <url>}`` and
-    ``{"type": "video", "video": <url or frame-list>}`` -- the chat template's
-    render_content matches parts carrying an ``image`` / ``video`` key, and the
-    tokenizer worker extracts them (data: URI, http(s) URL, local path, or an
-    ordered frame-reference list for video) to run the HF image processor.
-    """
-    rendered: list[dict[str, Any]] = []
-    has_media = False
+def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    """Plain string for text-only parts; a template-ready part list with {"type": "image"} entries (source kept under freetoken_ref) when images are present."""
+    out: list[dict[str, Any]] = []
+    has_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
-            rendered.append(
-                {"type": "text", "text": (part.get("text") if isinstance(part, dict) else None) or ""}
-            )
-        elif ptype == "image_url":
-            url = _image_part_url(part)
-            if url is None:
-                raise ValueError("image_url content part is missing its url")
-            rendered.append({"type": "image", "image": url})
-            has_media = True
-        elif ptype in ("video", "video_url"):
-            url = _video_part_url(part)
-            if url is None:
-                raise ValueError("video content part is missing its url")
-            rendered.append({"type": "video", "video": url})
-            has_media = True
+            out.append({"type": "text", "text": part.get("text") or ""})
+        elif ptype in ("image_url", "input_image"):
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            url = url or part.get("url")
+            if not url:
+                raise ValueError("image content part carries no url")
+            out.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+        elif ptype in ("video_url", "input_video"):
+            url = part.get("video_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            url = url or part.get("url")
+            if not url:
+                raise ValueError("video content part carries no url")
+            out.append({"type": "video", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+        elif ptype in ("image", "video") and isinstance(part.get("freetoken_ref"), dict):
+            out.append(part)
+            has_image = True
         else:
-            raise ValueError(
-                f"Unsupported content part type: {ptype!r} (text, image_url and video are supported)"
-            )
-    if not has_media:
-        return "".join(p["text"] for p in rendered)
-    return rendered
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    if not has_image:
+        return "".join(p["text"] for p in out)
+    return out
 
 
-def _image_part_url(part: dict[Any, Any]) -> "str | None":
-    url = part.get("image_url")
-    if isinstance(url, dict):
-        url = url.get("url")
-    if isinstance(url, str) and url:
-        return url
-    return None
-
-
-def _video_part_url(part: dict[Any, Any]) -> "str | list[str] | None":
-    """Video reference(s) from a video/video_url part: a single url string or an
-    ordered list of frame references. Both OpenAI (``video_url``) and template
-    (``video``) spellings are read."""
-    url = part.get("video_url")
-    if url is None:
-        url = part.get("video")
-    if isinstance(url, dict):
-        url = url.get("url")
-    if isinstance(url, str) and url:
-        return url
-    if isinstance(url, (list, tuple)) and url:
-        return [str(u) for u in url if isinstance(u, str) and u]
-    return None
+async def _resolve_images(refs: list[dict[str, Any]], state: Any) -> list[bytes]:
+    """Gate and fetch a request's images; every failure is a GenerationError."""
+    if reason := image_reject_reason(state.config):
+        raise GenerationError(reason)
+    try:
+        return await fetch_image_bytes(refs, state.config)
+    except ValueError as exc:
+        raise GenerationError(str(exc)) from exc
 
 
 def split_tool_lists(
@@ -317,6 +300,8 @@ def split_tool_lists(
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    refs = collect_image_refs(spec.messages)
+    images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -325,6 +310,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=images,
         )
     )
     return uid
@@ -348,19 +334,22 @@ async def count_prompt_tokens(
     class the generation path maps to a 400. A tokenizer *initialization* failure (missing
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
+    refs = collect_image_refs(messages)
+    images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
         text=messages,
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        images=images,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
-        input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
+        (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
-    return int(input_ids.numel())
+    return int(user_msg.input_ids.numel())
 
 
 async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:

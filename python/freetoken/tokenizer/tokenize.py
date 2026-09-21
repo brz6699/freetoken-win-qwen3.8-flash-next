@@ -4,14 +4,16 @@ import importlib.util
 import json
 import os
 import threading
-from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
-from freetoken.message import TokenizeMsg
+from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from freetoken.mm.processor import MMProcessor
 
 from .effort import (
     EffortProfile,
@@ -20,21 +22,8 @@ from .effort import (
     probe_thinking_profile,
     quantize_effort,
 )
-from .media import MediaPipeline, extract_image_urls, vision_geometry
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class TokenizeResult:
-    """One tokenized request: the (possibly image-expanded) prompt tokens, plus the
-    multimodal side channels (flat [P*3] int32 mrope table / staged payload path) or
-    None for a text-only request."""
-
-    input_ids: torch.Tensor
-    mm_mrope: torch.Tensor | None = None
-    mm_data_path: str | None = None
-    mm_cache_key: torch.Tensor | None = None
 
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
@@ -61,22 +50,17 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
+        self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
-        # Vision capability probe (checkpoint files, no weights): gates the per-request
-        # image scan so text-only checkpoints pay zero vision cost.
-        self._media_pipeline: MediaPipeline | None = None
-        self._vision_supported = vision_geometry(
-            str(getattr(tokenizer, "name_or_path", "") or "")
-        ) is not None
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List["TokenizeResult"]:
-        results: List[TokenizeResult] = []
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
+        results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
@@ -92,31 +76,25 @@ class TokenizeManager:
                 )
             )
             input_ids = input_ids.view(-1).to(torch.int32)
-            # Image-bearing chat: the template rendered one image_pad per image; expand
-            # each to its grid's token block, build the M-RoPE table, stage the pixels.
-            mm_mrope: torch.Tensor | None = None
-            mm_data_path: str | None = None
-            mm_cache_key: torch.Tensor | None = None
-            if self._vision_supported and isinstance(msg.text, list) and extract_image_urls(msg.text):
-                ids, table, path, key = self._media().prepare(msg.text, input_ids)
-                input_ids, mm_mrope, mm_data_path, mm_cache_key = ids, table, path, key
-            results.append(TokenizeResult(input_ids, mm_mrope, mm_data_path, mm_cache_key))
+            if msg.images:
+                if self.mm_processor is None:
+                    raise ValueError("image input is not supported for this model")
+                mm = self.mm_processor.apply(input_ids, msg.images)
+                results.append(
+                    UserMsg(
+                        uid=msg.uid,
+                        input_ids=mm.input_ids,
+                        sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items,
+                        mrope_positions=mm.mrope_positions,
+                        mrope_delta=mm.mrope_delta,
+                    )
+                )
+            else:
+                results.append(
+                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                )
         return results
-
-    def _media(self) -> "MediaPipeline":
-        if self._media_pipeline is None:
-            from .media import MediaPipeline
-
-            geometry = vision_geometry(str(getattr(self.tokenizer, "name_or_path", "") or ""))
-            if geometry is None:
-                raise ValueError("checkpoint exposes no image token id; vision is not supported")
-            self._media_pipeline = MediaPipeline(
-                str(getattr(self.tokenizer, "name_or_path", "")),
-                geometry["image_token_id"],
-                geometry["vision_config"],
-                geometry.get("video_token_id"),
-            )
-        return self._media_pipeline
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can

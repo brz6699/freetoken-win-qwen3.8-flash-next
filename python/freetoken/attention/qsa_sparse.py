@@ -90,10 +90,14 @@ class QSASparseMetadata(BaseAttnMetadata):
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
     # M-RoPE (image batches only; None keeps every indexer rope on 1-D logical positions).
     # pos3 is the [T, 3] triple of each row's CLOSING group's first token (host-built:
-    # mm_mrope rows below the prompt, base + k above it); rows_pos3 is the batch's own
+    # mrope_positions_full rows below the prompt, f + mrope_delta above it); rows_pos3 is the batch's own
     # [T, 3] table for the indexer query rows.
     pos3:             torch.Tensor | None = None  # [T, 3] int32, group-first triples
     rows_pos3:        torch.Tensor | None = None  # [T, 3] int32, this forward's rows
+    # mrope only, built once per forward: row r of the caches is token r's [cos | sin] (queries) or its group start's (keys)
+    rope_rows:        torch.Tensor | None = None  # [T] int32 arange
+    q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -150,6 +154,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 "QSA attend: turbo4 packed KV (4-bit nibble rotspace, "
                 "Q rotated / output unrotated)"
             )
+        self._section_table: torch.Tensor | None = None
+        if group.rotary_config.mrope_section is not None:
+            from freetoken.layers.rotary import build_section_table
+
+            self._section_table = build_section_table(
+                tuple(group.rotary_config.mrope_section), group.rotary_config.mrope_layout
+            ).to(self.device)
 
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
@@ -211,6 +222,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 )
             self._index_cos_sin = rope._cos_sin_cache.to(self.device)
         return self._index_cos_sin
+
+    def _index_rope_rows(self, positions: torch.Tensor) -> torch.Tensor:
+        """Per-token indexer cos/sin rows for [3, n] mrope positions."""
+        from freetoken.layers.rotary import mrope_cos_sin_rows
+
+        return mrope_cos_sin_rows(self._index_rope_cache(), positions, self._section_table)
 
     # ----- metadata -----------------------------------------------------------------------
     def prepare_metadata(self, batch: Batch) -> None:
@@ -336,10 +353,30 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
-        md.rows_pos3 = getattr(batch, "mrope_positions", None)
+        # Batch.mrope_positions is [3, T] (engine/graph build); the pos3 kernel contract is
+        # row-major [T, 3] (tok * stride_row + channel), so orient it here once.
+        mrope = getattr(batch, "mrope_positions", None)
+        if mrope is not None and mrope.shape[0] == 3 and mrope.shape[1] != 3:
+            mrope = mrope.transpose(0, 1).contiguous()
+        md.rows_pos3 = mrope
         md.pos3 = self._plan_group_mrope(md, batch)
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
+        if self._section_table is not None:
+            rope_positions = batch.get_attn_positions()
+            if rope_positions.dim() == 1:
+                rope_positions = rope_positions.unsqueeze(0).expand(3, -1)
+            rope_positions = rope_positions.to(torch.int32)
+            self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
+            # groups are ratio-aligned within a page, so the group start is the slot rounded down
+            first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()
+            md.rope_rows = torch.arange(out_loc.numel(), dtype=torch.int32, device=self.device)
+            # USE_MROPE forwards read the raw cache + pos3 triples, so the folded per-row
+            # cos/sin caches are only needed when the indexer stays on the row-index path
+            # (md.pos3 None -> text-only). Skip building them otherwise.
+            if md.pos3 is None:
+                md.q_rope_cache = self._index_rope_rows(rope_positions)
+                md.k_rope_cache = self._index_rope_rows(first_pos)
         rows = torch.arange(out_loc.numel(), device=self.device)
         req = md.token_to_req.to(torch.int64)
         slots = md.ring_slots.to(torch.int64).index_select(0, req)
@@ -359,13 +396,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def _plan_group_mrope(self, md: QSASparseMetadata, batch: Batch) -> torch.Tensor | None:
         """The [T, 3] M-RoPE triple of each row's closing group's FIRST token, host-built
-        (no GPU sync): below the prompt the request's mm_mrope table owns the triple,
-        past it every decode step is ``mm_mrope_base + (f - prompt_len)`` on all three
+        (no GPU sync): below the prompt the request's mrope_positions_full table owns
+        the triple, past it every decode step is ``f + mrope_delta`` on all three
         channels (HF's rope_deltas rule). Non-closing rows land on scratch rows the
         score path never reads, so their triples are unconstrained. None (the whole
         batch text) keeps the indexer on the 1-D logical path."""
         reqs = batch.padded_reqs
-        if not any(r.mm_mrope is not None for r in reqs):
+        if not any(r.mrope_positions_full is not None for r in reqs):
             return None
         T = md.positions.numel()
         host = torch.empty(T, 3, dtype=torch.int32, pin_memory=True)
@@ -375,22 +412,22 @@ class QSASparseAttnBackend(BaseAttnBackend):
             first = torch.arange(
                 req.cached_len, req.device_len, dtype=torch.int32
             ) - (self.ratio - 1)
-            if req.mm_mrope is None:
+            table = req.mrope_positions_full  # [3, prompt_len] int32, CPU
+            if table is None:
                 host[offset : offset + n] = first.clamp_(min=0)[:, None]
             else:
-                prompt_len = req.mm_mrope.shape[0]
-                base = req.mm_mrope_base
+                prompt_len = table.shape[1]
                 # Out-of-place clamp, BOTH ends: an in-place clamp_ would alias
-                # `first` and make `in_table` trivially true (dead base+k branch).
+                # `first` and make `in_table` trivially true (dead delta branch).
                 # min=0: the first group starts before index 0 (its real first token
                 # IS 0). max=prompt_len-1: groups past the prompt (decode, or the
-                # prompt's last partial group) take the base+k rule below instead.
+                # prompt's last partial group) take the f + mrope_delta rule instead.
                 idx = torch.clamp(first, min=0, max=prompt_len - 1)
                 in_table = (first < prompt_len)[:, None]
                 values = torch.where(
                     in_table,
-                    req.mm_mrope[idx],
-                    (base + (first - prompt_len).clamp_(min=0))[:, None],
+                    table[:, idx].transpose(0, 1),
+                    (first + req.mrope_delta)[:, None],
                 )
                 host[offset : offset + n] = values
             offset += n
@@ -420,10 +457,19 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        if md.pos3 is not None:
+            # USE_MROPE indexes the cos/sin cache by ABSOLUTE position triples, so it needs
+            # the raw per-position cache; the folded [T, rot] rows are keyed by row index and
+            # would be re-selected a second time (wrong rows -> wrong rotation).
+            rope_positions, rope_cache = md.rope_rows, self._index_rope_cache()
+        elif md.k_rope_cache is None:
+            rope_positions, rope_cache = first, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.k_rope_cache
         qsa_index_norm_rope(
             pooled,
-            first,
-            self._index_rope_cache(),
+            rope_positions,
+            rope_cache,
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
@@ -450,10 +496,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
         q_index = self._scratch(
             "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
         )
+        if md.rows_pos3 is not None:
+            rope_positions, rope_cache = md.rope_rows, self._index_rope_cache()
+        elif md.q_rope_cache is None:
+            rope_positions, rope_cache = positions, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.q_rope_cache
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
+            rope_positions,
+            rope_cache,
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Generic, TypeVar
 
+import sys
+import zlib
+
 import msgpack
 import zmq
 import zmq.asyncio
-
-import sys
-import zlib
 
 T = TypeVar("T")
 

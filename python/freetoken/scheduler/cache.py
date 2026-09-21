@@ -10,9 +10,7 @@ import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.kvcache.radix_cache import RadixCacheHandle
-from freetoken.utils import align_down, div_ceil, init_logger
-
-logger = init_logger(__name__)
+from freetoken.utils import align_down, div_ceil
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -32,6 +30,19 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # prompt end. The gap covers templates whose generation prompt injects tokens that vanish when
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
+# Token-id window that keys a TEXT prefix in the RAM tier (mm requests key on per-item
+# content hashes instead). Both the store side (finished Req) and the restore side
+# (matching PendingReq) hash the SAME first-cap window, so a shared prompt prefix lands in
+# the same bucket; the exact boundary is then verified off the stored ids in restore_mm.
+_TIER_HASH_CAP = 256
+
+
+def _tier_cap_bytes() -> int:
+    raw = os.environ.get("FREETOKEN_MM_TIER_MB", "1024")
+    try:
+        return max(0, int(raw)) * 2**20
+    except ValueError:
+        return 1024 * 2**20
 
 
 @dataclass(frozen=True)
@@ -57,14 +68,6 @@ class _PlainTierHandle(RadixCacheHandle):
 
     def get_matched_indices(self) -> torch.Tensor:
         return self.kv_indices
-
-
-def _tier_cap_bytes() -> int:
-    raw = os.environ.get("FREETOKEN_MM_TIER_MB", "1024")
-    try:
-        return max(0, int(raw)) * 2**20
-    except ValueError:
-        return 1024 * 2**20
 
 
 class CacheManager:
@@ -99,13 +102,14 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
-        # mm RAM tier: finished multimodal requests park their prompt-span KV (packed rows +
-        # GDN state) in host RAM; a later request with the SAME content key promotes it back
-        # into freshly allocated VRAM pages instead of recomputing the media span. Lives
-        # beside the VRAM radix tree (which it only ever extends: restore happens when the
-        # tree match is shorter than the tier entry's boundary).
+        # RAM tier: finished requests park their prompt-span KV (packed rows + GDN state) in host
+        # RAM; a later request whose prefix matches identically promotes it back into freshly
+        # allocated VRAM pages instead of recomputing the span. Lives beside the VRAM radix tree
+        # (which it only ever extends: restore happens when the tree match is shorter than the tier
+        # entry's boundary). mm requests key on the per-item content hashes the mm processor already
+        # computes; text requests key on a first-cap token-id window with exact boundary verify.
         self.kv_pool = kv_pool
-        self._mm_tier: "OrderedDict[int, Tuple[Any, dict, Any, int, int]]" = OrderedDict()
+        self._mm_tier: "OrderedDict[int, Tuple[Any, Any, dict, Any, int, int]]" = OrderedDict()
         self._mm_tier_bytes = 0
         self._mm_tier_cap = _tier_cap_bytes()
 
@@ -137,88 +141,177 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
+    def _mm_bound(self, req: PendingReq, cached_len: int) -> int:
+        """Cap an mm prefix match so it never cuts inside a media pad run. A half-cached pad run
+        leaves some vision pads cached and the rest in the rows -> the splice count mismatches on
+        the follow-up turn. Pull the boundary back to the first pad run's start, page-aligned."""
+        items = getattr(req, "mm_items", None)
+        if not items or not items[0].offsets:
+            return cached_len
+        lo, hi = items[0].offsets[0]
+        if lo <= cached_len < hi:
+            return align_down(lo, self.page_size)
+        return cached_len
+
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        # Multimodal requests must not reuse a shared prefix keyed on RAW ids: image-placeholder
-        # tokens have identical ids across images but carry different content (and KV), so a
-        # raw match would serve the wrong image's KV. P4: when the worker supplied a content
-        # key (image_pad runs -> payload-hash id), match on IT -- identical images then reuse
-        # the cached prefix, different images never false-match. Keyless mm (offline
-        # precomputed embeds) still matches the empty prefix (no cross-request reuse).
-        mm_span = None
-        if req.mm_embeds is not None and req.mm_cache_key is not None:
-            key = req.mm_cache_key
-            ids = key[: input_len - 1]
-            # Splice invariant (Qwen4ExpModel.forward): the vision soft tokens are scattered
-            # onto exactly the pad positions of THIS forward's rows, and the worker always
-            # supplies ALL of the image's soft rows. A match that cuts a pad run in half
-            # would leave some pads cached and the rest in the rows -> count mismatch kills
-            # the scheduler on the follow-up turn. So an mm match may either stay before the
-            # first pad run (whole span in the rows -- the normal case) or clear the LAST
-            # run (span fully cached, zero pads in the rows, nothing to scatter); a boundary
-            # in between is pulled back to the first run's start, page-aligned. A pulled-back
-            # match also drops any donated GDN snapshot: it sits at the UNCAPPED node
-            # boundary, and COW-restoring it (mamba_restore_src) would over-advance the state
-            # to a boundary past what this request actually cached.
-            diff = (key[: input_len] != req.input_ids[: input_len]).nonzero()
-            if diff.numel():
-                pads = torch.nonzero(
-                    req.input_ids[: input_len]
-                    == req.input_ids[int(diff[0, 0])]).squeeze(1)
-                mm_span = (int(pads[0]), int(pads[-1]) + 1)
-        elif req.mm_embeds is not None:
-            ids = req.input_ids[:0]
-        else:
-            ids = req.input_ids[: input_len - 1]
-
-        def _mm_bound(cached_len: int) -> int:
-            if mm_span is None or not (mm_span[0] <= cached_len < mm_span[1]):
-                return cached_len
-            return align_down(mm_span[0], self.page_size)
-
+        ids = req.input_ids[: input_len - 1]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            cap = _mm_bound(m.cached_len)
+            cap = self._mm_bound(req, m.cached_len)
             if cap != m.cached_len:
                 return MatchResult(SWACacheHandle(cap, m.node, m.kv_indices[:cap]))
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            cap = _mm_bound(m.cached_len)
+            cap = self._mm_bound(req, m.cached_len)
             if cap != m.cached_len:
+                # pulled back past the donated GDN snapshot's node: drop it so the COW restore
+                # does not over-advance the state beyond what this request actually cached.
                 return MatchResult(HybridCacheHandle(cap, m.node, m.kv_indices[:cap]))
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         m = self.prefix_cache.match_prefix(ids)
-        cap = _mm_bound(m.cuda_handle.cached_len)
+        cap = self._mm_bound(req, m.cuda_handle.cached_len)
         if cap != m.cuda_handle.cached_len:
             from freetoken.kvcache.radix_cache import RadixCacheHandle
             return MatchResult(RadixCacheHandle(cap, m.cuda_handle.node))
         return m
 
-    def _full_key(self, req: Req) -> torch.Tensor:
-        """The request's full prefix-cache key, long enough to cover req.cached_len.
+    # ---------------- mm RAM tier (store on finish / restore on match) ----------------
+    @staticmethod
+    def _tier_digest(hashes) -> int:
+        # ``int(h)`` keeps the hash in python-int range: a tuple of item hashes is a no-op,
+        # an int32 tensor key would otherwise overflow int32 before the modulo.
+        d = len(hashes)
+        for h in hashes:
+            d = (d * 1_000_003 + int(h)) % (1 << 62)
+        return d
 
-        An mm request keys its PROMPT on the content key (image_pad runs -> payload-hash
-        id; same length as the prompt). The SAMPLED tail is plain text -- generation never
-        emits image_pad -- so it keys on the raw input_ids there. Without the tail the key
-        stops at the prompt end while cached_len runs past it (finish = prompt + generated -
-        1), and the insert would truncate the node boundary to the key length: orphaning the
-        generated KV pages and attaching the donated GDN state (which covers cached_len
-        tokens) to a shorter boundary. A continuation turn re-tokenizes the same response to
-        the same ids, so the grown key matches its cached form exactly. Text requests key on
-        input_ids (already grown by append_host); unchanged.
-        """
-        key = req.mm_cache_key
-        if key is None:
-            return req.input_ids
-        tail = req.input_ids[key.shape[0]:]
-        if tail.numel() == 0:
-            return key
-        return torch.cat([key, tail])
+    @staticmethod
+    def _tier_hashes(obj) -> tuple:
+        """Bucket key for a tier entry. mm requests key on the per-item content hashes the mm
+        processor already computes; text requests key on the first ``_TIER_HASH_CAP`` token ids.
+        Both sides (finished Req on store, PendingReq on restore) hash the SAME window so a shared
+        prefix lands in one bucket. The bucket is only a coarse key -- restore verifies the exact
+        boundary before reusing the parked rows (mm: full hash equality; text: common-prefix of the
+        stored ids)."""
+        items = getattr(obj, "mm_items", None)
+        if items:
+            return tuple(item.hash for item in items)
+        ids = obj.input_ids
+        head = ids[: min(len(ids), _TIER_HASH_CAP)]
+        return tuple(head.tolist()) if hasattr(head, "tolist") else tuple(head)
+
+    def _tier_store(self, req: Req) -> None:
+        """Park a finished mm request's prompt-span KV + GDN state in host RAM, keyed on the
+        items' content hashes. The KV/state pair must cover EXACTLY the boundary ``b``: prefer
+        the pending ×CHUNK track (the frozen ping-pong slot covers ``mamba_last_track_seqlen``
+        exactly); fall back to the live slot only when it ends precisely at the prompt end. A
+        mismatched pair would over-advance the GDN recurrence on restore -- skip instead."""
+        pool = self.kv_pool
+        if pool is None or self._mm_tier_cap == 0 or self.is_swa:
+            return
+        if not hasattr(pool, "snapshot_rows"):
+            return
+        items = getattr(req, "mm_items", None)
+        hashes = self._tier_hashes(req)
+        prompt_len = max(0, req.max_device_len - req.output_len)
+        L = req.mamba_last_track_seqlen
+        if self.is_hybrid:
+            frozen = (
+                req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+                if req.mamba_ping_pong is not None
+                else None
+            )
+            if (
+                L is not None
+                and 0 < L <= prompt_len
+                and align_down(L, self.page_size) == L
+                and frozen is not None
+            ):
+                b, state_src = L, frozen
+            elif (
+                L is None
+                and req.cached_len == prompt_len
+                and align_down(prompt_len, self.page_size) == prompt_len
+            ):
+                b, state_src = prompt_len, req.linear_slot_idx
+            else:
+                return
+        else:
+            b, state_src = align_down(prompt_len, self.page_size), None
+        if b <= 0:
+            return
+        slots = self.page_table[req.table_idx, :b]
+        rows = pool.snapshot_rows(slots)
+        gdn = self.linear_state_pool.snapshot_state(state_src) if state_src is not None else None
+        nbytes = sum(int(t.numel()) * int(t.element_size()) for t in rows.values())
+        if gdn is not None:
+            nbytes += sum(int(t.numel()) * int(t.element_size()) for t in gdn[:2]) + sum(
+                int(t.numel()) * int(t.element_size()) for t in gdn[2].values()
+            )
+        # Text buckets key only the first-cap window, so stash the full boundary ids to let
+        # restore trim to the true common prefix; mm trusts its per-item hashes outright.
+        ids = None
+        if not items:
+            head = req.input_ids[:b]
+            ids = tuple(int(t) for t in (head.tolist() if hasattr(head, "tolist") else head))
+        digest = self._tier_digest(hashes)
+        old = self._mm_tier.pop(digest, None)
+        if old is not None:
+            self._mm_tier_bytes -= old[-1]
+        self._mm_tier[digest] = (hashes, ids, rows, gdn, b, nbytes)
+        self._mm_tier_bytes += nbytes
+        while self._mm_tier_bytes > self._mm_tier_cap and len(self._mm_tier) > 1:
+            _, old = self._mm_tier.popitem(last=False)
+            self._mm_tier_bytes -= old[-1]
+
+    def restore_mm(self, req: PendingReq, mr: MatchResult) -> MatchResult:
+        """RAM -> VRAM half of the mm tier: on an identical-content hit whose boundary beats
+        the tree match, allocate fresh pages, scatter the parked rows back, and hand back a
+        handle for the restored prefix. The GDN state rides on as host tensors
+        (``MatchResult.gdn_host``), written into the request's live slot by the scheduler before
+        the first forward. SWA-paged models keep the plain tree path (their window tier rides
+        the swa pool's own mapping)."""
+        pool = self.kv_pool
+        if pool is None or not self._mm_tier:
+            return mr
+        hashes = self._tier_hashes(req)
+        digest = self._tier_digest(hashes)
+        entry = self._mm_tier.get(digest)
+        if entry is None:
+            return mr
+        ehashes, ids, rows, gdn, b, _bytes = entry
+        if ehashes != hashes:
+            return mr
+        m = mr.cuda_handle
+        if ids is not None:
+            # The bucket only hashed the first-cap ids, so trim to the true common prefix before
+            # reusing rows that were computed under the stored ids (mm trusts its item hashes).
+            pid = req.input_ids
+            pm = pid.tolist() if hasattr(pid, "tolist") else pid
+            lim = min(b, len(ids), len(pm))
+            common = lim
+            for i in range(lim):
+                if ids[i] != int(pm[i]):
+                    common = i
+                    break
+            b = align_down(common, self.page_size)
+        if b <= m.cached_len or b > req.input_len or self._mm_bound(req, b) != b:
+            return mr
+        if self.is_swa:  # window tier not carried: keep the tree match (no pages to leak)
+            return mr
+        allocated = self._allocate(div_ceil(b, self.page_size))
+        slots = self._page_to_token(allocated)[:b]
+        pool.restore_rows(slots, rows)
+        self._mm_tier.move_to_end(digest)
+        handle_cls = _TierHandle if self.is_hybrid else _PlainTierHandle
+        handle = handle_cls(b, m.node, slots)
+        return MatchResult(handle, mamba_value=None, gdn_host=gdn)
 
     @property
     def available_size(self) -> int:
@@ -372,114 +465,6 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
-    # ---------------- mm RAM tier (store on finish / restore on match) ----------------
-    @staticmethod
-    def _tier_digest(key: torch.Tensor) -> int:
-        return int(key[0]) * 1_000_003 + key.numel()
-
-    def _tier_store(self, req: Req) -> None:
-        """Park a finished mm request's prompt-span KV + GDN state in host RAM.
-
-        The KV/state pair must cover EXACTLY the boundary ``b``: prefer the pending ×CHUNK
-        track (the frozen ping-pong slot covers ``mamba_last_track_seqlen`` exactly); fall
-        back to the live slot only when it ends precisely at the prompt end. A mismatched
-        pair would over-advance the GDN recurrence on restore -- skip instead."""
-        pool = self.kv_pool
-        if pool is None or self._mm_tier_cap == 0 or req.mm_cache_key is None:
-            return
-        if not hasattr(pool, "snapshot_rows"):
-            return
-        prompt_len = max(0, req.max_device_len - req.output_len)
-        L = req.mamba_last_track_seqlen
-        if self.is_hybrid:
-            frozen = (
-                req.mamba_ping_pong[1 - req.mamba_next_track_idx]
-                if req.mamba_ping_pong is not None
-                else None
-            )
-            if (
-                L is not None
-                and 0 < L <= prompt_len
-                and align_down(L, self.page_size) == L
-                and frozen is not None
-            ):
-                b, state_src = L, frozen
-            elif (
-                L is None
-                and req.cached_len == prompt_len
-                and align_down(prompt_len, self.page_size) == prompt_len
-            ):
-                b, state_src = prompt_len, req.linear_slot_idx
-            else:
-                return
-        else:
-            b, state_src = align_down(prompt_len, self.page_size), None
-        if b <= 0:
-            return
-        slots = self.page_table[req.table_idx, :b]
-        rows = pool.snapshot_rows(slots)
-        gdn = self.linear_state_pool.snapshot_state(state_src) if state_src is not None else None
-        key = req.mm_cache_key.cpu().clone()
-        nbytes = sum(int(t.numel()) * int(t.element_size()) for t in rows.values())
-        if gdn is not None:
-            nbytes += sum(
-                int(t.numel()) * int(t.element_size()) for t in gdn[:2]
-            ) + sum(
-                int(t.numel()) * int(t.element_size()) for t in gdn[2].values()
-            )
-        digest = self._tier_digest(key)
-        old = self._mm_tier.pop(digest, None)
-        if old is not None:
-            self._mm_tier_bytes -= old[4]
-        self._mm_tier[digest] = (key, rows, gdn, b, nbytes)
-        self._mm_tier_bytes += nbytes
-        while self._mm_tier_bytes > self._mm_tier_cap and len(self._mm_tier) > 1:
-            _, old = self._mm_tier.popitem(last=False)
-            self._mm_tier_bytes -= old[4]
-
-    def _mm_restore_ok(self, req: PendingReq, b: int) -> bool:
-        """The mm pad-run rule of ``match_req`` in restore form: the boundary may sit before
-        the first pad run or clear the last one, never inside a run (a half-cached pad run
-        would strand soft tokens between the cached pages and the rows)."""
-        key = req.mm_cache_key
-        n = min(req.input_len, int(key.shape[0]))
-        diff = (key[:n] != req.input_ids[:n]).nonzero()
-        if diff.numel() == 0:
-            return True
-        pads = torch.nonzero(
-            req.input_ids[:n] == req.input_ids[int(diff[0, 0])]).squeeze(1)
-        return b <= int(pads[0]) or b > int(pads[-1])
-
-    def restore_mm(self, req: PendingReq, mr: MatchResult) -> MatchResult:
-        """RAM -> VRAM half of the mm tier: on an exact content-key hit whose boundary beats
-        the tree match, allocate fresh pages, scatter the parked rows back, and hand back a
-        handle for the restored prefix. The GDN state rides on as host tensors
-        (``MatchResult.gdn_host``), written into the request's live slot by the scheduler's
-        ``_restore_linear_states`` before the first forward. SWA-paged models keep the plain
-        tree path (their window tier rides the swa pool's own mapping)."""
-        pool = self.kv_pool
-        if pool is None or req.mm_cache_key is None or req.mm_embeds is None or not self._mm_tier:
-            return mr
-        key = req.mm_cache_key
-        entry = self._mm_tier.get(self._tier_digest(key))
-        if entry is None:
-            return mr
-        ekey, rows, gdn, b, _bytes = entry
-        if ekey.numel() != int(key.numel()) or not torch.equal(ekey, key):
-            return mr
-        m = mr.cuda_handle
-        if b <= m.cached_len or b > req.input_len or not self._mm_restore_ok(req, b):
-            return mr
-        allocated = self._allocate(div_ceil(b, self.page_size))
-        slots = self._page_to_token(allocated)[:b]
-        pool.restore_rows(slots, rows)
-        self._mm_tier.move_to_end(self._tier_digest(key))
-        if self.is_swa:  # window tier not carried; keep the tree match
-            return mr
-        handle_cls = _TierHandle if self.is_hybrid else _PlainTierHandle
-        handle = handle_cls(b, m.node, slots)
-        return MatchResult(handle, mamba_value=None, gdn_host=gdn)
-
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
@@ -519,19 +504,7 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
-        # Multimodal requests must not be keyed on RAW ids (image_pad ids are identical
-        # across images while their KV differs). P4: with a content key, insert keyed on IT
-        # (identical images reuse KV, different images never false-match); keyless mm
-        # (offline precomputed embeds) keeps the prior no-cross-request-reuse exclusion.
-        if req.mm_embeds is not None and req.mm_cache_key is None:
-            self.unlock(old_handle)
-            if finished:
-                tail = self._padded_tail(req, old_handle.cached_len)
-                if self.swa_paged:
-                    self._free_swa(tail)
-                self._free(tail)
-            return
-        insert_ids = self._full_key(req)[: req.cached_len]
+        insert_ids = req.input_ids[: req.cached_len]
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         # unlock until all operations on handle is done
         self.unlock(old_handle)
@@ -572,19 +545,6 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        # P4: key mm insert/match on the content key (image_pad runs -> payload-hash id) so
-        # identical images reuse KV and different images never false-match. Keyless mm
-        # (offline precomputed embeds) carries no content key -> keep the prior "no
-        # cross-request reuse" exclusion. Text uses its raw ids (unchanged). _full_key grows
-        # the content key with the sampled tail so the inserted boundary reaches cached_len.
-        key_ids = self._full_key(req)
-        if req.mm_embeds is not None and req.mm_cache_key is None:
-            self.unlock(old_handle)
-            if finished:
-                self._free(page_indices[old_handle.cached_len :])
-                self._free_req_slots(req)
-            return
-
         if finished:
             # Park the prompt-span KV + GDN state in the RAM tier BEFORE the inserts/frees
             # below recycle the pages and slots this reads.
@@ -607,7 +567,7 @@ class CacheManager:
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    key_ids[:L], page_indices[:L], frozen)
+                    req.input_ids[:L], page_indices[:L], frozen)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -621,7 +581,7 @@ class CacheManager:
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    key_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
@@ -644,13 +604,13 @@ class CacheManager:
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
         prefix_len, mamba_exist = self.prefix_cache.insert(
-            key_ids[:L], page_indices[:L], frozen)
+            req.input_ids[:L], page_indices[:L], frozen)
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
-        m = self.prefix_cache.match_prefix(key_ids[:L])
+        m = self.prefix_cache.match_prefix(req.input_ids[:L])
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
@@ -675,17 +635,6 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        # P4: content-key mm insert (see _cache_req_hybrid); keyless mm keeps no-reuse.
-        # _full_key grows the content key with the sampled tail (see CacheManager._full_key).
-        key_ids = self._full_key(req)
-        if req.mm_embeds is not None and req.mm_cache_key is None:
-            self.unlock(old_handle)
-            if finished:
-                tail = self._padded_tail(req, old_handle.cached_len)
-                self._free_swa(tail)
-                self._free(tail)
-            return
-
         insert_len = align_down(req.cached_len, self.page_size)
         freed = page_indices[:0]
         if insert_len > 0:
@@ -698,7 +647,7 @@ class CacheManager:
             # unfinished chunk's frontier is already > 0 and must be honored (else insert adopts
             # sentinel slots -> the request's later SWA gathers read slot 0 -> corruption).
             _, freed = self.prefix_cache.insert(
-                key_ids[:insert_len], page_indices[:insert_len],
+                req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
                 update_kv_after_len=old_handle.cached_len)
         self.unlock(old_handle)
@@ -724,14 +673,10 @@ class CacheManager:
                     max(prompt_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0),
                     self.page_size,
                 )
-                # Re-match/trim on the SAME key source as the insert: for a content-keyed mm
-                # request the raw ids diverge from the tree key at the first image_pad, so a
-                # raw match would under-cover the committed prefix and the floor below it
-                # (maybe_free_swa_out_of_window) would free tree-owned swa slots.
                 if keep_from > 0:
                     self._free_swa(
-                        self.prefix_cache.trim_head_swa(key_ids[:prompt_len], keep_from))
-                self.prefix_cache.match_prefix(key_ids[:prompt_len])
+                        self.prefix_cache.trim_head_swa(req.input_ids[:prompt_len], keep_from))
+                self.prefix_cache.match_prefix(req.input_ids[:prompt_len])
         else:
             # inc_lock is node-granular, and the suffix insert just made this chunk's whole
             # extend one node: locking it would pin the entire chunk's swa for all of decode,
@@ -741,10 +686,9 @@ class CacheManager:
             # roomy, evictable the moment it is not.
             keep_from = align_down(
                 max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0), self.page_size)
-            # key_ids (the insert's key source), not raw input_ids -- see the finished branch.
             if keep_from > 0:
-                self.prefix_cache.match_prefix(key_ids[:keep_from])
-            m = self.prefix_cache.match_prefix(key_ids[:insert_len])
+                self.prefix_cache.match_prefix(req.input_ids[:keep_from])
+            m = self.prefix_cache.match_prefix(req.input_ids[:insert_len])
             # Re-point the page table to the tree's live slots for the committed region. Any dup
             # slots insert reclaimed had their full->swa mapping reset to the 0 sentinel; unlike the
             # full pool (KV survives in place until realloc), a stale swa mapping would make the
@@ -808,21 +752,11 @@ class CacheManager:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
         if len(self.free_slots) + cache_pages != self.num_pages:
-            # Log-only (D10, 2026-09-07): a small orphaned-page leak (2 pages observed after a
-            # 124k-radix-hit hybrid request) used to RAISE here and kill the worker at the next
-            # idle poll. The orphaned pages are a slow accounting leak, not a corruption of any
-            # live data, so report the exact gap and keep serving instead of dying on it.
-            # check_integrity runs on every idle poll, so log a stable gap only once (and
-            # again if the gap changes) instead of spamming each idle cycle.
-            gap = self.num_pages - (len(self.free_slots) + cache_pages)
-            if getattr(self, "_last_integrity_gap", None) != gap:
-                self._last_integrity_gap = gap
-                logger.warning_rank0(
-                    "CacheManager integrity check FAILED (continuing):"
-                    " free_pages(%d) + cache_pages(%d) != num_pages(%d); "
-                    "%d page(s) unaccounted (leak)"
-                    % (len(self.free_slots), cache_pages, self.num_pages, gap)
-                )
+            raise RuntimeError(
+                "CacheManager integrity check failed:"
+                f" free_pages({len(self.free_slots)}) +"
+                f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
+            )
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
 
@@ -843,8 +777,8 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
-        # Tier rows were packed under the OLD pool geometry; after a rebuild their
-        # index_copy_ targets no longer match. Drop them (keys are cheap to re-earn).
+        # The parked rows name the OLD page table's slots; rebuild recycles those pages, so drop
+        # the tier with them (else a later restore scatters into reassigned pages).
         self._mm_tier.clear()
         self._mm_tier_bytes = 0
 
