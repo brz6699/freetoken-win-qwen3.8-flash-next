@@ -196,6 +196,10 @@ class OffloadMoELayer(MoELayer):
         )
         self.offload_cache: OffloadMoeCache | None = None
 
+    @property
+    def skips_inactive_slots(self) -> bool:
+        return self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -301,7 +305,8 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             slots,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
+
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -336,6 +341,7 @@ class OffloadMoELayer(MoELayer):
         on_gpu = topk_ids >= 0
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -350,7 +356,7 @@ class OffloadMoELayer(MoELayer):
         # Snapshot this layer's views/alphas BEFORE the prefetch so the prefetch's own
         # ensure_experts_hybrid (which rewrites id_of_slot for next_layer) cannot perturb
         # the alpha-index gather that alphas_for_slots performs against live slot state.
-        views = cache.bank_views()
+        views = cache.pool_bank_views(self.layer_id)
         alphas = cache.alphas_for_slots(self.layer_id)
         # Double-buffered decode prefetch (bs>=4 only): issue next-layer's PCIe fetch before
         # this layer's GEMM so PCIe transfers overlap GPU compute on the same stream. The
@@ -370,6 +376,7 @@ class OffloadMoELayer(MoELayer):
             gpu_w,
             gpu_slots,
             views=views,
+
             n=None,
             alphas=alphas,
             is_prefill=False,
@@ -398,7 +405,7 @@ class OffloadMoELayer(MoELayer):
                 hidden_states,
                 topk_weights,
                 slots,
-                views=cache.bank_views(),
+                views=cache.pool_bank_views(self.layer_id),
                 n=None,
                 alphas=cache.alphas_for_slots(self.layer_id),
                 is_prefill=True,
@@ -418,17 +425,20 @@ class OffloadMoELayer(MoELayer):
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
-        cache.copy_missing(self.num_experts)
-        return self._expert_gemm(
+        cache.copy_missing()
+        out = self._expert_gemm(
+
             cache,
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(self.num_experts),
+            views=cache.stage_views(self.layer_id, 0),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        cache.release_prefill_layer(self.layer_id)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

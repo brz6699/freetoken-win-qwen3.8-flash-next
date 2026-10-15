@@ -46,6 +46,12 @@ class EngineConfig:
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
+    # --moe-cache-mem: slot-cache budget in bytes, turned into a slot count once the expert banks are loaded
+    moe_cache_mem: int | None = None
+    # --moe-cache-scope: unified (one LRU pool per expert quant) or per-layer (one pool per layer)
+    moe_cache_scope: str = "unified"
+    # --moe-cache-split: how pools share the slots; equal or profile:<path> (by expert use from a profile file)
+    moe_cache_split: str = "equal"
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     # Runtime KV<->MoE rebalancing on top of the startup plan: KV occupancy is sampled
     # per batch and the byte envelope is traded with the expert-slot cache at the idle

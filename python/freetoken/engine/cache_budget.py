@@ -20,30 +20,36 @@ if TYPE_CHECKING:
 # only matters when explicitly given, where its (1-ratio) remainder is the headroom by definition.
 DEFAULT_MEMORY_RATIO = 1.0
 
-
 def effective_ratio(memory_ratio: float | None) -> float:
     """Resolve a possibly-None memory_ratio into the concrete ceiling fraction to apply."""
     return DEFAULT_MEMORY_RATIO if memory_ratio is None else float(memory_ratio)
 
 
-def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"], row_align: int = 16) -> int:
-    """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
+def layer_slot_bytes(sources: dict[str, "list[torch.Tensor]"], row_align: int = 16) -> list[int]:
+    """Bytes one expert slot of EACH layer occupies on GPU: per-layer row bytes summed over banks.
 
-    Each bank source is per-layer ``[num_experts, *row_shape]`` tensors and is
-    already TP-sharded upstream, so the per-row byte count is the per-rank slot
-    size. ``row_align`` is the lcm of the active kernels' READ-contract atoms
-    (``MoEKernel.row_align_bytes``); per-bank row bytes and the final total are both
-    ROUND_UP-ed to it, so the arena's gcd(cpp, peb) lattice lands on points every
-    backend can read cleanly without misaligned tile loads.
+    Each bank source is per-layer ``[num_experts, *row_shape]`` tensors and is already TP-sharded
+    upstream, so the per-row byte count is the per-rank slot size for one layer. ``row_align`` is
+    the lcm of the active kernels' READ-contract atoms (``MoEKernel.row_align_bytes``); each layer's
+    summed bytes are ROUND_UP-ed to it so the arena's gcd(cpp, peb) lattice lands on points every
+    backend reads cleanly without misaligned tile loads.
     """
-    # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
-    # with cache_size), so they are intentionally excluded from the per-slot growth term.
-    # tensor[0].numel() is the per-row element count (one expert slot); see the matching
-    # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    total = sum(
-        align_ceil(t[0][0].numel() * t[0].element_size(), row_align) for t in sources.values()
-    )
-    return align_ceil(total, row_align)
+    num_layers = len(next(iter(sources.values())))
+    return [
+        align_ceil(sum(t[l][0].numel() * t[l].element_size() for t in sources.values()), row_align)
+        for l in range(num_layers)
+    ]
+
+
+def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"], row_align: int = 16) -> int:
+    """Bytes one expert slot occupies on GPU: mean over layers when bank layouts differ, then aligned.
+
+    ``row_align`` (lcm of active kernels' READ-contract atoms) is applied BOTH inside per-layer
+    sums AND to the final rounded mean, so the value the engine and budget_slide agree on is an
+    atom-multiple by construction regardless of how uneven the layer bank layouts are.
+    """
+    per_layer = layer_slot_bytes(sources, row_align)
+    return align_ceil(-(-sum(per_layer) // len(per_layer)), row_align)
 
 
 def net_cache_budget_bytes(
