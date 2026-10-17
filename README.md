@@ -4,45 +4,25 @@ Chinese version: [README_BRANCH_zh.md](README_BRANCH_zh.md).
 
 A patched branch of [FreeToken](https://github.com/FlashML-org/FreeToken) (base `0.1.2+g816c324d0`, upstream main `58f4b9e`) tuned for **one consumer GPU + lots of system RAM** — e.g. RTX 5090 32 GB with ~254 GiB RAM — serving large MoE checkpoints through an OpenAI-/Anthropic-compatible HTTP API. Upstream Apache-2.0 LICENSE preserved; see [Provenance](#provenance).
 
-Every item below follows the same shape: **(1) Problem observed** on this stack, **(2) Mechanism implemented**, **(3) Measured verification result**. Reference rig for every number: RTX 5090 SM120 PCIe-bound + Qwen3.8-Flash-Next(-ABLITERATED)-NVFP4.
+This README lists what this branch added on top of upstream `58f4b9e` plus a short tuning note for upstream-provided knobs. Each feature follows the same shape: **(1) Problem observed** on this stack, **(2) Mechanism implemented**, **(3) Measured verification**. Reference rig for every number: RTX 5090 SM120 PCIe-bound + Qwen3.8-Flash-Next(-ABLITERATED)-NVFP4.
 
 ---
 
 ## Feature points
 
-### 1. Shared cudaMemPool CUDA-graph ladder with fixed-shape collapse
+### 1. Verify-phase statistics exclusion in MoE expert LRU
 
-**(1)** Each captured bs in upstream stacks its own workspace and graph-private pool; with bs ∈ {1,2,4,8} ladder the dead-slot overhead eats contiguity headroom the verify peak needs. bs-histogram in `/v1/stats` showed ≥95% of traffic is bs=1 on this workload, yet bs=4/8 graphs were still capturing.
-
-**(2)** `engine/graph.py` captures every ladder entry against a single shared `cudaMemPool` plus one shared `GraphCaptureBuffer` sized to `max_graph_bs`. Ladder entries share workspace instead of stacking it, so adding entries costs topology metadata (~few MB), not another workspace. Ladder = `[1, 2, 4] + range(8, max_bs+1, 8)`. `--cuda-graph-max-bs 1` collapses to single bs=1 capture; replay pads up to next ladder entry.
-
-**(3)** bs=1-dominated traffic: bs=1 ladder leaves ~7.5 GiB contiguous free after PyTorch allocator overhead, comfortably covers MTP verify peak (~3–4 GiB contiguous at bs=4 with `--mtp-draft-len 2`). bs=4 mixed-decode bench: steady ~104 tok/s aggregate across rounds with bs=4 ladder. No quality hit from pad-to-next-ladder-entry.
-
----
-
-### 2. Verify-phase statistics exclusion in MoE expert LRU
-
-**(1)** MTP verify batch carries a K+1-row distribution that differs from decode-phase routing. Mixing those counts into hot-expert LRU promotes experts that only verify needs, evicting real decode working set.
+**(1)** MTP verify batch carries a K+1-row distribution that differs from decode-phase routing. Mixing those counts into hot-expert LRU promotes experts that only verify needs, evicting real decode working set. Upstream's recurrence-window admission doesn't separate verify from decode phases.
 
 **(2)** `MtpExpertBank` and the `OffloadMoeCache` chain (`load_experts` / `ensure_experts` / `ensure_experts_hybrid` / `prefetch_decode_layer`) thread a `record_stats: bool` kwarg driven by `ctx.batch.moe_force_decode` from scheduler. Verify admissions update hit/miss counters; they do **not** promote into LRU. Decode admissions do both.
 
-**(3)** Expert residency tracks decode demand without verify-phase noise; bs=8 mixed-decode aggregate ~187/~193 tok/s across rounds. bs=4→bs=8 scaling ×1.85 — within PCIe BW ceiling, no LRU-thrash dip.
+**(3)** Expert residency tracks decode demand without verify-phase noise; bs=8 mixed-decode aggregate ~187/~193 tok/s cross rounds. bs=4→bs=8 scaling ×1.85 — within PCIe BW ceiling, no LRU-thrash dip.
 
 ---
 
-### 3. b12x Triton backend for NVFP4 MoE decode
+### 2. turbo4 KV storage tier + TurboQuant packed-nibble rotspace
 
-**(1)** cuBLASLt on SM120 doesn't saturate PCIe BW for the NVFP4 MoE shapes on this model (`hidden=2560`, `num_experts=512/topk=10`, `moe_intermediate=640`); launch overhead per route dominates on bs ∈ {1,4,8} decode.
-
-**(2)** `kernel/triton/nvfp4_fused_moe.py` is marlin-style: wide int32 loads (8 codes/word), deferred K reduction, register-only `_split8` shuffle, fp32 accumulate, per-route grid `(num_routes, cdiv(N, BLOCK_N))`. Block-scale epilogue folded into fp16 bits with global-scale applied post-K-loop + arrival-counter split-K reduction in single launch — no second kernel.
-
-**(3)** ~87% PCIe BW ceiling hit on RTX 5090. Per-stream decode ~25 tok/s is length-independent up to ~50k context (KV read BW not yet bottleneck — weight streaming dominates). Aggregate bs=4 ~104 tok/s mixed-decode across ~10k/~50k prompts. Residual ~13% gap attributed to FP4-dequant ALU; this covers what DeepGEMM tiled cluster kernels offer in our shape range, so DeepGEMM not pulled in.
-
----
-
-### 4. Hybrid QSA sparse attention + turbo4 KV storage tier
-
-**(1)** bf16 paged KV eats too much VRAM for bs=1 long-context on a PCIe-bound stack. Need storage-side compression without touching compute path.
+**(1)** bf16 paged KV eats too much VRAM for bs=1 long-context on a PCIe-bound stack. Existing fp8_e4m3 tier still leaves ~50% headroom unused at 1M-token contexts. Need a fourth tier with cosine ≥0.98 vs bf16 that fits longest contexts inside ~6.8 GiB pool.
 
 **(2)** Three tiers measured against bf16 reference attention (max-cosine over sparse + split-k paths):
 
@@ -52,52 +32,33 @@ Every item below follows the same shape: **(1) Problem observed** on this stack,
 | `fp8_e4m3` | 1024 | 0.9994 | general balance point |
 | `turbo4` | ~516 | 0.9887 | longest contexts (100k+ tokens) |
 
-Storage compressed; compute stays bf16. Indexer keys always bf16. QSA paged KV pool stores in turbo4 packed nibble rotspace; block top-k uses Triton `qsa_block_topk`. Engine gate keeps turbo4 on QSA + MLA-latent families.
+Storage compressed; compute stays bf16. Indexer keys always bf16. `kvcache/turboquant.py` implements packed-nibble rotspace dequant with bf16 per-(token, head, slab) scales. `kvcache/dsv4_cost_model.py` prices the per-token byte cost including the scale overhead. Engine gate keeps turbo4 on QSA + MLA-latent families only.
 
-**(3)** bs=1 holds ~50k-token context inside ~3 GiB KV pool with no verify-phase OOM. Needle retrieval 6/6 exact across 322k/450k × depth {30%, 60%, 90%}, worst-case depth-90% at 35.2s, rest 5–12s. Measured KV ≈6.9 KiB/token → full 1M-token pool ≈6.8 GiB. TTFT @ 901k context: 32.5s with prefill overlap, 51s without. Steady-state decode length-independent.
-
----
-
-### 5. MoE prefill demand threshold gated on chunk row count
-
-**(1)** Gating expert-fetch on whole prompt length over-fetches when cached-prefix incremental prefills add only small chunks per step but cumulative context is huge. Whole-prompt gating treats each incremental chunk as if it were cold-start.
-
-**(2)** `--moe-prefill-demand-tokens` gates on chunk row count (`hidden_states.shape[0]`), not whole prompt length. Default `64`. Cached-prefix hits skip demand-prefill path; cold starts pay it once.
-
-**(3)** Cached-prefix warm hits refill expert cache without re-fetching whole-prompt working set. bs=8 mixed-decode TTFT ~47s reflects chunked-prefill queueing across 8 streams × XLONG prompts × ~8192-token chunks — not demand-gating overhead. Round-to-round TTFT drop confirms warm prefix-cache effect.
+**(3)** bs=1 holds ~50k-token context inside ~3 GiB KV pool, verify peak fits without OOM. Needle retrieval 6/6 exact across 322k/450k × depth {30%, 60%, 90%}, worst-case depth-90% at 35.2s, rest 5–12s. Measured KV ≈6.9 KiB/token → full 1M-token pool ≈6.8 GiB. TTFT @ 901k context: 32.5s with prefill overlap, 51s without. Steady-state decode length-independent.
 
 ---
 
-### 6. Round-7 runtime rebalancing — eight independent rules
+### 3. QSA sparse attention extended for turbo4 packed-nibble rotspace
 
-**(1)** Fixed VRAM arena must adapt to traffic mix changes without engine restart or weight reload. Each upstream knob on its own is too coarse; combined rules need to be independently gateable so disabling one doesn't perturb the others.
+**(1)** Upstream `attention/qsa_sparse.py` assumes bf16-packed KV layout for the block-top-k scatter/gather path. Adding turbo4 tier requires the indexer's block_topk reads and the attention-row writes to handle packed nibbles + per-token bf16 scales without an extra dequant pass.
 
-**(2)** Eight small rules, shared invariant: VRAM allocation happens once at startup; everything after is view reslicing and bookkeeping reset.
+**(2)** `qsa_block_topk` Triton kernel updated to read packed-nibble blocks with co-loaded bf16 scale row, scatter writes go through `index_copy_` in-place so a single launch covers both K and V slab. Upstream file is 542 lines; ours extends to 647 with turbo4 branch + cost-model integration with `dsv4_cost_model.py`. Compute path itself stays bf16 — only storage layout changes.
 
-- **Recurrence-window MoE admission** — `ensure_experts_hybrid` fetches onto GPU on second sighting in window; first misses compute CPU-side. Gate fires per-layer at moment of miss, not periodic sweep. Removes cold-prefill cache thrash.
-- **bs-sized transport routing** — `hybrid_fetch_fraction` (0–1 ratio read once from `ft bench bw`) replaces fixed `hybrid_max_fetch` count. Each decode step fetches `fraction × misses` experts; PCIe stays saturated and CPU GEMM overlaps across bs=1…8. Profile read at engine init only.
-- **bs≥4 decode-step prefetch** — `_decode_hybrid` issues `prefetch_decode_layer(next_layer, hint)` before current-layer GEMM dispatch when bs≥4. Below bs=4 routing entropy exceeds prefetch-hit benefit. Tests in `tests/moe/test_decode_prefetch_gate.py`.
-- **KV hot-window** — `FREETOKEN_HOT_WINDOW_TOKENS` caps `demand_tokens` signal the slider sees, letting KV grow into soft ceiling instead of pure shrink-only. Opt-in: unset preserves shrink-only exactly. Sized for multi-turn agent prompts where hard shrink-only floor evicts still-useful prefix pages.
-- **Prefill/decode interleaving** — `_interleave_every` (default 4) consecutive prefill chunks force one decode step. Counted in chunks not seconds for deterministic replay. Override via `prefill_interleave_every`.
-- **Asymmetric EMA shrink** — `BudgetSlider.propose_targets` rises fast (high EMA α, avoid under-provision in bursts) falls slow (low α, avoid ping-pong on load drop). `min_step_ratio` deadband ignores sub-threshold wobble; `demand_floor` keeps shrink-only above next-request working set. Fires only at idle transitions.
-- **Special-token ckpt for tool-call reuse** — `--enable-special-token-ckpt` snapshots GDN state at tool-call opener token (structural boundary: pre-token content identical across turns, post-token drifts). Snapshot paid once per turn; prefix reuse hit on every echo. Replaces older "ckpt every N tokens" heuristic where most ckpts never matched.
-- **BudgetSlider carrier** — `engine/budget_slide.py` re-derives KV pages ↔ MoE slots from current traffic. `mha_pool.rebuild` / `OffloadMoeCache.rebuild` re-slice views from arena left end; base pointer never moves, CUDA graphs stay valid. Fires only at idle transitions — the only moment with no live page-index references and no in-flight graph replay. Preserve-residency: pinned experts stay pinned.
-
-**(3)** bs=4 mixed-decode aggregate steady ~104 tok/s across rounds; bs=8 ~187/~193 tok/s; bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling. With `--max-running-requests 8` bs=6 fills bs=8 graph → aggregate lifts to ~76.9 at cost of p95 ≈7s (c8 tail ≈25s). Rebuild cadence observed: every few requests during bursts, every ~minute when idle. `budget_slide_test.py` green.
+**(3)** bs=1 ~50k-token context fits ~3 GiB KV pool. Block_topk overhead vs bf16 within measurement noise; cosine vs bf16 reference 0.9887 across 24 sanity legs.
 
 ---
 
-### 7. Windows compatibility layer + split residency + pin budget
+### 4. BudgetSlider runtime rebalancing
 
-**(1)** WDDM caps GPU-accessible pinned host memory at roughly half physical RAM; locked working-set pages count against same budget. Upstream's POSIX-only `resource` module, `expandable_segments`, and Proactor/zmq loop divergence don't degrade gracefully on Windows. Large MoE weights exceed pinned ceiling at default budget.
+**(1)** Upstream `engine/cache_budget.py` does startup-only sizing. Fixed KV/MoE pools sized for one traffic mix leave headroom wasted when mix shifts within hours. Long-lived agent traffic alternates between short high-rate bursts and long idle stretches; restart is unacceptable on this stack.
 
-**(2)** `ctypes` `VirtualLock` replaces POSIX-only `resource`; expandable_segments graceful degradation path; Proactor loop adaptation; `FREETOKEN_PIN_BUDGET_GB` env knob (auto ≈0.4–0.5 × RAM by default). Below ceiling, head/tail MoE layers OS-lock CPU and decode on multi-threaded CPU executor (AVX-512 BF16 + VNNI, NVFP4 W4A8); remaining banks pin for GPU streaming. Locked ≠ pinned: locked banks decode CPU-side, pinned stream GPU-side.
+**(2)** `engine/budget_slide.py` adds a `BudgetSlider` class that re-derives KV pages ↔ MoE slots at idle transitions. Asymmetric EMA: α high on rise (avoid under-provision during bursts), low on fall (avoid ping-pong when load drops). `min_step_ratio` deadband ignores sub-threshold wobble; `demand_floor` keeps shrink-only above next-request working set. `mha_pool.rebuild` / `OffloadMoeCache.rebuild` re-slice views from arena left end; base pointer never moves, CUDA graphs stay valid. Fires only at idle transitions — the only moment with both no live page-index references and no in-flight graph replay. Preserve-residency: pinned experts stay pinned.
 
-**(3)** Steady-state on bs=1 ladder: ~14 GiB allocated / ~16 GiB contiguous free — verify peak fits comfortably. PyTorch reports less free than `nvidia-smi` by ~3 GiB (CUDA driver context + cuBLASLt workspace + cuDNN pools + CUDA-graph private pools sit outside PyTorch allocator visibility). `torch.cuda.empty_cache()` recovers that gap only at startup; runtime peak sizing must come from shrinking steady-state allocated. Startup OOM on last bank: lower `--num-tokens` first (turbo4 ≈6.9 KiB/token), then budget.
+**(3)** bs=4 mixed-decode aggregate steady ~104 tok/s cross rounds; bs=8 ~187/~193 tok/s; bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling. Rebuild cadence observed: every few requests during bursts, every ~minute when idle. `budget_slide_test.py` green.
 
 ---
 
-### 8. MM content-key prefix cache + splice invariant fix (Round-4 / P4)
+### 5. MM content-key sha1 prefix cache + splice invariant fix
 
 **(1)** Repeated mm requests re-prefill identical image pixels; pad-span alignment in splice can overrun COW buffer when prefix matches land inside image_pad span. Production crash regression observed.
 
@@ -107,31 +68,45 @@ Storage compressed; compute stays bf16. Indexer keys always bf16. QSA paged KV p
 
 ---
 
-### 9. MM video path + dual-pad fix (Round-5)
+### 6. MM video path + dual-pad spelling fix
 
-**(1)** Different checkpoints write either `image_token_id` or `video_token_id` (both wrapped inside vision_start/end). PIL without ffmpeg backend can't read mp4 containers. Need single serve path that handles both spellings without model-side changes.
+**(1)** Different checkpoints write either `image_token_id` or `video_token_id` (both wrapped inside vision_start/end). PIL without ffmpeg backend can't read mp4 containers. Upstream doesn't detect both spellings and silently drops video legs.
 
-**(2)** Detect both spellings in prepare; expansion uniformly writes `image_token_id`, so model-side embed mask / cache key / scheduler stay unchanged; `vision_geometry` passes `video_token_id` through. Video parts accept frame lists (data:/http/local paths) or single animated files (GIF/WebP/APNG); ≤8 frames sampled evenly; multi-frame uses processor `videos=` temporal pairing (falls back to per-frame stacking) with `t>1` grid; expand count comes from real grid, still renders exactly one pad placeholder. `extract_media_parts` mirrors template branch order. mp4 fallback via `imageio` (bundles static `imageio-ffmpeg`): read whole segment, sample ≤8 frames. 32768-patch budget covers whole video segment; guard past it returns clean 400 `context_length_exceeded`, streaming carries it as in-stream error frame.
+**(2)** Detect both spellings in prepare; expansion uniformly writes `image_token_id`, so model-side embed mask / cache key / scheduler stay unchanged; `vision_geometry` passes `video_token_id` through. Video parts accept frame lists (data:/http/local paths) or single animated files (GIF/WebP/APNG); ≤8 frames sampled evenly; multi-frame uses processor `videos=` temporal pairing (falls back to per-frame stacking) with `t>1` grid; expand count comes from real grid, still renders exactly one pad placeholder. mp4 fallback via `imageio` (bundles static `imageio-ffmpeg`): read whole segment, sample ≤8 frames. Past 32768-patch budget the guard returns clean 400 `context_length_exceeded`, streaming carries it as in-stream error frame.
 
-**(3)** `serve_video_smoke.py` / `vision_video_test.py` / `vision_p3_media_test.py` green vs HF oracle bit-match. Live serve (:8001, default vision on) smoke: frame-list / GIF / image_url+video mixed legs all correct (static green ∉ {red, blue} animated). Measured prompt_tokens=238 on a representative reasoning leg; reasoning leg budget needs ≥512. Large image (19200 patches) peaks VRAM +984 MiB, first-token latency 2.9–4.2s. Image requests vs text: cold TTFT medians text 1518ms vs image 1526ms (+8ms). ViT forward not dominant — the ~1.5s floor is fixed MoE expert-cache cold-start which text pays too.
+**(3)** `serve_video_smoke.py` / `vision_video_test.py` / `vision_p3_media_test.py` green vs HF oracle bit-match. Live serve (:8001) smoke: frame-list / GIF / image_url+video mixed legs all correct (static green ∉ animated {red, blue}). Measured prompt_tokens=238 on a representative reasoning leg; reasoning leg budget ≥512. Image requests vs text: cold TTFT medians text 1518ms vs image 1526ms (+8ms); ViT forward not dominant — ~1.5s floor is fixed MoE expert-cache cold-start which text pays too. Large image (19200 patches) peaks VRAM +984 MiB, first-token latency 2.9–4.2s.
 
 ---
 
-### 10. MM RAM tier swap-in/out (Round-6)
+### 7. MM RAM tier swap-in/out
 
-**(1)** Same mm content arriving hours later pays full ViT + prefill cost from cold KV. No mechanism to reuse prompt-segment KV across long gaps within pinned-budget arena.
+**(1)** Same mm content arriving hours later pays full ViT + prefill cost from cold KV. Pinned-budget arena on Windows has limited VRAM, so pure VRAM-resident mm cache can't survive hours-long gaps. Upstream has no mm-tier mechanism.
 
-**(2)** Completed mm requests stash prompt-segment KV + GDN state to host RAM. Subsequent same-content-key requests restore rows into freshly allocated VRAM pages and continue directly. `kvcache/mha_pool.py` / `qsa_pool.py`: `snapshot_rows` / `restore_rows` pack K/V compressed blocks + turbo4 dequant scales + QSA compressed-index rows (`slot // index_ratio`) to CPU; restore writes back via `index_copy_` in-place scatter (`[:, idx].copy_` would gather into a temp first and silently fail to write — known trap; documented inline). `pending_ring` is transient and not tiered. `linear_state_pool.snapshot_state` / `restore_state` pack conv+recurrent+slot_states whole-slot. Tier storage uses LRU-bytes eviction with `FREETOKEN_MM_TIER_MB` budget (default 1024). Restore gate: content-key bit-match + boundary beats tree match + doesn't cut a pad run → allocate new pages + row refill + `_TierHandle`. Restore integrated into admission after budget gate; `mm_gdn` propagated through PendingReq→Req; `_restore_linear_states` writes back on first prefill forward.
+**(2)** Completed mm requests stash prompt-segment KV + GDN state to host RAM. Subsequent same-content-key requests restore rows into freshly allocated VRAM pages and continue directly. `kvcache/mha_pool.py` / `qsa_pool.py`: `snapshot_rows` / `restore_rows` pack K/V compressed blocks + turbo4 dequant scales + QSA compressed-index rows (`slot // index_ratio`) to CPU; restore writes back via `index_copy_` in-place scatter (`[:, idx].copy_` would gather into a temp first and silently fail to write — known trap; documented inline). `pending_ring` transient, not tiered. `linear_state_pool.snapshot_state` / `restore_state` pack conv+recurrent+slot_states whole-slot. Tier storage uses LRU-bytes eviction with `FREETOKEN_MM_TIER_MB` budget (default 1024). Restore gate: content-key bit-match + boundary beats tree match + doesn't cut a pad run → allocate new pages + row refill + `_TierHandle`. Restore integrated into admission after budget gate; `mm_gdn` propagated through PendingReq→Req; `_restore_linear_states` writes back on first prefill forward.
 
-**(3)** `kv_tier_test.py` green on real QSA+turbo4 pools — row round-trip, byte accounting, same-key replacement, LRU eviction, pad-boundary GDN write-back. Vision two-suite regression green. Live serve (:8001) smoke: same-content repeated request takes restore path and answers correctly; image_url+video mixed legs judged correctly (static green ∉ animated {red, blue}); prompt_tokens=238 measured. Warm TTFT below cold TTFT confirms tier hits.
+**(3)** `kv_tier_test.py` green on real QSA+turbo4 pools — row round-trip, byte accounting, same-key replacement, LRU eviction, pad-boundary GDN write-back. Vision two-suite regression green. Live serve (:8001) smoke: same-content repeat takes restore path and answers correctly; image_url+video mixed legs judged correctly; prompt_tokens=238 measured. Warm TTFT below cold TTFT confirms tier hits.
+
+---
+
+## Tuning notes for upstream-provided knobs
+
+The mechanisms below exist upstream and this branch adopts them unchanged but tuned for PCIe-bound single-GPU stacks.
+
+- **Shared cudaMemPool CUDA-graph ladder** — `engine/graph.py` already shares the cudaMemPool + graph handle across bs entries upstream. For bs-histogram ≥95% bs=1 traffic (`/v1/stats` `bs_hist`), `--cuda-graph-max-bs 1` collapses the ladder to single bs=1 capture; replay pads up to next entry. bs=1-dominated Windows stacks see ~7.5 GiB contiguous free after PyTorch allocator overhead with bs=1 ladder.
+- **bs-sized transport routing** — `hybrid_fetch_fraction` (0–1 ratio read once from `ft bench bw`) replaces fixed `hybrid_max_fetch` count. Each decode step fetches `fraction × misses` experts; PCIe stays saturated and CPU GEMM overlaps across bs=1…8. Profile read at engine init only — mid-decode re-benching jitters TTFT.
+- **Recurrence-window MoE admission** — `expert_recency` recurrence window gates expert fetch on second sighting; first misses compute CPU-side. Already in upstream `moe/offload_cache.py`. Combined with verify-phase stats exclusion above to keep hot LRU tracking decode demand.
+- **bs≥4 decode-step prefetch** — `_decode_hybrid` issues `prefetch_decode_layer(next_layer, hint)` before current-layer GEMM dispatch when bs≥4. Tests in `tests/moe/test_decode_prefetch_gate.py`. Below bs=4 routing entropy exceeds prefetch-hit benefit, gate skips.
+- **KV hot-window** — `FREETOKEN_HOT_WINDOW_TOKENS` caps the `demand_tokens` signal so KV grows to soft ceiling instead of pure shrink-only. Opt-in; unset preserves shrink-only exactly. Sized for multi-turn agent prompts where hard shrink-only floor evicts still-useful prefix pages.
+- **Prefill/decode interleaving** — `_interleave_every` (default 4) consecutive prefill chunks force one decode step. Counted in chunks not seconds for deterministic replay. Override via `prefill_interleave_every`.
+- **Special-token ckpt** — `--enable-special-token-ckpt` snapshots GDN state at tool-call opener token. Structural boundary: pre-token content identical across turns, post-token drifts. Snapshot paid once per turn, prefix reuse hit on every echo. Already upstream args.py.
 
 ---
 
 ## Bench findings
 
-Two measured curves that drive serve-profile choices.
+Two measured curves that drive serve-profile choices on this rig.
 
-**Concurrency sweet spot.** bs=4 maximises per-stream latency × aggregate on this rig. `max_tokens=96`, text-only, `--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d`:
+**Concurrency sweet spot.** bs=4 maximises per-stream latency × aggregate on this hardware. `max_tokens=96`, text-only, `--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d`:
 
 | concurrency | aggregate tok/s | per-stream tok/s | notes |
 |---|---|---|---|
@@ -178,11 +153,11 @@ Flags worth understanding:
 
 - `--num-tokens` — paged KV pool size. turbo4 ≈6.9 KiB/token → ≈6.8 GiB full pool at 1M, ≈3.4 GiB at 512k, ≈0.4 GiB at 65k. Smaller pool leaves contiguous VRAM headroom for verify peak.
 - `--moe-cache-size` — experts resident on GPU. Steady-state decode scales roughly with hit rate up to ~3072, then flattens.
-- `--kv-cache-dtype` — see tier table under feature point 4.
-- `--text-model-only` — skip all encoder towers; their VRAM goes to KV / expert caches. Use `--mm-disable vision audio` instead when only some kinds should be skipped. Vision / audio towers load by default and skip cleanly when disabled.
-- `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies.
-- `--cuda-graph-max-bs N` — CUDA-graph ladder cap; `1` for bs=1-dominated, `4` adds bs=4 burst slot cheaply under shared mempool.
-- `--moe-prefill-demand-tokens` — chunk-row threshold for demand-prefill; default `64` fits cached-prefix incremental prefill.
+- `--kv-cache-dtype` — see tier table under feature point 2.
+- `--text-model-only` — skip all encoder towers; their VRAM goes to KV / expert caches. Use `--mm-disable vision audio` instead when only some kinds should be skipped. Vision / audio towers load by default and skip cleanly when disabled. Upstream-provided flags.
+- `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies. Upstream-provided.
+- `--cuda-graph-max-bs N` — CUDA-graph ladder cap; `1` for bs=1-dominated, `4` adds bs=4 burst slot cheaply under shared mempool. Upstream-provided flag.
+- `--moe-prefill-demand-tokens` — chunk-row threshold for demand-prefill; default `64`. Upstream-provided flag.
 - `--mtp-draft-len` / `--mtp-device gpu` — opt-in. Measured acceptance ~0.70 with draft-len=2 gives net-positive on multi-stream aggregate but net-negative on bs=1-dominated traffic where verify overhead (~70ms/step) + redraft (~30ms) exceeds savings. Default-off on this branch.
 
 ## Requirements & install
@@ -222,4 +197,6 @@ Run from package root with venv Python, e.g. `python verification/p4_splice_test
 
 ## Provenance
 
-Derived from upstream FreeToken commit `58f4b9e` (release `0.1.2+g816c324d0`). Upstream PRs merged in: #377 (nightly engine manifests), #375 (issue templates), #343 (NVFP4 detection behind compressed-tensors), #336 (safetensors index shards), #332 (GLM-5.3-Flash), #329 (exact Triton top-k/top-p), #319 (in-repo triton router), #311 (PLE n-gram table disk stream), #310 (nightly kernel-cache wheel fix), #243 (`_scaled_mm` sm_89 stall avoidance, baseline commit), plus #257 (Qwen3.8-Flash-Next support) and the foundational #1 / #2 / #3 / #4 / #5 / #6 / #7 / #25 / #75 / #117. Kernel-cache wheel unchanged from upstream. Upstream LICENSE (Apache-2.0) and copyright preserved in `package/`. Third-party checkpoint Qwen3.8-Flash-Next-ABLITERATED-NVFP4 downloaded at runtime from its HF hub.
+<a name="provenance"></a>
+
+Derived from upstream FreeToken commit `58f4b9e` (release `0.1.2+g816c324d0`). Upstream PRs merged in: #377, #375, #343, #336, #332, #329, #319, #311, #310, #243, #257, plus foundational #1 / #2 / #3 / #4 / #5 / #6 / #7 / #25 / #75 / #117. Kernel-cache wheel unchanged from upstream. Upstream LICENSE (Apache-2.0) and copyright preserved in `package/`. Third-party checkpoint Qwen3.8-Flash-Next-ABLITERATED-NVFP4 downloaded at runtime from its HF hub.
