@@ -104,9 +104,16 @@ The mechanisms below exist upstream and this branch adopts them unchanged but tu
 
 ## Bench findings
 
-Two measured curves that drive serve-profile choices on this rig.
+Two complementary bench regimes on this rig. Each isolates a different operating point — neither is "the answer" for the other. Both reflect the current packaged state with all exp mechanisms active by default.
 
-**Concurrency sweet spot.** bs=4 maximises per-stream latency × aggregate on this hardware. `max_tokens=96`, text-only, `--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d`:
+| regime | what it measures | output length | prompt length |
+|---|---|---|---|
+| Short-output ladder | PCIe BW ceiling + per-step launch overhead; aggregate soft cap independent of prefill | `max_tokens=96` | short |
+| Mixed-decode lc_mixed | steady-state agent workload with prefill overlap + warm prefix cache; aggregate after amortization kicks in | per-stream ∈ {1k, 2k, 3k, 4k} | ~10k / ~50k shared-prefix |
+
+Same hardware, same serve profile (`--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d`), but lc_mixed aggregate sits higher than ladder aggregate at identical bs because long outputs amortize fixed per-step overheads (launch, cache rebuild check, scheduler tick) over more decoded tokens.
+
+**Ladder** — `max_tokens=96`, text-only:
 
 | concurrency | aggregate tok/s | per-stream tok/s | notes |
 |---|---|---|---|
@@ -118,47 +125,64 @@ Two measured curves that drive serve-profile choices on this rig.
 
 Aggregate soft ceiling ≈65–77 tok/s — set by PCIe BW + per-step expert-fetch volume, not compute. Adding `--max-running-requests 8` lets bs=6 fill the captured bs=8 graph and lifts c6 aggregate to ~76.9 at cost of p95 ≈7s (c8 tail ≈25s) — throughput-first only.
 
-**MoE cache size vs decode speed.** `ft ctl cache rebuild` live resize, no restart. Slots 1024 → 2048 → 3072 give long-text steady-state decode ≈62 → 75 → 84 char/s (≈33 → 40 → 44 tok/s; short text ≈52). Cumulative **+36% with zero quality loss** — cache stores exact weights, gains come purely from hit rate. Past ~3072 curve flattens (+5–8% but eats KV pool).
+**lc_mixed** — `bench_lc_mixed.py`, MTP off, `--cuda-graph-max-bs 1`, two prompt tiers × bs ∈ {4, 8}, two rounds each:
+
+| bs | prompt tier | aggregate tok/s | per-stream avg tok/s | TTFT cold → warm |
+|---|---|---|---|---|
+| 4 | ~10k | ~104 | ~25 | 3.2s → 2.4s |
+| 4 | ~50k | ~104 | ~25 | 10.1s → 2.6s |
+| 8 | ~10k | ~193 | ~24 | 46.6s → 46.8s |
+| 8 | ~50k | ~187 | ~24 | 47.7s → 48.3s |
+
+Three observations: per-stream decode ~25 tok/s is length-independent up to ~50k context (KV read BW not yet bottleneck — weight streaming dominates); bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling; bs=8 TTFT ~47s reflects chunked-prefill queueing across 8 streams × XLONG prompts × ~8192-token chunks, not decode slowdown. Round-to-round TTFT drop confirms warm prefix cache hits via mm content-key path.
+
+**MoE cache size vs decode speed** (`ft ctl cache rebuild` live resize, no restart). Slots 1024 → 2048 → 3072 give long-text steady-state decode ≈62 → 75 → 84 char/s (≈33 → 40 → 44 tok/s; short text ≈52). Cumulative **+36% with zero quality loss** — cache stores exact weights, gains come purely from hit rate. Past ~3072 curve flattens (+5–8% but eats KV pool).
 
 ---
 
 ## Serve profiles
 
+The launcher in `_exp_garble/run_exp.py` is a thin shim that prepends the exp package dir to `sys.path` so `import freetoken` resolves to the exp tree, then forwards CLI flags unchanged. Equivalent to `ft serve` against the same package. Paths below are illustrative — substitute your own venv Python, launcher path, and model dir.
+
+Default profile:
+
 ```powershell
-# optional: only when expert weights exceed the pin budget (~half RAM under WDDM)
-$env:FREETOKEN_PIN_BUDGET_GB = "120"
-
-# turbo4 + 1M KV — longest-context profile, encoders on
-ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model ./models/Qwen3.8-Flash-Next-NVFP4 `
+python <launcher>.py `
+  --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 1048576 --moe-cache-size 2048 `
-  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d
+  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
+  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
+  --max-running-req 4 `
+  --host 0.0.0.0 --port 8001
+```
 
-# turbo4 + 512K KV — larger resident expert cache
-ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
-  --num-tokens 524288 --moe-cache-size 3072 `
-  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d
+This is the 1M-token longest-context profile with b12x Triton backend (feature point 3) and bs=4 cap. Budget slide is enabled; encoder towers load by default; CUDA-graph ladder is auto-tuned from VRAM.
 
-# bs=1-dominated tight profile — single-graph ladder, MTP off, q4_0 bank, text-only
-ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
+Tighter bs=1-dominated profile (verified separately, useful when bs_hist ≥95% bs=1 in `/v1/stats`):
+
+```powershell
+python <launcher>.py `
+  --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 65536 --moe-cache-size 1024 `
   --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
-  --cuda-graph-max-bs 1 --moe-prefill-demand-tokens 64 `
-  --mtp-expert-quant q4_0 --text-model-only
+  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
+  --cuda-graph-max-bs 1 --mtp-expert-quant q4_0 --text-model-only `
+  --host 0.0.0.0 --port 8001
 ```
 
 Flags worth understanding:
 
+- `--quant-backend moe.nvfp4=b12x` — select the b12x Triton backend for NVFP4 MoE decode (feature point 3). Without it the auto-selector may pick `marlin` on SM80/99 or fall through to torch `_scaled_mm`. On SM120 with this checkpoint, `b12x` is the right choice; pair with `--moe-prefill-hit-d2d` so prefill hits reuse GPU-side copies. Accepts per-layer overrides: `linear=marlin,moe=b12x`.
 - `--num-tokens` — paged KV pool size. turbo4 ≈6.9 KiB/token → ≈6.8 GiB full pool at 1M, ≈3.4 GiB at 512k, ≈0.4 GiB at 65k. Smaller pool leaves contiguous VRAM headroom for verify peak.
 - `--moe-cache-size` — experts resident on GPU. Steady-state decode scales roughly with hit rate up to ~3072, then flattens.
 - `--kv-cache-dtype` — see tier table under feature point 2.
+- `--max-running-req N` — scheduler concurrency cap. Argparse prefix-matches `--max-running-requests`; both spellings work. Default lets bs grow up to ladder cap; `4` keeps the bs=4 graph hot.
 - `--text-model-only` — skip all encoder towers; their VRAM goes to KV / expert caches. Use `--mm-disable vision audio` instead when only some kinds should be skipped. Vision / audio towers load by default and skip cleanly when disabled. Upstream-provided flags.
 - `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies. Upstream-provided.
 - `--cuda-graph-max-bs N` — CUDA-graph ladder cap; `1` for bs=1-dominated, `4` adds bs=4 burst slot cheaply under shared mempool. Upstream-provided flag.
-- `--moe-prefill-demand-tokens` — chunk-row threshold for demand-prefill; default `64`. Upstream-provided flag.
-- `--mtp-draft-len` / `--mtp-device gpu` — opt-in. Measured acceptance ~0.70 with draft-len=2 gives net-positive on multi-stream aggregate but net-negative on bs=1-dominated traffic where verify overhead (~70ms/step) + redraft (~30ms) exceeds savings. Default-off on this branch.
+- `--moe-prefill-demand-tokens` — chunk-row threshold for demand-prefill (feature point 5); default `64` fits cached-prefix incremental prefill. Upstream-provided flag.
+- `--mtp-expert-quant q4_0` — shrink the MTP draft expert bank to q4_0 to fit verify peak inside tight VRAM. Use with `--mtp-device gpu` to actually enable MTP; default-off on this branch (see tuning note under feature point 1).
+- `--disable-budget-slide` — opt-out of the BudgetSlider from feature point 4, freezing KV/MoE pool sizes from startup. Use when the workload is single-model fixed-footprint and you want CUDA-graph captures pinned to stable addresses.
 
 ## Requirements & install
 

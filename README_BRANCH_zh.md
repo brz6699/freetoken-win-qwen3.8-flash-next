@@ -104,9 +104,16 @@ Storage 压缩;compute 保 bf16。Indexer keys 永远 bf16。`kvcache/turboquant
 
 ## Bench findings
 
-两条决定 serve-profile 的实测曲线。
+两条互补 bench regime,各自 isolate 一个 operating point——彼此不能互相代替。两张表都在 exp 全部 mechanism default-on 状态下测得。
 
-**Concurrency sweet spot。** bs=4 在这块卡上 per-stream latency × aggregate 最优。`max_tokens=96`,text-only,`--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d`:
+| regime | 测什么 | output length | prompt length |
+|---|---|---|---|
+| Short-output ladder | PCIe BW ceiling + per-step launch overhead;aggregate soft cap 与 prefill 无关 | `max_tokens=96` | short |
+| Mixed-decode lc_mixed | steady-state agent workload,prefill overlap + warm prefix cache 都生效;aggregate 在 amortization 后 | per-stream ∈ {1k, 2k, 3k, 4k} | ~10k / ~50k shared-prefix |
+
+同一硬件同一 serve profile(`--num-tokens 524288 --moe-cache-size 3072 --kv-cache-dtype turbo4 --moe-prefill-hit-d2d`),lc_mixed aggregate 比 ladder aggregate 在同一 bs 下高一截,因为长 output 把 fixed per-step overheads(launch、cache rebuild check、scheduler tick)摊到更多 decoded tokens 上。
+
+**Ladder**——`max_tokens=96`,text-only:
 
 | concurrency | aggregate tok/s | per-stream tok/s | notes |
 |---|---|---|---|
@@ -118,47 +125,64 @@ Storage 压缩;compute 保 bf16。Indexer keys 永远 bf16。`kvcache/turboquant
 
 Aggregate soft ceiling ≈65–77 tok/s——PCIe BW + per-step expert-fetch volume 决定,非 compute。`--max-running-requests 8` 让 bs=6 填 bs=8 graph → aggregate 升到 ~76.9,p95 ≈7s(c8 tail ≈25s)——throughput-first only。
 
-**MoE cache size vs decode speed。** `ft ctl cache rebuild` live resize,no restart。Slots 1024 → 2048 → 3072:long-text steady-state decode ≈62 → 75 → 84 char/s(≈33 → 40 → 44 tok/s;short text ≈52)。Cumulative **+36% 零质量损失**——cache 存 exact weights,gains 纯靠 hit rate。Past ~3072 curve flatten(+5–8% 但吃 KV pool)。
+**lc_mixed**——`bench_lc_mixed.py`,MTP off,`--cuda-graph-max-bs 1`,两 prompt tiers × bs ∈ {4, 8},各跑两轮:
+
+| bs | prompt tier | aggregate tok/s | per-stream avg tok/s | TTFT cold → warm |
+|---|---|---|---|---|
+| 4 | ~10k | ~104 | ~25 | 3.2s → 2.4s |
+| 4 | ~50k | ~104 | ~25 | 10.1s → 2.6s |
+| 8 | ~10k | ~193 | ~24 | 46.6s → 46.8s |
+| 8 | ~50k | ~187 | ~24 | 47.7s → 48.3s |
+
+三点观察:per-stream decode ~25 tok/s 与长度无关直到 ~50k context(KV read BW 还不是瓶颈——weight streaming 主导);bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling;bs=8 TTFT ~47s 反映 chunked-prefill queueing across 8 streams × XLONG prompts × ~8192-token chunks,非 decode slowdown。Round-to-round TTFT 下降证实 mm content-key path warm prefix cache hits 生效。
+
+**MoE cache size vs decode speed**(`ft ctl cache rebuild` live resize,no restart)。Slots 1024 → 2048 → 3072:long-text steady-state decode ≈62 → 75 → 84 char/s(≈33 → 40 → 44 tok/s;short text ≈52)。Cumulative **+36% 零质量损失**——cache 存 exact weights,gains 纯靠 hit rate。Past ~3072 curve flatten(+5–8% 但吃 KV pool)。
 
 ---
 
 ## Serve profiles
 
+Launcher `_exp_garble/run_exp.py` 是个 thin shim:prepend exp package dir 到 `sys.path`,让 `import freetoken` resolve 到 exp tree;CLI flags 透传不变。等价于 `ft serve` 跑同一 package。下面路径都是示意——换成你自己的 venv Python、launcher path、model dir。
+
+Default profile:
+
 ```powershell
-# optional:仅当 expert weights 超过 pinned budget(WDDM 下约 RAM 一半)
-$env:FREETOKEN_PIN_BUDGET_GB = "120"
-
-# turbo4 + 1M KV — longest-context profile,encoder tower 默认加载
-ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model ./models/Qwen3.8-Flash-Next-NVFP4 `
+python <launcher>.py `
+  --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 1048576 --moe-cache-size 2048 `
-  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d
+  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
+  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
+  --max-running-req 4 `
+  --host 0.0.0.0 --port 8001
+```
 
-# turbo4 + 512K KV — larger resident expert cache
-ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
-  --num-tokens 524288 --moe-cache-size 3072 `
-  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d
+这是 1M-token longest-context profile + b12x Triton backend(功能点 3)+ bs=4 cap。Budget slide enabled;encoder towers default-on;CUDA-graph ladder auto-tuned from VRAM。
 
-# bs=1-dominated tight profile — single-graph ladder,MTP off,q4_0 bank,text-only
-ft.exe serve --host 0.0.0.0 --port 8001 `
-  --model ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
+bs=1-dominated tight profile(`/v1/stats` bs_hist ≥95% bs=1 时单独验证过):
+
+```powershell
+python <launcher>.py `
+  --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 65536 --moe-cache-size 1024 `
   --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
-  --cuda-graph-max-bs 1 --moe-prefill-demand-tokens 64 `
-  --mtp-expert-quant q4_0 --text-model-only
+  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
+  --cuda-graph-max-bs 1 --mtp-expert-quant q4_0 --text-model-only `
+  --host 0.0.0.0 --port 8001
 ```
 
 Flags worth understanding:
 
+- `--quant-backend moe.nvfp4=b12x` — NVFP4 MoE decode 选 b12x Triton backend(功能点 3)。不设时 auto-selector 在 SM80/99 上可能选 `marlin`,否则 fall through 到 torch `_scaled_mm`。SM120 + 这个 checkpoint 下 `b12x` 是对的;配合 `--moe-prefill-hit-d2d` 让 prefill hits 复用 GPU-side copies。支持 layer-level override:`linear=marlin,moe=b12x`。
 - `--num-tokens` — paged KV pool size。turbo4 ≈6.9 KiB/token → full pool ≈6.8 GiB @1M,≈3.4 GiB @512k,≈0.4 GiB @65k。Pool 越小给 verify peak 留越多 contiguous VRAM headroom。
 - `--moe-cache-size` — GPU 上驻留的 expert 数量。Steady-state decode 大致跟 hit rate 涨到 ~3072,然后 flatten。
 - `--kv-cache-dtype` — 见功能点 2 tier table。
+- `--max-running-req N` — scheduler concurrency cap。Argparse prefix-match `--max-running-requests`,两种写法都接受。Default 让 bs 涨到 ladder cap;`4` 让 bs=4 graph 保持热。
 - `--text-model-only` — skip all encoder towers;它们的 VRAM 给 KV / expert caches。只想 skip certain kinds 用 `--mm-disable vision audio`。Vision / audio towers 默认 load,disabled 时 clean skip。上游已提供 flags。
 - `--moe-prefill-hit-d2d` — prefill expert hits 走 device-to-device copies。上游已提供。
 - `--cuda-graph-max-bs N` — CUDA-graph ladder cap;bs=1-dominated 设 1,共享 mempool 下 bs=4 burst slot 加 `4`。上游已提供 flag。
-- `--moe-prefill-demand-tokens` — demand-prefill chunk-row threshold;默认 `64`。上游已提供 flag。
-- `--mtp-draft-len` / `--mtp-device gpu` — opt-in。Acceptance ~0.70 with draft-len=2 在 multi-stream aggregate 净正,bs=1-dominated 净负(verify overhead ~70ms/step + redraft ~30ms > skipping forward passes savings)。本分支默认 off。
+- `--moe-prefill-demand-tokens` — demand-prefill chunk-row threshold(功能点 5);默认 `64` 适配 cached-prefix incremental prefill。上游已提供 flag。
+- `--mtp-expert-quant q4_0` — shrink the MTP draft expert bank to q4_0,让 verify peak fit inside tight VRAM。配合 `--mtp-device gpu` 才真启 MTP;本分支默认 off(见功能点 1 调优注)。
+- `--disable-budget-slide` — opt-out of BudgetSlider(功能点 4),freeze KV/MoE pool sizes from startup。Workload single-model fixed-footprint、想让 CUDA-graph captures pin to stable addresses 时用。
 
 ## Requirements & install
 
