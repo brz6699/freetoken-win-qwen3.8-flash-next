@@ -20,7 +20,7 @@ Reference rig for every number below: RTX 5090 SM120 PCIe-bound + Qwen3.8-Flash-
 
 ### 1. turbo4 KV storage tier + TurboQuant packed-nibble rotspace
 
-**(1)** bf16 paged KV at ~27 KiB/token overflows a 32 GiB card at bs=1 long-context once you also need room for NVFP4 weights (~24 GiB), encoder towers (~0.84 GiB), GDN linear-state pools, and the MoE expert LRU. Existing fp8_e4m3 tier halves that to ~13.5 KiB/token, still leaving no headroom for the 1M-token pool. Need a tier with cosine ≥0.98 vs bf16 that fits longest contexts inside ~6.8 GiB pool — without that tier, the 1M-token profile this branch ships is simply impossible on this hardware.
+**(1)** bf16 paged KV at ~27 KiB/token overflows a 32 GiB card at bs=1 long-context once you also need room for NVFP4 weights (~24 GiB), encoder towers (~0.84 GiB), GDN linear-state pools, and the MoE expert LRU. Existing fp8_e4m3 tier halves that to ~13.5 KiB/token, still leaving no headroom for the 1M-token pool. Need a third tier with cosine ≥0.98 vs bf16 that fits longest contexts inside ~6.8 GiB pool — without that tier, the 1M-token profile this branch ships is simply impossible on this hardware.
 
 **(2)** Three tiers measured against bf16 reference attention (max-cosine over sparse + split-k paths):
 
