@@ -40,6 +40,27 @@
 
 **Budget slide:运行时 KV/expert rebalancing。** `engine/budget_slide.py` 根据当前流量重新分配 KV pool pages 与 MoE cache slots,不需要重启 engine 也不需要重新加载权重。实测触发节奏:burst 时每几条请求一次,idle 时大约每分钟一次。Rebuild 是 preserve-residency(已驻留的专家权重不动),只换 pool sizes。
 
+## Round-7 —运行时再平衡 + pipeline overlap
+
+在上游基础上叠的八条小规则,每条独立可测,合起来让一块固定大小的 VRAM arena 在不重新分配的前提下服务长寿命 agent 流量。共同不变量:启动一次性 allocate,之后只做视图切片和簿记重置。
+
+- **Recurrence-window MoE admission。** `ensure_experts_hybrid` 在 recurrence window 内第二次看到该 expert 时才把它 fetch 到 GPU,首次 miss 走 CPU 计算。Gate 在每层 expert lookup 触发,所以 admission 在 miss 那一刻决定,而不是 periodic sweep。消除 cold prefill 阶段每个 expert 都短暂占一个 GPU slot 的 cache thrash。
+- **bs-sized transport routing。** `hybrid_fetch_fraction`(0–1 比率,init 时由 `ft bench bw` 测一次)取代固定 `hybrid_max_fetch` 计数:每个 decode step fetch `fraction × misses` 个 expert,PCIe 饱和而 CPU GEMM 仍然 overlap。bs=1…8 都靠这一条。profile 只在 engine init 读一次——decode 中途重测会抖 TTFT。
+- **bs≥4 decode-step prefetch。** `_decode_hybrid` 在本层 GEMM dispatch 之前对 next_layer 调 `prefetch_decode_layer(next_layer, hint)`,让下一层 PCIe 跟当前层 compute overlap。bs<4 路由熵太高,prefetch hit 概率压不过浪费 fetch 的成本,gate 跳过。见 `tests/moe/test_decode_prefetch_gate.py`。
+- **KV hot-window。** `FREETOKEN_HOT_WINDOW_TOKENS` 给 budget-slider 看到的 `demand_tokens` 信号加 cap,让 KV 能涨到一个 soft ceiling,而不是纯 shrink-only。Opt-in:不设时严格保留 shrink-only 行为。针对多轮 agent prompt:硬性 shrink-only floor 会把还在用的 prefix pages 踢掉。
+- **Prefill/decode interleaving。** `_interleave_every`(默认 4)个连续 prefill chunk 之后 scheduler 强制插一个 decode step。计数单位是 chunk 而非秒,保证 replay 确定性。override:`prefill_interleave_every`。
+- **Asymmetric EMA shrink。** `budget_slide.propose_targets` 上行快下行慢:EMA 系数上升时高(burst 期间不要欠配),下降时低(load 回落时不要 pingpong)。`min_step_ratio` deadband 忽略阈值以下抖动;`demand_floor` 防止 shrink-only 跌破下一请求 working set。只在 idle transition 触发。
+- **Special-token ckpt,工具调用复用。** `--enable-special-token-ckpt` 让 decode 在 tool-call opener token 处快照 GDN state。该 token 是结构边界——之前(system prompt / few-shot / history)逐轮一致,之后漂移。snapshot 每轮付一次成本,prefix reuse 每次 echo 命中。替代旧的"每 N token ckpt 一次"启发式——后者大多数 ckpt 根本没匹配上。
+- **Budget slider(载体)。** `BudgetSlider` 在 idle 时重切 KV pages ↔ MoE slots。`mha_pool.rebuild` / `OffloadMoeCache.rebuild` 从 arena 左端重新切视图;base pointer 不动,CUDA graph 仍有效。Rebalance 只在 idle transition 触发——这是唯一同时没有 live page-index 引用也没有 in-flight graph replay 的时刻。
+
+八条各自独立 gate,关掉或调某一条不影响其他。共享不变量就是 VRAM 启动一次性分配,之后只做 view reslice + bookkeeping reset。
+
+## mm pipeline 三轮迭代
+
+- **Round-4 / P4 — content-key 前缀缓存 + splice 不变量修复。** tokenizer worker 用图像像素负载的 sha1 生成 content id,mm 前缀匹配/插入走 `mm_cache_key`(image_pad 段替换为 content id)——同图复用 KV,异图零误命中。splice 不变量修复:模型要求 mm 请求的所有 image_pad 要么全部在本次 forward 的行内要么整段已被缓存(行内 0 个 pad)。`match_req` 对落在 pad 跨度内的前缀匹配回退到 `align_down(span_start, page_size)` 并丢弃 GDN 快照(防 COW 越界);越过最后一段 pad 的匹配原样放行。验证:`p4_splice_test.py` 21 腿 + `r4_adv_probe.py` 174 对抗。
+- **Round-5 — 视频路径 + dual-pad 修复。** video 部件接受帧列表(data:/http/本地路径)或单个动画文件(GIF/WebP/APNG);≤8 帧等间隔采样;多帧走处理器 `videos=` 时间配对(回退逐帧堆叠),`t>1` grid;每个部件仍只渲染一个 pad 占位。checks 中两种 pad 拼写(`image_token_id` / `video_token_id`,均在 vision_start/end 内)都识别,展开统一写 `image_token_id`,模型侧 embed mask / cache key / scheduler 零改动。mp4 PIL 无 ffmpeg 后端时回退 `imageio`(bundled 静态 `imageio-ffmpeg`)整段读入后采样 ≤8 帧。超过 32768 patch 直接返回干净 400(`context_length_exceeded`),streaming 在流内承载 error frame。验证:`vision_video_test.py` / `vision_p3_media_test.py`。
+- **Round-6 — mm RAM tier swap-in/out。** 已完成的 mm 请求把 prompt 段 KV + GDN 状态暂存主机内存;后续同内容键请求匹配时把行搬回新分配的 VRAM pages 直接续跑。实现:`snapshot_rows` / `restore_rows` 打包 K/V 压缩块 + turbo4 标尺 + QSA 压缩索引行(`slot // index_ratio`)到 CPU;`index_copy_` 原地散射(`[:, idx].copy_` 会先 gather 成临时量写不进去——踩过)。`pending_ring` 暂态不入 tier。Tier 存储按字节 LRU 淘汰,`FREETOKEN_MM_TIER_MB` budget 默认 1024。Restore gate:content key 逐位相等 + 边界优于树匹配 + 不切断 pad run。验证:`kv_tier_test.py` 在真实 QSA+turbo4 pool 上(行往返/字节核算/同键替换/LRU/pad 边界/GDN 写回)。
+
 ## 环境要求
 
 - Windows 11(或 WSL2)x64,NVIDIA GPU ≥ 24 GB VRAM,推荐 ≥ 2× 模型大小的内存。
