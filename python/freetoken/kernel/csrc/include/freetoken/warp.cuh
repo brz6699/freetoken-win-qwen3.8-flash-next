@@ -1,6 +1,10 @@
 #pragma once
 #include <freetoken/utils.cuh>
 
+#ifndef _WIN32
+#include <sys/cdefs.h>
+#endif
+
 #include <cstddef>
 
 namespace device::warp {
@@ -37,7 +41,7 @@ using mem_package_t = decltype(get_mem_package<kUnit>());
 
 template <std::size_t kBytes,
           std::size_t kUnit = details::resolve_unit_size(kBytes)>
-__forceinline__ __device__ void copy(void *__restrict__ dst,
+__always_inline __device__ void copy(void *__restrict__ dst,
                                      const void *__restrict__ src) {
   using Package = details::mem_package_t<kBytes, kUnit>;
   constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
@@ -58,7 +62,7 @@ __forceinline__ __device__ void copy(void *__restrict__ dst,
 
 template <std::size_t kBytes,
           std::size_t kUnit = details::resolve_unit_size(kBytes)>
-__forceinline__ __device__ void reset(void *__restrict__ dst) {
+__always_inline __device__ void reset(void *__restrict__ dst) {
   using Package = details::mem_package_t<kBytes, kUnit>;
   constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
   constexpr auto kLoopCount = kBytes / kBytesPerLoop;

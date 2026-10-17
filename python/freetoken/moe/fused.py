@@ -5,12 +5,9 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
-from freetoken.moe import BaseMoeBackend
-from freetoken.utils import div_ceil, init_logger
+from freetoken.utils import div_ceil
 
-logger = init_logger(__name__)
-
-_warned_torch_topk = False
+from .base import BaseMoeBackend
 
 
 def _torch_fused_topk(
@@ -19,7 +16,7 @@ def _torch_fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-torch softmax router matching triton_kernels.topk (Windows fallback).
+    """Pure-torch reference for the fused softmax router; tests compare the kernel against it.
 
     Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
     selected weights to sum to 1 -- the standard fused-MoE routing convention.
@@ -44,52 +41,14 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from freetoken.kernel.backend import is_triton_kernels_installed
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
-    # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
-    # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
-    if not is_triton_kernels_installed():
-        global _warned_torch_topk
-        if not _warned_torch_topk:
-            _warned_torch_topk = True
-            # Once, not per call: this runs every MoE forward. On Linux a missing
-            # triton_kernels used to fail fast with ImportError; keep the misconfiguration
-            # visible without giving up the fallback that Windows needs.
-            logger.warning_rank0(
-                "fused_topk: triton_kernels is not installed -> pure-torch router fallback "
-                "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
-                "install triton_kernels to restore the fused router."
-            )
-        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
+    return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
-    if topk & (topk - 1):
-        # triton_kernels.topk builds tl.arange(0, k), which must be a power of 2; a
-        # top-10 router (qwen4_exp) takes the equivalent vendored triton router instead.
-        from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
-        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
-
-    from triton_kernels.topk import topk as triton_kernels_topk
-
-    logits = gating_output.float()
-    softmax_first = not renormalize
-    if softmax_first:
-        logits = torch.softmax(logits, dim=-1)
-    sparse_topk = triton_kernels_topk(
-        logits,
-        topk,
-        apply_softmax=not softmax_first,
-    )
-    if hasattr(sparse_topk, "vals"):
-        topk_weights = sparse_topk.vals
-        topk_ids = sparse_topk.indx
-    else:
-        topk_weights, topk_ids = sparse_topk[:2]
-    topk_ids = topk_ids.to(torch.int32)
-    if num_token_non_padded is not None:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
-    return topk_weights, topk_ids
+# sgl_kernel's moe_align_block_size counts experts in one 1024-thread block and reads out of
+# bounds past it; a prefill over the offload slot cache aligns against the slot count.
+_SGL_ALIGN_MAX_EXPERTS = 1024
 
 
 def moe_align_block_size(
@@ -134,7 +93,7 @@ def moe_align_block_size(
     """
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
-    if not is_sgl_kernel_installed():
+    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS:
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )
@@ -245,13 +204,15 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
     not shared; the resident bf16 path routes decode through here too."""
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
-    from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+    from freetoken.layers import gated_act_and_mul
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -320,8 +281,7 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
     )
-    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
-    FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    gated_act_and_mul(activation, intermediate_cache1.view(-1, N), intermediate_cache2, alpha=act_alpha, limit=act_limit)
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -352,9 +312,11 @@ def fused_experts_decode_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
-    from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+    from freetoken.layers import gated_act_and_mul
 
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert w1.shape[0] == w2.shape[0], "Expert cache size mismatch"
@@ -370,9 +332,6 @@ def fused_experts_decode_impl(
     assert w1.dtype == hidden_states.dtype and w2.dtype == hidden_states.dtype
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
-    if activation not in {"silu", "gelu", "gelu_tanh"}:
-        raise ValueError(f"Unsupported activation: {activation}")
-
     M, _ = hidden_states.shape
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]
@@ -405,8 +364,7 @@ def fused_experts_decode_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
-    FN_MAP[activation](intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2)
+    gated_act_and_mul(activation, intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2, alpha=act_alpha, limit=act_limit)
 
     intermediate_cache3 = torch.empty(
         (M, top_k, w2.shape[1]),

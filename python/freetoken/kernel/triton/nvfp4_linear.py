@@ -25,37 +25,40 @@ Dispatch (``nvfp4_dense_linear``):
     dequants in the K loop, with the same split-K trick when ``M x N`` alone cannot fill the
     SMs. Reads only the packed weight -- the bf16 scratch path would cost ~4.5x the traffic,
     which at these M is the whole latency.
-  * M > 64 (prefill): dequantize the whole weight to a bf16 scratch (memory-roof Triton
-    kernel, N-chunked to bound the allocation) and run cuBLAS. In-kernel dequant GEMMs
-    re-dequantize every weight tile ``M / BLOCK_M`` times and top out ~3x slower than cuBLAS
-    on H100; dequant-once + cuBLAS is within ~7% of the bf16 GEMM at prefill M.
+  * M > 64 (prefill): the NVFP4-native block-scaled MMA through ``torch._scaled_mm``
+    (cuBLASLt on sm_120): activations are quantized to e2m1 with per-16 e4m3 block
+    scales (the checkpoint's own recipe) and both operands go to the tensor cores in
+    FP4 -- ~1.5-3x over dequant-scratch + cuBLAS at prefill M. Where the native call
+    is unavailable, fall back to: dequantize the whole weight to a bf16 scratch
+    (memory-roof Triton kernel, N-chunked to bound the allocation) and run cuBLAS.
+    In-kernel dequant GEMMs re-dequantize every weight tile ``M / BLOCK_M`` times and
+    top out ~3x slower than cuBLAS on H100; dequant-once + cuBLAS is within ~7% of
+    the bf16 GEMM at prefill M.
 
 CUDA-graph safe on the decode paths: fixed shapes, no host sync.
 """
 
 from __future__ import annotations
 
-import os
 
 import torch
 import triton
 import triton.language as tl
-from freetoken.layers import BaseOP
-from freetoken.layers.base import _concat_prefix
 
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
+    e4m3_native,
     e4m3_native_cx,
     e4m3_u8_to_f16_x128,
     e4m3_u8_to_f32,
+    round_e4m3,
 )
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
-
-# Escape hatch: FREETOKEN_DEBUG_DENSE_NVFP4_REF=1 swaps the triton kernels for a dequant_nvfp4 +
-# torch matmul reference (numeric A-B debugging). Evaluated once; the kernels are the default.
-_USE_REF = os.environ.get("FREETOKEN_DEBUG_DENSE_NVFP4_REF") == "1"
 
 # Decode GEMV tiles (H100-tuned; the fp16-trick dequant is ALU-cheap so wider K tiles win).
 # Two sets: the transposed K-major resident layout (coalesced along N; narrower K tiles win)
@@ -720,6 +723,110 @@ def _dequant_rows(packed_i32: torch.Tensor, scale: torch.Tensor, gscale: torch.T
     )
 
 
+# ======================================================================================
+# NVFP4-native path (M > 64): quantize activations with the checkpoint recipe and run
+# the block-scaled FP4 MMA through cuBLASLt (torch._scaled_mm, sm_120+).
+# ======================================================================================
+@triton.jit
+def _nvfp4_quant_act_kernel(
+    x_ptr,      # [M, K] activations, row-major
+    out_ptr,    # [M, K // 2] uint8, packed e2m1 pairs (low nibble = even k)
+    scale_ptr,  # [Mp, K // 16] e4m3 block scales, rows zero-padded to Mp
+    K_BLKS,
+    stride_xm, stride_om, stride_sm,
+    BLOCK_KB: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    offs_b = pid_b * BLOCK_KB + tl.arange(0, BLOCK_KB)
+    bmask = offs_b < K_BLKS
+    offs_k = offs_b[:, None] * 16 + tl.arange(0, 16)[None, :]
+    v = tl.load(x_ptr + pid_m * stride_xm + offs_k, mask=bmask[:, None], other=0.0).to(tl.float32)
+
+    amax = tl.max(tl.abs(v), axis=1)
+    s = round_e4m3(tl.minimum(tl.maximum(amax / 6.0, 0.001953125), 448.0))
+    q = v / s[:, None]
+
+    a = tl.abs(q)
+    idx = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+           + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32)
+           + (a > 5.0).to(tl.int32))
+    code = idx + (q < 0).to(tl.int32) * 8
+    lo, hi = tl.split(tl.reshape(code, (BLOCK_KB, 8, 2)))
+    offs_o = offs_b[:, None] * 8 + tl.arange(0, 8)[None, :]
+    tl.store(out_ptr + pid_m * stride_om + offs_o,
+             (lo | (hi << 4)).to(tl.uint8), mask=offs_o < K_BLKS * 8)
+    tl.store(scale_ptr + pid_m * stride_sm + offs_b, s.to(tl.float8e4nv), mask=bmask)
+
+
+def _quant_act(x2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """e2m1-pack activations with per-16-element e4m3 scales (amax / 6, the same
+    recipe the checkpoint uses for weights)."""
+    M, K = x2d.shape
+    KB = K // 16
+    packed = torch.empty(M, K // 2, dtype=torch.uint8, device=x2d.device)
+    scales = torch.empty(M, KB, dtype=FP8, device=x2d.device)
+    BLOCK_KB = 8
+    _nvfp4_quant_act_kernel[(M, triton.cdiv(KB, BLOCK_KB))](
+        x2d, packed, e4m3_kernel_view(scales), KB,
+        x2d.stride(0), packed.stride(0), scales.stride(0),
+        BLOCK_KB=BLOCK_KB, num_warps=4,
+    )
+    return packed, scales
+
+
+def _smm_scale(s: torch.Tensor) -> torch.Tensor:
+    """Pad an ``[R, C]`` scale matrix onto cuBLASLt's block tiles (rows in 128,
+    columns in 4) and hand it over contiguous."""
+    r, c = s.shape
+    rp, cp = (r + 127) // 128 * 128, (c + 3) // 4 * 4
+    if (rp, cp) == (r, c):
+        return s.contiguous()
+    out = torch.zeros(rp, cp, dtype=s.dtype, device=s.device)
+    out[:r, :c] = s
+    return out
+
+
+_SMM_OK: dict = {}
+
+
+def _smm_supported(device: torch.device) -> bool:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    ok = _SMM_OK.get(idx)
+    if ok is None:
+        if not e4m3_native():
+            _SMM_OK[idx] = False
+            return False
+        try:
+            # Scale matrices consume rows in 128 tiles and columns in 4-block tiles;
+            # pick the smallest probe that needs no padding on any axis.
+            a = torch.ones(128, 32, dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2)
+            b = torch.ones(128, 32, dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2)
+            sa = torch.ones(128, 4, dtype=FP8, device=device)
+            sb = torch.ones(128, 4, dtype=FP8, device=device)
+            out = torch._scaled_mm(a, b.t(), scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+            ok = tuple(out.shape) == (128, 128)
+        except Exception:  # noqa: BLE001
+            ok = False
+        logger.info(f"nvfp4 native MMA path: {'on' if ok else 'off'} (gpu {idx})")
+        _SMM_OK[idx] = ok
+    return ok
+
+
+def _smm_gemm(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
+              gscale: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Block-scaled FP4 MMA on the native cuBLASLt path. ``scale`` is the logical
+    ``[N, K // 16]`` e4m3 view; the per-row global scale applies as an epilogue."""
+    xq, xs = _quant_act(a)
+    w = packed_i32.contiguous().view(torch.uint8).view(torch.float4_e2m1fn_x2)
+    out = torch._scaled_mm(
+        xq.view(torch.float4_e2m1fn_x2), w.t(),
+        scale_a=_smm_scale(xs), scale_b=_smm_scale(scale), out_dtype=torch.bfloat16,
+    )
+    out = out * gscale.to(out.dtype)
+    return out.to(out_dtype) if out.dtype != out_dtype else out
+
+
 def _gemm_scratch(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
                   gscale: torch.Tensor, out_dtype: torch.dtype,
                   transposed: bool) -> torch.Tensor:
@@ -758,23 +865,34 @@ def _gemm(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     """M>1 W4A16 GEMM dispatch. Small M (batched decode, lm_head last-token batch) reads
     the packed weight directly in the dot GEMM (split-K when needed); larger M (prefill)
     goes dequant-to-scratch + cuBLAS."""
-    M = a.shape[0]
+    M, K = a.shape
+    N = packed_i32.shape[0]
     if M <= _GEMM_MAX_INKERNEL_M:
         return _gemm_inkernel(a, packed_i32, scale, gscale, out_dtype, transposed)
+    # torch requires both packed trailing dims divisible by 16 (K // 2 and N for the
+    # column-major mat2); anything else takes the scratch fallback.
+    if K % 32 == 0 and N % 16 == 0 and _smm_supported(a.device):
+        return _smm_gemm(a, packed_i32, scale, gscale, out_dtype)
     return _gemm_scratch(a, packed_i32, scale, gscale, out_dtype, transposed)
 
 
-def _ref(a: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor,
-         gscale: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
-    """Numeric reference: dequant the FP4 weight to bf16 (well-tested ``dequant_nvfp4``)
-    then a plain matmul. Used by FREETOKEN_DEBUG_DENSE_NVFP4_REF=1 for A-B validation."""
-    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+_LUT_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
-    slots = torch.zeros(1, dtype=torch.int32, device=a.device)
-    w = dequant_nvfp4(
-        packed.unsqueeze(0), scale.unsqueeze(0), gscale.unsqueeze(0), slots, dtype=torch.bfloat16
-    )[0]  # [N, K] bf16
-    return (a.reshape(-1, a.shape[-1]) @ w.t()).to(out_dtype)
+
+def _dequant_nvfp4_torch(packed_i32, scale, gscale, dtype):
+    """Pure-torch NVFP4 dequant for the CPU-hidden head: unpack the little-endian e2m1
+    nibbles (8 per int32 word, LSB-first), map through the e2m1 magnitude LUT, apply the
+    fp8-e4m3 per-block scale and the fp16 per-row global scale. Returns ``[N, K]``."""
+    n, kw = packed_i32.shape
+    p = packed_i32.contiguous()
+    shifts = torch.arange(8, device=p.device, dtype=torch.int32) * 4
+    nib = ((p[:, :, None] >> shifts) & 0xF).reshape(n, kw * 8)  # k = kw*8 + j
+    lut = torch.tensor(_LUT_E2M1, device=p.device, dtype=torch.float32)
+    vals = lut[(nib & 7).long()]
+    vals = torch.where(nib >= 8, -vals, vals)
+    blk = scale.to(torch.float32).repeat_interleave(16, dim=1)  # [N, K]
+    vals = vals * blk * gscale.to(torch.float32)[:, None]
+    return vals.to(dtype)
 
 
 def _linear_impl(
@@ -783,6 +901,9 @@ def _linear_impl(
     transposed: bool,
 ) -> torch.Tensor:
     """Shared dispatch on a logical ``[N, K//8]`` int32 weight view (either storage order)."""
+    if not x.is_cuda:
+        w = _dequant_nvfp4_torch(packed_i32, scale, gscale, x.dtype)
+        return torch.nn.functional.linear(x, w, bias)
     *lead, K = x.shape
     N = packed_i32.shape[0]
     if x.numel() // K == 1:
@@ -802,10 +923,6 @@ def nvfp4_dense_linear(
 ) -> torch.Tensor:
     """``y = x @ dequant(weight)^T`` on the checkpoint-native row-major layout.
     ``weight`` [N, K//2] uint8, ``weight_scale`` [N, K//16] fp8-e4m3, ``weight_global`` [N] fp16."""
-    if _USE_REF:
-        *lead, K = x.shape
-        out = _ref(x, weight, weight_scale, weight_global, x.dtype).reshape(*lead, weight.shape[0])
-        return out + bias.to(out.dtype) if bias is not None else out
     return _linear_impl(
         x, weight.view(torch.int32), weight_scale, weight_global, bias, x.dtype, transposed=False
     )
@@ -829,105 +946,9 @@ def nvfp4_dense_linear_t(
 ) -> torch.Tensor:
     """``y = x @ dequant(W)^T`` on the K-major resident layout from
     :func:`nvfp4_transpose_resident` (``weight_t`` [K//8, N] int32, ``scale_t`` [K//16, N])."""
-    if _USE_REF:
-        out = _gemm_scratch(
-            x.reshape(-1, x.shape[-1]).contiguous(), weight_t.t(), scale_t.t(),
-            weight_global, x.dtype, transposed=True,
-        ).reshape(*x.shape[:-1], weight_t.shape[1])
-        return out + bias.to(out.dtype) if bias is not None else out
     return _linear_impl(
         x, weight_t.t(), scale_t.t(), weight_global, bias, x.dtype, transposed=True
     )
-
-
-# ======================================================================================
-# BaseOP linear layers (TP=1, replicated). Buffers: uint8 packed ``weight`` + fp8 block
-# ``weight_scale`` + fp16 per-row ``weight_global``.
-# ======================================================================================
-class Nvfp4DenseLinear(BaseOP):
-    """Replicated NVFP4 dense linear (W4A16). Drop-in for ``LinearReplicated`` /
-    ``LinearRowParallel`` at TP=1 on the mixed-precision checkpoint's NVFP4 dense weights.
-
-    Buffers are declared (and loaded) in the checkpoint's row-major layout; at load the
-    packed weight + block scales are repacked to K-major (:func:`nvfp4_transpose_resident`)
-    so the decode kernels' weight loads coalesce along N (~2x batched-decode throughput)."""
-
-    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
-        assert in_features % 16 == 0, f"NVFP4 in_features must be %16, got {in_features}"
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.empty(out_features, in_features // 2, dtype=torch.uint8)
-        self.weight_scale = torch.empty(out_features, in_features // 16, dtype=FP8)
-        self.weight_global = torch.empty(out_features, dtype=torch.float16)
-        self.bias = torch.empty(out_features) if has_bias else None
-        self._transposed = False
-
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        w = state_dict.pop(_concat_prefix(prefix, "weight"))
-        s = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
-        assert w.shape == self.weight.shape and w.dtype == torch.uint8
-        assert s.shape == self.weight_scale.shape
-        self.weight, self.weight_scale = nvfp4_transpose_resident(w, s)
-        self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
-        if self.bias is not None:
-            self.bias = state_dict.pop(_concat_prefix(prefix, "bias"))
-        self._transposed = True
-        if not _internal and state_dict:
-            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._transposed:
-            return nvfp4_dense_linear_t(
-                x, self.weight, self.weight_scale, self.weight_global, self.bias
-            )
-        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global, self.bias)
-
-
-class Nvfp4DenseColMerged(Nvfp4DenseLinear):
-    """Column-merged NVFP4 dense linear (drop-in for ``LinearColParallelMerged`` at TP=1):
-    one packed weight concatenating several projections on the output dim; each part keeps its
-    own per-row ``weight_global`` (and block scales), so the fused weight is exact. The caller
-    splits the output by ``output_sizes`` (e.g. shared-expert gate|up) as before."""
-
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
-        self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
-
-
-class Nvfp4LMHead(BaseOP):
-    """NVFP4 (W4A16) LM head for the mixed checkpoint (TP=1, untied). Mirrors
-    ``ParallelLMHead.forward`` at TP=1: slice to the last token per sequence at prefill, then
-    the W4A16 GEMV/GEMM instead of a bf16 ``F.linear`` over the (here ~1 GB) bf16 weight."""
-
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        assert embedding_dim % 16 == 0
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.weight = torch.empty(num_embeddings, embedding_dim // 2, dtype=torch.uint8)
-        self.weight_scale = torch.empty(num_embeddings, embedding_dim // 16, dtype=FP8)
-        self.weight_global = torch.empty(num_embeddings, dtype=torch.float16)
-        self._transposed = False
-
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        w = state_dict.pop(_concat_prefix(prefix, "weight"))
-        s = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
-        assert w.shape == self.weight.shape and w.dtype == torch.uint8
-        self.weight, self.weight_scale = nvfp4_transpose_resident(w, s)
-        self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
-        self._transposed = True
-        if not _internal and state_dict:
-            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.core import get_global_ctx
-
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        if self._transposed:
-            return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
-        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)
 
 
 __all__ = [
@@ -935,7 +956,4 @@ __all__ = [
     "nvfp4_dense_linear",
     "nvfp4_dense_linear_t",
     "nvfp4_transpose_resident",
-    "Nvfp4DenseLinear",
-    "Nvfp4DenseColMerged",
-    "Nvfp4LMHead",
 ]

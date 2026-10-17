@@ -3,12 +3,17 @@
 When flashinfer / sgl_kernel are installed the call-sites use their fused CUDA
 ops; otherwise they fall back to the pure-Triton kernels in
 ``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
-importable (no import side effects), and the result is cached.
+importable (no import side effects), and the result is cached. The
+flashinfer-backed peripheral ops can additionally be pinned back to triton
+with FREETOKEN_FLASHINFER_PERIPH=0 (see :func:`periph_flashinfer_ok`).
 """
 from __future__ import annotations
 
 import functools
 import importlib.util
+import os
+
+import torch
 
 
 def _importable(name: str) -> bool:
@@ -27,19 +32,52 @@ def is_flashinfer_installed() -> bool:
 
 
 @functools.cache
+def periph_flashinfer_ok() -> bool:
+    """Gate for the peripheral flashinfer call-sites (activation / rope / norm /
+    sampling). Defaults to ``is_flashinfer_installed()``; set
+    FREETOKEN_FLASHINFER_PERIPH=0 to force the triton kernels for those ops. The
+    b12x fused-MoE kernel gate (B12xNvfp4MoEKernel) deliberately keeps reading
+    ``is_flashinfer_installed()`` so this switch never disables it."""
+    if os.environ.get("FREETOKEN_FLASHINFER_PERIPH", "1") == "0":
+        return False
+    return is_flashinfer_installed()
+
+
+@functools.cache
 def is_sgl_kernel_installed() -> bool:
     return _importable("sgl_kernel")
 
 
 @functools.cache
-def is_triton_kernels_installed() -> bool:
-    """OpenAI's ``triton_kernels`` (the fused MoE router used by ``moe.fused.fused_topk``).
+def is_vllm_installed() -> bool:
+    return _importable("vllm")
 
-    Distinct from the ``triton`` runtime we always depend on: it ships with the Triton
-    source tree and has no Windows wheel. It is also not one of the six ops
-    ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
-    """
-    return _importable("triton_kernels")
+
+@functools.cache
+def device_capability() -> tuple[int, int]:
+    """Compute capability of the current device as (major, minor); (0, 0) without CUDA."""
+    if not torch.cuda.is_available():
+        return (0, 0)
+    major, minor = torch.cuda.get_device_capability()
+    return (int(major), int(minor))
+
+
+@functools.cache
+def is_rocm() -> bool:
+    """True when torch is built for ROCm (AMD GPU)."""
+    import torch
+    return getattr(torch.version, "hip", None) is not None
+
+
+@functools.cache
+def driver_hip_version() -> int | None:
+    """ROCm driver version, or None if undetermined."""
+    # TODO(ROCm): flashinfer/sgl_kernel have no ROCm builds — Triton fallback is used.
+    try:
+        from freetoken.kernel.pinned import _load_pinned_extension
+        return int(_load_pinned_extension().driver_cuda_version()) or None
+    except Exception:
+        return None
 
 
 @functools.cache

@@ -45,6 +45,14 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # MTP speculation counters of a finished request (steps / drafted / accepted / first-position
+    # matches / fully accepted steps), attached once on the terminal reply and folded by the
+    # StatsTracker into the /v1/stats `mtp` section. All 0 on the plain path.
+    mtp_steps: int = 0
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+    mtp_first_match: int = 0
+    mtp_full_accept: int = 0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

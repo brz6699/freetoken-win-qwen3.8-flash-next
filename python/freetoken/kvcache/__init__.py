@@ -40,7 +40,8 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .mha_pool import MHAKVCache
 
         return MHAKVCache
-    types = {spec.attn_type for spec in specs_fn()}
+    specs = list(specs_fn())
+    types = {spec.attn_type for spec in specs}
     if AttnType.DSV4 in types:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
@@ -50,6 +51,11 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
 
         return HybridSWAKVCache
     if AttnType.DSA in types:
+        # kpool-compressed indexer (glm5_next): shadow slab + tail rings.
+        if any(s.attn_type == AttnType.DSA and s.index_ratio > 1 for s in specs):
+            from .dsa_pool import KpoolDSAKVCache
+
+            return KpoolDSAKVCache
         from .dsa_pool import DSAKVCache
 
         return DSAKVCache
@@ -70,7 +76,9 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config, num_pages: int, device: torch.device, dtype: torch.dtype, arena: torch.Tensor | None = None
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
@@ -119,6 +127,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             else None
         ),
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        arena=arena,
     )
 
 
@@ -132,6 +141,7 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     kv_dtype: torch.dtype | None = None,
     kv_quant: str | None = None,
+    arena: torch.Tensor | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -144,6 +154,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            arena=arena,
         )
 
     from .mha_pool import MHAKVCache
@@ -200,6 +211,10 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        # spec decode keeps the last (1 + K) pre-RoPE index keys pending per request
+        # (vLLM sizing): the ring widens by the draft depth so a straddling group still
+        # finds its members. With MTP off this is the plain index_ratio sizing.
+        num_spec = (model_config.mtp_draft_len or 0) + 1 if model_config.enable_mtp else 0
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -212,33 +227,55 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_spec),
             layer_ids=spec.layer_ids,
             kv_dtype=kv_dtype,
             kv_quant=kv_quant,
+            mrope=model_config.model_is_mrope,
+            arena=arena,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
-        from .dsa_pool import DSAKVCache, MLAKVCache
+        from .dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache
 
         spec = kv_specs[0]
+        # With a layer remap the pool allocates len(layer_ids) slabs; without one
+        # it backs every model layer (all-MLA models, GLM-5.2).
+        num_layers = model_config.num_layers if layer_ids is None else len(layer_ids)
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
-            return DSAKVCache(
+            common = dict(
                 latent_dim=spec.head_dim,
-                num_layers=model_config.num_layers,
+                num_layers=num_layers,
                 num_pages=num_pages,
                 page_size=page_size,
                 dtype=dtype,
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                layer_ids=layer_ids,
+                kv_dtype=kv_dtype,
+                kv_quant=kv_quant,
             )
+            if spec.index_ratio > 1:
+                # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
+                if num_req_slots is None:
+                    raise ValueError("kpool pools need num_req_slots (max_running_req + 1)")
+                return KpoolDSAKVCache(
+                    **common,
+                    index_ratio=spec.index_ratio,
+                    num_req_slots=num_req_slots,
+                )
+            return DSAKVCache(**common)
         return MLAKVCache(
             latent_dim=spec.head_dim,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=layer_ids,
+            kv_dtype=kv_dtype,
+            kv_quant=kv_quant,
         )
 
     return MHAKVCache(
@@ -250,6 +287,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        arena=arena,
     )
 
 

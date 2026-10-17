@@ -16,7 +16,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from freetoken.layers import BaseOP
 
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_act_dtype,
@@ -271,48 +270,27 @@ def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block: int = _B
     return (weight.to(torch.float32) * s).to(torch.bfloat16)
 
 
-# ======================================================================================
-# BaseOP linear layers (TP=1, replicated).
-# ======================================================================================
-class Fp8BlockLinear(BaseOP):
-    """Replicated block-fp8 linear: fp8-e4m3 ``weight`` ``[out, in]`` + bf16
-    ``weight_scale_inv`` ``[out//128, in//128]``. Activations are quantized dynamically;
-    the GEMM dequantizes per block, so activations keep bf16 precision."""
+def per_block_quant_fp8(weight: torch.Tensor, block: int = _BLOCK):
+    """Quantize a bf16 weight ``[N, K]`` to fp8-e4m3 ``weight`` + ``[N//block, K//block]`` bf16 scale.
 
-    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
-        assert in_features % _BLOCK == 0 and out_features % _BLOCK == 0, (in_features, out_features)
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.empty(out_features, in_features, dtype=FP8)
-        self.weight_scale_inv = torch.empty(
-            out_features // _BLOCK, in_features // _BLOCK, dtype=torch.bfloat16
-        )
-        self.bias = torch.empty(out_features) if has_bias else None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return block_fp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
-
-
-class Fp8BlockColMerged(Fp8BlockLinear):
-    """Block-fp8 column-merged linear (drop-in for ``LinearColParallelMerged`` at TP=1).
-
-    Holds one fp8 weight that is the concatenation of several projections along the output
-    dim; the caller splits the bf16 output by ``output_sizes`` exactly as before. Each part's
-    out dim must be a multiple of 128 so the concatenated ``weight_scale_inv`` blocks align."""
-
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
-        for o in output_sizes:
-            assert o % _BLOCK == 0, (output_sizes, "each merged output size must be /128 for fp8")
-        self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
+    Exact inverse of :func:`dequant_block_fp8`: ``weight_bf16[i,j] ≈ w_fp8[i,j] * scale[i//block, j//block]``
+    with ``scale = amax(block) / 448`` (e4m3 finite max). ``N``/``K`` must be divisible by ``block``.
+    Used to quantize a weight the checkpoint ships in bf16 (e.g. lm_head) at load time."""
+    N, K = weight.shape
+    if N % block or K % block:
+        raise ValueError(f"per_block_quant_fp8 needs [N,K] divisible by {block}, got {N}x{K}")
+    w = weight.to(torch.float32).reshape(N // block, block, K // block, block)
+    amax = w.abs().amax(dim=(1, 3), keepdim=True)
+    scale = (amax / _FP8_MAX).clamp(min=1e-12)  # all-zero block -> tiny scale keeps w_fp8 = 0
+    w_fp8 = (w / scale).clamp(-_FP8_MAX, _FP8_MAX).to(FP8).reshape(N, K)
+    return w_fp8, scale.reshape(N // block, K // block).to(torch.bfloat16)
 
 
 __all__ = [
     "FP8",
-    "Fp8BlockLinear",
-    "Fp8BlockColMerged",
     "block_fp8_linear",
     "block_fp8_matmul",
     "per_token_group_quant_fp8",
     "dequant_block_fp8",
+    "per_block_quant_fp8",
 ]

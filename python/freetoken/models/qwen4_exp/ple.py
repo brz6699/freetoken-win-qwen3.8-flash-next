@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.mm import restore_placeholder
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
@@ -333,12 +334,22 @@ def build_ple_metadata(
     )
     fla = getattr(batch, "fla_metadata", None)
     slots_dev = getattr(batch, "linear_table_idx", None)
+    # The n-gram pool is GPU-resident even when the head is CPU-hidden, so the whole
+    # metadata (ids + cu/slots/fresh + context) must agree on the pool's device or the
+    # gather/searchsorted below mixes CUDA and CPU. Rebind the build target to the pool.
+    device = context_pool.device
+    # image rows hash as the placeholder token, never as the content pad ids
+    input_ids = batch.input_ids.to(device)
+    if args.image_token_id is not None:
+        input_ids = restore_placeholder(input_ids, args.image_token_id)
 
     if batch.is_decode and slots_dev is not None:
-        slots = slots_dev.long()
+        # The head (possibly CPU-hidden) may hand the verify batch its slot metadata on
+        # CPU while the n-gram pool is GPU-resident; align the index to the pool.
+        slots = slots_dev.long().to(context_pool.device)
         bs = slots.numel()
         return PLEMetadata(
-            input_ids=batch.input_ids,
+            input_ids=input_ids,
             cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
             seq_lens=(1,) * bs,
             ngram_context=context_pool.index_select(0, slots).long(),
@@ -349,18 +360,19 @@ def build_ple_metadata(
 
     lens = [r.extend_len for r in reqs]
     if fla is not None and fla.has_initial_state is not None:
-        cu = fla.cu_seqlens
-        slots = fla.cache_indices.long()
-        fresh = ~fla.has_initial_state
+        cu = fla.cu_seqlens.to(device)
+        slots = fla.cache_indices.long().to(device)
+        fresh = (~fla.has_initial_state).to(device)
     else:  # direct-op callers (tests) with no scheduler metadata
         pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
         cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
         slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
         fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
-    context = context_pool.index_select(0, slots).long()
-    context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
+    cdev = context_pool.device
+    context = context_pool.index_select(0, slots.long().to(cdev)).long()
+    context = torch.where(fresh.to(cdev).unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
-        input_ids=batch.input_ids,
+        input_ids=input_ids,
         cu_seqlens=cu,
         seq_lens=tuple(lens),
         ngram_context=context,
@@ -542,7 +554,7 @@ class PLELayer(BaseOP):
     """
 
     def __init__(
-        self, config: ModelConfig, layer_id: int, table: PLETableBackend | None = None
+        self, config: ModelConfig, layer_id: int, table: PLETableBackend | None = None, *, prefix: str = ""
     ) -> None:
         args = config.qwen4_args
         self.args = args
@@ -554,8 +566,12 @@ class PLELayer(BaseOP):
         self.state_len = args.ple_conv_state_len
         width = args.ple_state_width
         self.ple_embedding = NGramEmbedding(args, table)
-        self.key_proj = LinearReplicated(args.ple_embed_dim, width, has_bias=False)
-        self.value_proj = LinearReplicated(args.ple_embed_dim, args.hidden_size, has_bias=False)
+        self.key_proj = LinearReplicated(
+            args.ple_embed_dim, width, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.key_proj"
+        )
+        self.value_proj = LinearReplicated(
+            args.ple_embed_dim, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.value_proj"
+        )
         self.norm_key = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.norm_query = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.norm_conv = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)

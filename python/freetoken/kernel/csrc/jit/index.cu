@@ -35,9 +35,10 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
   using namespace device;
   constexpr auto kSize = kElementSize;
   constexpr auto kSizePerWarp = kSize / kNumSplits;
-  constexpr auto kWarpPerBlock = static_cast<unsigned>(kNumThreads / 32);
+  constexpr auto kWarpPerBlock =
+      static_cast<unsigned>(kNumThreads / kWarpThreads);
 
-  static_assert(kNumThreads % 32 == 0);
+  static_assert(kNumThreads % kWarpThreads == 0);
   static_assert(std::has_single_bit(kNumSplits));
   static_assert(kElementSize % kNumSplits == 0);
 
@@ -66,9 +67,10 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
   using namespace device;
   constexpr auto kSize = kElementSize;
   constexpr auto kSizePerWarp = kSize / kNumSplits;
-  constexpr auto kWarpPerBlock = static_cast<unsigned>(kNumThreads / 32);
+  constexpr auto kWarpPerBlock =
+      static_cast<unsigned>(kNumThreads / kWarpThreads);
 
-  static_assert(kNumThreads % 32 == 0);
+  static_assert(kNumThreads % kWarpThreads == 0);
   static_assert(std::has_single_bit(kNumSplits));
   static_assert(kElementSize % kNumSplits == 0);
 
@@ -111,18 +113,22 @@ struct IndexKernel {
     auto device_ = SymbolicDevice{};
     auto weights_dtype_ = SymbolicDType{};
     auto indices_dtype_ = SymbolicDType{};
+    // set dtype options on the shared symbol up front; the explicit-template
+    // .with_dtype<Ts...>(sym) overload followed by .with_device<...>() in the
+    // same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+    indices_dtype_.set_options<int32_t, int64_t>();
 
     TensorMatcher({-1, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(weights);
     TensorMatcher({L, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(output);
     TensorMatcher({L}) //
         .with_dtype(indices_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices);
 
     const auto device = device_.unwrap();
@@ -132,7 +138,12 @@ struct IndexKernel {
     RuntimeCheck(entry_size == element_size,
                  "IndexKernel: element_size mismatch.");
 
-    constexpr auto kWarpPerBlock = num_threads / 32;
+    // Empty batches are valid no-ops; do not launch a zero-sized grid.
+    if (num_indices == 0) {
+      return;
+    }
+
+    constexpr auto kWarpPerBlock = num_threads / device::kWarpThreads;
     const auto num_warps = num_splits * num_indices;
     const auto num_blocks = div_ceil(num_warps, kWarpPerBlock);
     const auto params = IndexKernelParams{

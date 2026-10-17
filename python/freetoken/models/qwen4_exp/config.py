@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
 
+from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
+    mrope_layout_from_rope_params,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
-    vision_load_enabled,
 )
+from freetoken.models.qwen3_vl.config import parse_vision_config
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    image_token_id: int | None = None
 
     @property
     def index_topk_blocks(self) -> int:
@@ -94,79 +96,6 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     )
 
 
-@dataclass(frozen=True)
-class Qwen4ExpVisionConfig:
-    """Qwen2.5-VL-lineage ViT tower (checkpoint ``vision_config``; all bf16, never quantized).
-
-    Every norm in this tower is a LayerNorm WITH bias (not RMSNorm) and every linear carries
-    a bias; attention is global on all blocks (no window masks, no deepstack indices). The
-    2-D RoPE theta is HF's vision default (10000.0, absent from the shipped vision_config);
-    the learned ``pos_embed`` table is interpolated per-image to its patch grid.
-    """
-
-    depth: int
-    hidden_size: int
-    intermediate_size: int
-    num_heads: int
-    head_dim: int
-    patch_size: int
-    temporal_patch_size: int
-    spatial_merge_size: int
-    in_channels: int
-    out_hidden_size: int
-    num_position_embeddings: int
-    hidden_act: str
-    layer_norm_eps: float
-    rope_theta: float
-
-
-def _parse_vision_config(
-    hf_config: Any, text_hidden_size: int
-) -> Qwen4ExpVisionConfig | None:
-    vc = getattr(hf_config, "vision_config", None)
-    if vc is None:
-        return None
-    # Vision is opt-in (default OFF), the same single switch gemma4 uses: returning None makes
-    # is_multimodal False, and BOTH the model build (model.py) and weight loading (weight.py
-    # ``include_vision``) skip the ~0.84 GiB bf16 tower. FREETOKEN_LOAD_VISION=1 flips both.
-    if not vision_load_enabled():
-        return None
-    if list(getattr(vc, "deepstack_visual_indexes", None) or []):
-        raise NotImplementedError("qwen4_exp vision does not support deepstack features")
-    if int(vc.out_hidden_size) != text_hidden_size:
-        raise ValueError(
-            f"vision out_hidden_size {vc.out_hidden_size} != text hidden_size {text_hidden_size}"
-        )
-    act = str(getattr(vc, "hidden_act", "gelu_pytorch_tanh"))
-    return Qwen4ExpVisionConfig(
-        depth=int(vc.depth),
-        hidden_size=int(vc.hidden_size),
-        intermediate_size=int(vc.intermediate_size),
-        num_heads=int(vc.num_heads),
-        head_dim=int(vc.hidden_size) // int(vc.num_heads),
-        patch_size=int(vc.patch_size),
-        temporal_patch_size=int(vc.temporal_patch_size),
-        spatial_merge_size=int(vc.spatial_merge_size),
-        in_channels=int(vc.in_channels),
-        out_hidden_size=int(vc.out_hidden_size),
-        num_position_embeddings=int(vc.num_position_embeddings),
-        hidden_act="gelu_tanh" if "tanh" in act else act,
-        layer_norm_eps=float(getattr(vc, "layer_norm_eps", 1e-6)),
-        rope_theta=float(getattr(vc, "rope_theta", 10000.0)),
-    )
-
-
-def _quant_get(hf_config: Any):
-    quant = getattr(hf_config, "quantization_config", None)
-    if quant is None:
-        return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
-
-
-def _ignored(patterns, module_name: str) -> bool:
-    return any(fnmatch(module_name, pat) for pat in patterns)
-
-
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
@@ -212,39 +141,13 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    get = _quant_get(hf_config)
-    if get is None:
-        expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
-    else:
-        algo = str(get("quant_algo") or get("quant_method") or "").lower()
-        block = get("weight_block_size")
-        if algo == "fp8" and block:
-            # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
-            # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
-            # GDN, the shared expert, HC, PLE and lm_head stay bf16.
-            bs = tuple(int(x) for x in block)
-            assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
-            expert_quant = "fp8_block"
-            attn_quant = dense_quant = lm_head_quant = "none"
-        else:
-            is_fp4 = "fp4" in algo
-            ignore = list(get("ignore") or [])
-
-            # The RadixArk NVFP4 build quantizes only the routed experts; attention/GDN,
-            # the shared expert, HC, PLE and lm_head all sit in the modelopt ignore list
-            # and stay bf16. Derive every flag from that list instead of assuming the split.
-            def _quant(probe: str) -> str:
-                return "nvfp4" if is_fp4 and not _ignored(ignore, probe) else "none"
-
-            prefix = "model.language_model.layers.0"
-            expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
-            dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
-            attn_quant = _quant(f"{prefix}.self_attn.q_proj")
-            lm_head_quant = _quant("lm_head")
-
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
+    # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
@@ -252,22 +155,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
         if layer_types[lid] != "linear_attention":
             raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
 
-    # Interleaved M-RoPE (vision): the per-frequency (t, h, w) channel split, kept out of
-    # rope_scaling (unhashable + not a scaling knob) and handed to get_rope as its own
-    # cache-keyed parameter. Text-only batches never consult it.
-    mrope_section: tuple[int, ...] | None = None
-    if rope_params.get("mrope_interleaved") or getattr(text, "mrope_interleaved", False):
-        section = rope_params.get("mrope_section") or getattr(text, "mrope_section", None)
-        if section:
-            mrope_section = tuple(int(x) for x in section)
-
+    vision_config = parse_vision_config(hf_config)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
-        mrope_section=mrope_section,
+        mrope_section=(
+            list(rope_params["mrope_section"])
+            if vision_config is not None and "mrope_section" in rope_params
+            else None
+        ),
+        mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
     full_group = FullAttentionGroupConfig(
         name="full",
@@ -324,6 +224,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        image_token_id=getattr(hf_config, "image_token_id", None),
     )
 
     return ModelConfig(
@@ -351,23 +252,13 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=_parse_vision_config(hf_config, text.hidden_size),
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
-        attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )
 
 
-__all__ = [
-    "PLE_CONV_STATE",
-    "PLE_NGRAM_STATE",
-    "Qwen4ExpArgs",
-    "Qwen4ExpVisionConfig",
-    "parse_config",
-    "ple_slot_states",
-]
+__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]

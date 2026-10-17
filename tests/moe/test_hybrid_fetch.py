@@ -99,30 +99,42 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
 
     gpu, ref = make(), make()
     frac_q16 = round(frac * Q)
+    # Fixed routing stream: the recurrence-window gate qualifies a miss only once that
+    # expert recurs within WINDOW, so a stable id set makes the eligible set equal the miss
+    # set from the warm-up step on -- which is when the bandwidth split becomes observable.
+    ids = torch.randperm(num_experts)[:top_k].to(torch.int32)
     for step in range(64):
-        ids = torch.randperm(num_experts)[:top_k].to(torch.int32)
         g, c = ids.clone().cuda(), ids.clone()  # a CPU ids tensor drives the reference path
         gpu.ensure_experts_hybrid(0, g)
         ref.ensure_experts_hybrid(0, c)
         missing = int(gpu.num_missing_full.item())
         fetched = int(gpu.num_indices.item())
+        # Primary invariant: the GPU kernel mirrors the CPU reference bit-for-bit every step.
         assert missing == int(ref.num_missing_full.item())
-        assert fetched == int(ref.num_indices.item()) == _balanced_fetch(missing, frac_q16)
-        # slot rewrites (hit/fetched -> slot, overflow -> -1) and LRU state stay identical
+        assert fetched == int(ref.num_indices.item())
         assert torch.equal(g.cpu(), c)
         assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
         assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
         assert (g >= 0).sum().item() == len(set(ids.tolist())) - (missing - fetched)
+        # Secondary: once recurrences make every miss eligible (step >= 1, since the id set is
+        # fixed and WINDOW covers it), the fetch count is the bandwidth-balanced split. Step 0
+        # is cold (all first sightings -> CPU), so only assert the split from step 1 on.
+        if step >= 1:
+            assert fetched == _balanced_fetch(missing, frac_q16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hybrid_fixed_cap_unchanged():
-    # fraction 0 (no profile / explicit --moe-hybrid-max-fetch) keeps the fixed cap.
+    # fraction 0 (no profile / explicit --moe-hybrid-max-fetch) keeps the fixed cap, applied
+    # to the recurrence-window-eligible misses. The first call is cold (first sightings -> CPU,
+    # fetch 0); the second sees the same experts recurring within WINDOW so the cap applies.
     cache = OffloadMoeCache(
         num_layers=1, num_experts=32, cache_size=40, device=torch.device("cuda"),
         quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1,
     )
     ids = torch.arange(8, dtype=torch.int32).cuda()
     cache.ensure_experts_hybrid(0, ids)
+    assert int(cache.num_indices.item()) == 0  # cold: recurrence gate defers to CPU
+    cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
-    assert int(cache.num_indices.item()) == 1
+    assert int(cache.num_indices.item()) == 1  # recurring within WINDOW -> capped at max_fetch

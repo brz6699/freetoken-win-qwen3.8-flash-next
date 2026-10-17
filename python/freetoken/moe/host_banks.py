@@ -36,6 +36,10 @@ logger = init_logger(__name__)
 _BLK = 4096  # O_DIRECT alignment (page size)
 
 
+class PinFailed(RuntimeError):
+    """cudaHostRegister refused a bank: the host is out of pinnable RAM or over its pin quota."""
+
+
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
@@ -136,9 +140,7 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
-            raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
-            ) from exc
+            raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True
 
     def release(self) -> None:
@@ -149,8 +151,6 @@ class HostBank:
             return
         if hasattr(self._buf, "madvise"):  # POSIX only; Windows mmap.mmap has no madvise
             self._buf.madvise(mmap.MADV_DONTNEED)
-        # Windows: leave the pageable mapping in place; the OS trims working-set pages
-        # under memory pressure. Contract (address space stays valid) holds either way.
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.

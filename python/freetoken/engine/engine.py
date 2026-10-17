@@ -13,7 +13,7 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
-from freetoken.moe import create_moe_backend, is_offload_moe_backend
+from freetoken.moe import create_moe_strategy, is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -25,8 +25,10 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, fit_linear_pool_slots,
+    state_pool_bytes,
 )
+from freetoken.mm.config import ENCODER_SECTIONS
 
 logger = init_logger(__name__)
 
@@ -63,11 +65,20 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
-    """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
-    what the resident model consumed. Kept as a pure function so the composition with the
-    pool families' ``solve_num_pages`` stays CPU-testable."""
-    return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+def _startup_kv_budget(
+    memory_ratio: float | None, init_free_memory: int, new_free_memory: int
+) -> int:
+    """Bytes available to the KV pool at startup.
+
+    Explicit ``memory_ratio``: ratio-scaled pre-load free memory minus what the resident model
+    consumed. With ``memory_ratio=None`` the ceiling falls back to DEFAULT_MEMORY_RATIO so the
+    (1-ratio) remainder stays available as CUDA-graph/activation headroom. Kept as a pure
+    function so the composition with the pool families' ``solve_num_pages`` stays CPU-testable.
+    """
+    from freetoken.engine.cache_budget import effective_ratio
+
+    ratio = effective_ratio(memory_ratio)
+    return int(ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -216,13 +227,19 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 "Use --attention-backend fi (or triton) instead."
             )
 
-    if required & {AttnType.MLA, AttnType.DSA} and config.page_size != 1:
-        # The MLA backend's row addressing (latent scatter, DSA index keys, sparse
-        # top-k page indices) assumes page_size == 1 throughout; reject explicitly
-        # like the SWA models do rather than corrupting addressing silently.
-        raise ValueError(
-            f"latent-KV MLA models require --page-size 1, got {config.page_size}."
+    if required & {AttnType.MLA, AttnType.DSA}:
+        # Plain MLA/DSA runs on page_size 1; the kpool indexer layout needs 64.
+        _kpool_ratio = max(
+            (s.index_ratio for s in model_config.kv_cache_group_specs() if s.mla),
+            default=1,
         )
+        want_page = 64 if _kpool_ratio > 1 else 1
+        if config.page_size != want_page:
+            logger.warning_rank0(
+                f"Page size {config.page_size} is auto-adjusted to {want_page} "
+                f"for latent-KV attention."
+            )
+            override("page_size", want_page)
 
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -244,7 +261,7 @@ def _make_dummy_weight_state_dict(
         if param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
-            # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
+            # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_strategy).
             t = torch.empty(param.shape, dtype=param.dtype, device=device)
             t.view(torch.uint8).random_(0, 16)
             state_dict[key] = t
@@ -272,6 +289,9 @@ def _materialize_loaded_weight_state_dict(
     for key, weight in weights:
         expected = model_state.get(key)
         if expected is None:
+            # NOTE: the quant scheme may declare no input_scale for a layer whose FTW still stores one
+            if key.endswith(".input_scale"):
+                continue
             state_dict[key] = weight.to(device=device)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
@@ -282,6 +302,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Committed token ids for an MTP step, one list per request (anchor + accepted drafts +
+    # bonus). None on the plain single-token path, so every existing 3-value unpack of this
+    # tuple keeps working where it reads by index/attribute. scheduler._process_last_data
+    # indexes the outer list by request position when this is set.
+    mtp_tokens: "list[list[int]] | None" = None
 
 
 class Engine:
@@ -293,6 +318,17 @@ class Engine:
         from freetoken.gpu_select import bind_assigned_gpu
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        # CUDA context is up now (bind_assigned_gpu -> torch.cuda.set_device). Apply the
+        # Windows flashinfer build.ninja fix LAZILY here -- NOT at launcher/import time, because
+        # `import flashinfer.jit.core` inits a CUDA context and would trip the
+        # `assert not torch.cuda.is_initialized()` above. The b12x pack's fp4 block-scale
+        # swizzle builds a flashinfer .cu module via build.ninja, so this must be in place
+        # before the offload MoE cache below is constructed. No-op on non-Windows.
+        from freetoken.kernel import winninja
+
+        winninja.apply()
+        winninja.trim_route_pack_smem()
+        winninja.allow_ultrawide_fc2_tile()
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -303,19 +339,21 @@ class Engine:
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
-        # --kv-cache-dtype fp8_e4m3 (storage-only KV quantization: compute stays bf16, the
-        # pool clamps on write and the attention kernels dequant on read) is implemented for
-        # the QSA pool family only -- the quantize-on-write hook lives in MHAKVCache.store_kv
-        # and the dequant on read in the QSA triton kernels. Any other pool must keep
-        # storage dtype == compute dtype.
+        # --kv-cache-dtype fp8_e4m3 / turbo4 (storage-only KV quantization: compute stays
+        # bf16, the pool clamps/packs on write and the attention kernels dequant on read)
+        # is implemented for the QSA and MLA-latent pool families -- the quantize-on-write
+        # hook lives in MHAKVCache.store_kv / MLAKVCache.store_kv and the dequant on read
+        # in the QSA / GLM sparse-attend triton kernels. Any other pool must keep
+        # storage dtype == compute dtype (the index-key slab stays bf16 in both families).
         if getattr(config, "kv_dtype", config.dtype) != config.dtype:
+            from freetoken.kvcache.dsa_pool import MLAKVCache
             from freetoken.kvcache.qsa_pool import QSAKVCache
 
-            if self._pool_cls is not QSAKVCache:
+            if not issubclass(self._pool_cls, (QSAKVCache, MLAKVCache)):
                 raise ValueError(
-                    f"--kv-cache-dtype {config.kv_cache_dtype!r} is implemented for QSA "
-                    "models (Qwen3.8-Flash-Next) only; this model resolves to "
-                    f"{self._pool_cls.__name__}"
+                    f"--kv-cache-dtype {config.kv_cache_dtype!r} is implemented for the "
+                    "QSA (Qwen3.8-Flash-Next) and MLA-latent (GLM-5.3) pool families; "
+                    f"this model resolves to {self._pool_cls.__name__}"
                 )
             logger.info_rank0(
                 f"KV pool storage: {config.kv_cache_dtype} (compute stays {config.dtype}, "
@@ -331,6 +369,11 @@ class Engine:
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
+        # Install the --quant-backend kernel requests before the layers are built; each
+        # quantized module then resolves its kernel through get_quant_backend().select().
+        from freetoken.layers.quantization import QuantBackend, set_quant_backend
+
+        set_quant_backend(QuantBackend.parse(config.quant_backend))
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
@@ -343,6 +386,7 @@ class Engine:
         # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
+        self._cache_arena = None
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
@@ -351,10 +395,27 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
-        if is_offload_moe_backend(config.moe_backend):
+        if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        self.encoder_cache = None
+        self.mm_processor = None
+        if config.active_encoders:
+            from freetoken.mm.encoder_cache import EncoderCache
+            from freetoken.mm.processor import get_mm_processor
+
+            self.mm_processor = get_mm_processor(config.model_path, config.mm)
+            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
+            logger.info_rank0(
+                f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
+                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
+            )
+            self._warmup_encoders()
+        elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
+            logger.info_rank0(
+                "Multimodal disabled: --text-model-only"
+            )
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -362,20 +423,85 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        # GPU-resident MTP expert bank (loaded in load_host_tables above): a fixed cost the
+        # pools must be sized around, priced into every budget like the state pool is.
+        available_memory -= self._mtp_gpu_bank_bytes()
+        self._ensure_cache_arena(config)
+        if self.moe_offload_cache is not None:
+            # Shared arena: the KV side may only take the bytes the MoE banks did not.
+            available_memory = min(
+                available_memory,
+                int(self._cache_arena.numel())
+                - sum(
+                    int(b.numel()) * b.element_size()
+                    for b in self.moe_offload_cache.bank_caches.values()
+                ),
+            )
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=self.dtype,
+            arena=self._cache_arena,
         )
+
+        # ======================= MTP speculative head wiring (--mtp) =======================
+        # Private dense-GQA KV for the 1-layer head, indexed by the SAME physical locs the
+        # page table hands out (plus draft_len+1 scratch rows past num_tokens for the draft
+        # chain of one step). Gated on --mtp so a plain serve pays nothing.
+        self._mtp_scratch_base = 0
+        if getattr(config, "enable_mtp", False):
+            head = getattr(self.model, "mtp", None)
+            if head is not None:
+                mc = config.model_config
+                extra = max(1, int(getattr(config, "mtp_draft_len", 2))) + 1
+                # CPU-hidden path (--mtp-device cpu): the head's own weights, its rope cache and
+                # its private KV pool all live on the CPU so the whole draft block is one coherent
+                # CPU compute region; only the shared embed_tokens/lm_head (big, reused by the main
+                # model) stay on the GPU and are bridged at the head.forward boundary. gpu path:
+                # everything on self.device, identical to before.
+                mdev = (
+                    self.device
+                    if str(getattr(config, "mtp_device", "gpu") or "gpu").lower() != "cpu"
+                    else torch.device("cpu")
+                )
+                head.to(mdev)
+                self._mtp_pool = torch.zeros(
+                    2,
+                    num_tokens + extra,
+                    mc.num_kv_heads,
+                    mc.head_dim,
+                    device=mdev,
+                    dtype=self.dtype,
+                )
+                head.self_attn.attach_pool(self._mtp_pool[0], self._mtp_pool[1])
+                head.attach_embed(self.model.model.embed_tokens)
+                self.model.model._mtp_head = head
+                self._mtp_scratch_base = num_tokens
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
+            # The GDN pool is a sibling of the KV family: when the KV half is pinned by
+            # --num-tokens/--num-pages and/or the MoE bank is large, the startup-default slot
+            # count can no longer fit the free VRAM that survives them -- the original code
+            # just called torch.zeros on it and OOMed. Clamp the slot count to what actually
+            # fits here (shrinking only the cross-request snapshot cache, never the admission
+            # floor); a clear MemoryError fires if even the floor is too big.
+            default_slots = _linear_pool_num_slots(config)
+            free_now = self._sync_get_memory()[0]
+            num_gdn_slots = fit_linear_pool_slots(config, free_now)
+            if num_gdn_slots < default_slots:
+                logger.info_rank0(
+                    f"GDN state pool: {default_slots} -> {num_gdn_slots} slots "
+                    f"(~{state_pool_bytes(config, num_gdn_slots) / 1e9:.2f} GiB to fit "
+                    f"{free_now / 1e9:.2f} GiB free; snapshot cache trimmed)"
+                )
+
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
-                num_slots=_linear_pool_num_slots(config),
+                num_slots=num_gdn_slots,
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
@@ -404,7 +530,7 @@ class Engine:
             config.attention_backend, config.model_config
         )
         if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+            self.ctx.moe_strategy = self.moe_strategy = create_moe_strategy(config.moe_strategy)
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -438,6 +564,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -477,47 +604,167 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
-            model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not is_offload_moe_backend(config.moe_backend),
-            ),
-            device=self.device,
+        weights = load_weight(
+            config.model_path,
+            self.device,
+            include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
         )
+        if not config.enable_mtp:
+            # the MTP head is only constructed with --mtp, so drop its keys for the strict
+            # load (otherwise the 21 mtp.* dense tensors would be "unexpected keys")
+            weights = ((k, v) for k, v in weights if not k.startswith("mtp."))
+        return _materialize_loaded_weight_state_dict(model_state, weights, device=self.device)
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(
+        self, config: EngineConfig, banks, method, reserve_pages: int | None = None
+    ) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
+
+        ``reserve_pages`` lifts the KV reservation to an explicit page count (from a declared
+        --num-tokens/--num-pages) so experts fill only what the declared KV leaves, instead of
+        the small reserve floor. Without it the two halves over-commit the shared arena.
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += state_pool_bytes(config) + self._mtp_gpu_bank_bytes()  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        if reserve_pages is not None:
+            kv_reserve_tokens = max(kv_reserve_tokens, reserve_pages * page_tokens)
+        # The b12x kernel indexes its banks with int32 element offsets, so its slot cache is
+        # bounded (method.slot_limit()); the auto plan must stay under it or OffloadMoeCache
+        # rejects the cache at construction.
+        kernel_slots = method.slot_limit() if method is not None else None
+        if kernel_slots is not None:
+            kernel_slots = min(kernel_slots, total_experts)
+        marlin_slots = MARLIN_MAX_CACHE_SIZE if banks.quant_format == "nvfp4_marlin" else None
+        max_slots = min(kernel_slots, marlin_slots) if kernel_slots is not None and marlin_slots is not None else (kernel_slots or marlin_slots)
+        per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        self._arena_per_expert_bytes = per_expert_bytes
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
-            quant_format=banks.quant_format,
+            max_slots=max_slots,
         )
+
+    def _mtp_gpu_bank_bytes(self) -> int:
+        """Expert bytes the MTP bank holds on-device (--mtp only); 0 on every other path."""
+        head = getattr(self.model, "mtp", None)
+        return getattr(head.bank, "gpu_bytes", 0) if head is not None else 0
+
+    def _ensure_cache_arena(self, config: EngineConfig) -> None:
+        """One flat byte block for the two sliding caches: KV from the LEFT end, MoE bank
+        slot-caches from the RIGHT, meeting at the sliding boundary. Allocated exactly once
+        at startup -- the process's largest contiguous allocation, taken at the moment of
+        lowest fragmentation (the Windows caching allocator has no expandable_segments, so
+        the single up-front big block replaces the free/re-alloc cycle runtime resizes used
+        to run). Sized by the same net budget the auto-sizer, declared-fit and rebuild-fit
+        checks all enforce, so any validated (moe, pages) geometry fits by construction."""
+        if getattr(self, "_cache_arena", None) is not None:
+            return
+        from freetoken.engine.cache_budget import net_cache_budget_bytes, required_bytes
+
+        cache_per_page, fixed_cache_size, _, _ = self._pool_cls.kv_cost(config)
+        fixed_cache_size += state_pool_bytes(config) + self._mtp_gpu_bank_bytes()
+        ceiling = max(
+            0,
+            net_cache_budget_bytes(
+                config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
+            ),
+        )
+        # Arena = the byte footprint of the resolved kv+moe geometry, capped by the ceiling so an
+        # over-declaration still fits physical VRAM. Everything the pools do NOT need is left as
+        # free VRAM, which is exactly what CUDA-graph capture and activations then consume: the
+        # capture is self-sizing -- GraphRunner measures free-after-init before capture and shrinks
+        # its bs set to fit -- so the graph headroom tracks real demand instead of a guessed ratio.
+        # A fixed-ratio reservation over-/under-shot that (observed: bs=[1,2,4,8] capture takes
+        # ~3.3 GiB, far off a flat per-bs estimate). Falls back to the ceiling when sizes were not
+        # both resolved (pure auto sizing reads free memory later).
+        per_expert = getattr(self, "_arena_per_expert_bytes", 0)
+        pages = config.num_page_override
+        budget = ceiling
+        if per_expert and pages:
+            footprint = required_bytes(config.moe_cache_size, pages, per_expert, cache_per_page)
+            budget = min(footprint, ceiling) if footprint > 0 else ceiling
+        # Round to 16 bytes: the fused-copy descriptor requires every bank cache's
+        # data_ptr to be 16-aligned, and the right-anchored packing derives each bank's
+        # offset from the arena END -- a multiple-of-16 length keeps that anchor aligned.
+        budget = (budget + 15) & ~15
+        self._cache_arena = torch.empty(budget, dtype=torch.uint8, device=self.device)
+
+    def _fit_declared_cache_sizes(self, config: EngineConfig, banks, method) -> None:
+        """Fit the DECLARED cache sizes into the MEASURED byte budget — the explicit-flag
+        twin of the auto path: declared values are ceilings, the model's own floors are
+        kept, and the KV half then follows the bytes the experts leave (solve_num_pages
+        reads post-allocation free memory). Rewrites config in place with what fits."""
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            fit_declared_cache_sizes,
+            net_cache_budget_bytes,
+        )
+        from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
+        from freetoken.utils import div_ceil
+
+        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        fixed_cache_size += state_pool_bytes(config) + self._mtp_gpu_bank_bytes()
+        budget = net_cache_budget_bytes(
+            config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
+        )
+        mc = config.model_config
+        num_experts = mc.num_experts
+        total_experts = mc.num_moe_layers * num_experts
+        max_slots = MARLIN_MAX_CACHE_SIZE if banks.quant_format == "nvfp4_marlin" else total_experts
+        self._arena_per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        kv_floor = max(config.kv_reserve_tokens, min_reserve)
+        if method is not None:
+            # the expert kernel's int32 slot cap also binds a DECLARED size: an over-cap
+            # declaration must clamp here, or OffloadMoeCache rejects the cache at build
+            kernel_slots = method.slot_limit()
+            if kernel_slots is not None:
+                max_slots = min(max_slots, kernel_slots)
+        moe, pages = fit_declared_cache_sizes(
+            declared_moe=config.moe_cache_size,
+            declared_pages=config.num_page_override,
+            budget_bytes=budget,
+            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            cache_per_page=cache_per_page,
+            kv_reserve_pages=div_ceil(kv_floor, page_tokens),
+            num_experts=num_experts,
+            total_experts=total_experts,
+            max_slots=max_slots,
+            prefill_overlap=config.moe_prefill_overlap,
+        )
+        if moe != config.moe_cache_size:
+            logger.info_rank0(
+                f"fit declared moe_cache_size {config.moe_cache_size} -> {moe} slots into measured budget"
+            )
+            object.__setattr__(config, "moe_cache_size", moe)
+        if config.num_page_override is not None and pages != config.num_page_override:
+            logger.info_rank0(
+                f"fit declared num_page_override {config.num_page_override} -> {pages} pages into measured budget"
+            )
+            object.__setattr__(config, "num_page_override", pages)
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
+        method = shared_offload_method(self.model)
         cache_factory = getattr(self.model, "make_offload_moe_cache", None)
         if cache_factory is not None and config.moe_cache_auto:
             raise ValueError(
@@ -536,13 +783,13 @@ class Engine:
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
-            and config.moe_backend in ("offload", "hybrid")
+            and config.moe_strategy in ("offload", "hybrid")
             and _pin_budget_bytes(self._host_tables_bytes) is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(
                 config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
             )
-        if config.moe_backend == "hybrid":
+        if config.moe_strategy == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
@@ -553,17 +800,17 @@ class Engine:
         # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
         split_residency = (
             bool(cpu_layer_ids)
-            and config.moe_backend in ("offload", "hybrid")
+            and config.moe_strategy in ("offload", "hybrid")
             and _pin_budget_bytes(self._host_tables_bytes) is not None
         )
-        if config.moe_backend == "cpu" and not split_residency:
+        if config.moe_strategy == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
             budget = _pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
             if bank_bytes and bank_bytes > budget:
                 split_residency = True
                 logger.info_rank0(
@@ -596,6 +843,7 @@ class Engine:
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
+                method=method,
                 device=self.device,
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
@@ -604,10 +852,12 @@ class Engine:
                 layer_residency=requested_residency,
             )
             if config.moe_cache_auto:
-                size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
-                object.__setattr__(config, "moe_cache_size", size)
+                declared_pages = config.num_page_override
+                size, pages, overlap = self._resolve_auto_moe_cache_size(
+                    config, banks, method, reserve_pages=declared_pages
+                )
                 object.__setattr__(config, "moe_prefill_overlap", overlap)
-                if config.num_page_override is None:
+                if declared_pages is None:
                     # Honor the plan's KV half too: MoE slots and KV pages were solved
                     # against ONE budget (ratio x baseline - weights), so both must come
                     # from it. Re-solving pages later from a fresh free-memory reading
@@ -615,12 +865,29 @@ class Engine:
                     # (this expert cache, the CPU-executor GPU buffers, allocator
                     # slack) and goes negative whenever the expert fill is exact --
                     # a greedy fill leaves no headroom for the measurement delta.
+                    object.__setattr__(config, "moe_cache_size", size)
                     object.__setattr__(config, "num_page_override", pages)
-                logger.info_rank0(
-                    f"--moe-cache-auto resolved moe_cache_size={size} "
-                    f"num_pages={pages} (prefill_overlap={overlap})"
-                )
+                    logger.info_rank0(
+                        f"--moe-cache-auto resolved moe_cache_size={size} "
+                        f"num_pages={pages} (prefill_overlap={overlap})"
+                    )
+                else:
+                    # KV half is pinned by --num-tokens/--num-pages. The resolve above already
+                    # reserved those declared pages, so `size` is experts-fit-after-KV and the
+                    # two halves sum into the arena instead of overlapping in the middle.
+                    object.__setattr__(config, "moe_cache_size", size)
+                    logger.info_rank0(
+                        f"--moe-cache-auto with declared KV: moe_cache_size={size} "
+                        f"num_pages={declared_pages} (prefill_overlap={overlap})"
+                    )
+            elif config.moe_cache_size > 0:
+                self._fit_declared_cache_sizes(config, banks, method)
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            layout = max_slots = None
+            if method is not None:
+                layout = method.layout()
+                max_slots = method.slot_limit()
+            self._ensure_cache_arena(config)
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -629,11 +896,15 @@ class Engine:
                 cache_size=config.moe_cache_size,
                 device=self.device,
                 cache_policy=config.moe_cache_policy,
+                prefill_demand_tokens=config.moe_prefill_demand_tokens,
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                arena=self._cache_arena,
+                layout=layout,
+                max_slots=max_slots,
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
@@ -719,8 +990,12 @@ class Engine:
             num_threads=config.moe_cpu_threads,
             max_tokens=max_tokens,
             device=self.device,
-            swiglu_alpha=getattr(sample, "hidden_act_alpha", 1.702),
-            swiglu_limit=getattr(sample, "swiglu_limit", None),
+            # The layer's own scalars (MoELayer.alpha/.limit): GLM's swiglu_clamp needs
+            # alpha=1.0 / limit=10.0 -- the old hidden_act_alpha/swiglu_limit names exist
+            # on no layer class, so the 1.702/no-clamp defaults silently mis-computed the
+            # clamped epilogue under cpu/hybrid decode.
+            swiglu_alpha=getattr(sample, "hidden_act_alpha", getattr(sample, "alpha", 1.702)),
+            swiglu_limit=getattr(sample, "swiglu_limit", getattr(sample, "limit", None)),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -889,6 +1164,14 @@ class Engine:
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        # Consolidate BEFORE allocating the resized pools: without expandable_segments
+        # (unsupported on Windows), bytes freed by teardown/old pools stay in per-old-size
+        # segments and a larger single-block pool can miss them even though the TOTAL is
+        # there (observed: needs 8.82 GiB, free 8.51, reserved-but-unallocated 8.82).
+        # empty_cache hands those segments back to the driver so the resize below sees one
+        # contiguous headroom; safe here because this runs at the scheduler idle safe point.
+        gc.collect()
+        torch.cuda.empty_cache()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -916,8 +1199,13 @@ class Engine:
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
-        #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+        #    the backend). Return the resized pools' freed blocks to the driver BEFORE
+        #    GraphRunner measures free memory, exactly as the slide path does: otherwise the
+        #    old pools stay reserved as partially-used segments and the recaptured graphs
+        #    under-size their headsroom (or the post-rebuild forward OOMs) even though the
+        #    bytes are logically free.
         gc.collect()
+        torch.cuda.empty_cache()
         free_min = self._sync_get_memory()[0]
         self.graph_runner = GraphRunner(
             stream=self.stream,
@@ -931,12 +1219,184 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
+        )
+        # Post-capture trim: graph capture + pool realloc leave hundreds of MiB (multiple
+        # GiB over repeated rebuilds) as reserved-but-unallocated segments. Without
+        # expandable_segments (unsupported on Windows), the allocator cannot hand that
+        # space back between sizes, so the next forwards OOM while the bytes ARE there.
+        # This runs at the scheduler idle safe point, so empty_cache has no in-flight
+        # tensors to disturb.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def rebuild_runtime_cache_slide(
+        self,
+        *,
+        moe_cache_size: int | None = None,
+        num_pages: int | None = None,
+        num_mamba_slots: int | None = None,
+        num_swa_pages: int | None = None,
+    ) -> None:
+        """Budget-slide clone of rebuild_runtime_cache.
+
+        Identical scope, validation, teardown/recapture order and failure semantics;
+        the one difference is the MoE slot cache resizes through
+        OffloadMoeCache.rebuild_slide, which keeps already-resident expert rows
+        instead of a full cold start. Manual / control-API rebuilds keep calling
+        rebuild_runtime_cache unchanged.
+        """
+        config = self.config
+        if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
+                and num_swa_pages is None):
+            return
+
+        # Geometry prevalidation + pool-family budget fit-check BEFORE any destructive
+        # free: identical to rebuild_runtime_cache, so one target accepts/rejects the
+        # same way on both paths.
+        if moe_cache_size is not None:
+            if self.moe_offload_cache is None:
+                raise CacheRebuildRejected(
+                    "moe_cache_size requested but this model has no MoE offload cache"
+                )
+            try:
+                self.moe_offload_cache.validate_rebuild(moe_cache_size)
+            except ValueError as e:
+                raise CacheRebuildRejected(str(e)) from e
+        if num_pages is not None and num_pages <= 0:
+            raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
+        if num_mamba_slots is not None:
+            if self.linear_state_pool is None:
+                raise CacheRebuildRejected(
+                    "num_mamba_slots requested but this model has no GDN state pool"
+                )
+            min_usable = _linear_pool_min_slots(config) - 1
+            if num_mamba_slots < min_usable:
+                raise CacheRebuildRejected(
+                    f"num_mamba_slots {num_mamba_slots} is below the minimum {min_usable} "
+                    f"(non-evictable working set for max_running_req={config.max_running_req}) "
+                    f"needed to run; admission would deadlock"
+                )
+        if num_swa_pages is not None:
+            if not _supports_swa_ratio(config):
+                raise CacheRebuildRejected(
+                    "num_swa_pages requested but this model has no window pool "
+                    "(needs DSV4 or a sliding-window model with --cache-type radix)"
+                )
+            if num_swa_pages <= 0:
+                raise CacheRebuildRejected(
+                    f"num_swa_pages must be positive, got {num_swa_pages}"
+                )
+        target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(moe_cache_size)
+        target_mamba = (
+            num_mamba_slots + 1
+            if num_mamba_slots is not None
+            else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
+        )
+        self.kv_cache.validate_rebuild(
+            config, num_pages=num_pages,
+            num_swa_pages=num_swa_pages, target_moe=target_moe,
+            per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
+            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            extra_fixed_bytes=(
+                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
+            ),
+            extra_note=(
+                f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
+            ),
         )
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        torch.cuda.synchronize(self.device)
+        # Reuse the startup-resolved graph batch-size set (same reasoning as
+        # rebuild_runtime_cache: post-cache free memory would skew a re-derive).
+        prior_graph_bs = self.graph_runner.graph_bs_list
+        self.rebuild_teardown_started = True
+        # Teardown -> consolidate -> resize -> recapture, same order as the official
+        # path; only the MoE step swaps rebuild() for rebuild_slide().
+        self.attn_backend.reset_capture()
+        self.graph_runner.destroy_cuda_graphs()
+        gc.collect()
+        torch.cuda.empty_cache()
+        if num_swa_pages is not None:
+            object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
+        if moe_cache_size is not None:
+            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            self.moe_offload_cache.rebuild_slide(moe_cache_size)
+        if num_pages is not None:
+            self._resize_kv_pool(config, num_pages, num_swa_pages)
+        elif num_swa_pages is not None:
+            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
+        if num_mamba_slots is not None:
+            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+        self._refresh_seq_state(config)
+        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        gc.collect()
+        # Return the slide's freed staging/pool blocks to the driver BEFORE GraphRunner
+        # measures free memory and grabs its graph pools: otherwise the caches stay
+        # reserved as partially-used segments and the post-slide forward OOMs on small
+        # allocations despite the bytes being logically free.
+        torch.cuda.empty_cache()
+        free_min = self._sync_get_memory()[0]
+        self.graph_runner = GraphRunner(
+            stream=self.stream,
+            device=self.device,
+            model=self.model,
+            attn_backend=self.attn_backend,
+            cuda_graph_bs=prior_graph_bs,
+            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            free_memory=free_min,
+            max_seq_len=aligned_max_seq_len,
+            vocab_size=config.model_config.vocab_size,
+            dummy_req=self.dummy_req,
+            moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info_rank0("cache slide applied (preserve-residency rebuild)")
+
+    @torch.inference_mode()
+    def _warmup_encoders(self) -> None:
+        for item in self.mm_processor.dummy_items(self.dtype, self.device):
+            if item.modality in self.config.served_modalities:
+                self.model.encode(item)
+        torch.cuda.synchronize(self.device)
+
+    @torch.inference_mode()
+    def _run_mm_encoder(self, batch: Batch) -> None:
+        """Encode the chunk's cache-miss items and gather its embedding rows into batch.mm_embeds, right before the LM forward."""
+        cache = self.encoder_cache
+        jobs = batch.mm_encoder_jobs or ()
+        # a job whose rows are not gathered this chunk would be encoded and freed unread
+        planned = {row[1] for row in batch.mm_gather_plan}
+        orphans = [item.hash for item in jobs if item.hash not in planned]
+        assert not orphans, f"encoder jobs without gather rows: {orphans}"
+        for item in jobs:
+            if not cache.has(item.hash):
+                if item.precomputed_embeddings is not None:
+                    emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
+                else:
+                    emb = self.model.encode(item)
+                cache.put(item.hash, emb)
+            # cached now; free the ~MiB feature buffer
+            item.feature = None
+            item.precomputed_embeddings = None
+        parts = []
+        for uid, item_hash, lo, hi, _, _ in batch.mm_gather_plan:
+            parts.append(cache.get_slice(item_hash, lo, hi, self.device))
+            cache.consume(item_hash, uid, hi - lo)
+        if parts:
+            batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
+
+    def forward_batch(
+        self, batch: Batch, args: BatchSamplingArgs, eager_only: bool = False
+    ) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if batch.mm_gather_plan:
+            self._run_mm_encoder(batch)
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if not eager_only and self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -954,6 +1414,24 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    @torch.inference_mode()
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """Eager forward returning the raw logits (no sampling, no bookkeeping): the MTP
+        verify / rollback re-runs consume the rows directly."""
+        assert torch.cuda.current_stream() == self.stream
+        with self.ctx.forward_batch(batch):
+            return self.model.forward()
+
+    def mtp_forward(
+        self, batch: Batch, residual: torch.Tensor, input_ids: torch.Tensor
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """One draft step of the MTP head: (pre-mixer residual, next tokens) ->
+        ``(draft_logits, multi_hidden)`` on the head's private KV pool. Scoped under the draft
+        batch so the head's leaf ``lm_head`` (which asserts an active ctx batch) sees it."""
+        m = self.model
+        with self.ctx.forward_batch(batch):
+            return m.mtp.forward(batch, residual, input_ids, m.model.embed_tokens, m.lm_head)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1044,8 +1522,13 @@ def _ensure_expandable_segments() -> None:
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
+    # torch._C._accelerator_setAllocatorSettings is the non-deprecated spelling (torch >= 2.9);
+    # the torch.cuda.memory alias still exists on older builds.
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if setter is None:
+        setter = torch.cuda.memory._set_allocator_settings
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        setter("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
@@ -1144,17 +1627,17 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
     ``--moe-backend cpu`` -> every layer. ``--moe-backend offload`` + ``--moe-cpu-layers``
     -> the parsed subset (the rest stay on the GPU offload/PCIe path). Otherwise none.
     """
-    if config.moe_backend == "cpu":
+    if config.moe_strategy == "cpu":
         return frozenset(range(num_moe_layers))
     spec = config.moe_cpu_layers
-    if not spec or not is_offload_moe_backend(config.moe_backend):
+    if not spec or not is_offload_moe_strategy(config.moe_strategy):
         return frozenset()
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
-    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai", "swiglu_clamp",
 )
 
 
@@ -1222,7 +1705,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
     return ids
 
 
-# MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled
+# MoE-only knobs and the value each resolves to on a dense model. moe_strategy is handled
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
@@ -1231,10 +1714,33 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
 }
+
+
+def shared_offload_method(model):
+    """The expert method every offload MoE layer of ``model`` uses, or None for models whose
+    MoE layers carry none (GGUF q4_0 keeps its own format provider).
+
+    The offload cache holds one bank layout, so the layers must agree on (kind, kernel)."""
+    from freetoken.moe.offload_cache import iter_offload_moe_layers
+
+    layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
+    if not layers:
+        return None
+    keys = {(layer.quant_method.kind, layer.quant_method.kernel.name) for layer in layers}
+    if len(keys) != 1:
+        found = sorted(f"{kind} / {kernel}" for kind, kernel in keys)
+        raise ValueError(
+            f"expert layers disagree on format / kernel: {found}; "
+            "per-layer mixed expert formats are not supported"
+        )
+    kind, kernel = keys.pop()
+    logger.info_rank0(f"MoE experts: {kind} via {kernel}")
+    return layers[0].quant_method
 
 
 def _adjust_config(config: EngineConfig):
@@ -1261,9 +1767,9 @@ def _adjust_config(config: EngineConfig):
             for name, dense_value in _DENSE_MOE_SETTINGS.items()
             if getattr(config, name, dense_value) != dense_value
         ]
-        if config.moe_backend not in ("auto", "fused"):
-            dropped.insert(0, f"moe_backend={config.moe_backend!r}")
-        override("moe_backend", "fused")
+        if config.moe_strategy not in ("auto", "fused"):
+            dropped.insert(0, f"moe_strategy={config.moe_strategy!r}")
+        override("moe_strategy", "fused")
         for name, dense_value in _DENSE_MOE_SETTINGS.items():
             override(name, dense_value)
         if dropped:
@@ -1364,12 +1870,12 @@ def _adjust_config(config: EngineConfig):
     if (
         is_moe
         and not _cpu_moe_act_ok
-        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
+        and (config.moe_strategy in ("cpu", "hybrid") or config.moe_cpu_layers)
     ):
         asked = (
             f"--moe-cpu-layers={config.moe_cpu_layers!r}"
-            if config.moe_backend not in ("cpu", "hybrid")
-            else f"--moe-backend {config.moe_backend!r}"
+            if config.moe_strategy not in ("cpu", "hybrid")
+            else f"--moe-backend {config.moe_strategy!r}"
         )
         raise ValueError(
             f"{asked}: the CPU MoE executor does not support this model's expert "
@@ -1377,7 +1883,7 @@ def _adjust_config(config: EngineConfig):
             "and let every layer decode on the GPU offload path instead."
         )
 
-    if is_moe and config.moe_backend == "auto":
+    if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
         # bigger than the GPU. The resident 'fused' path (bf16 / block-fp8 experts, the two
@@ -1422,18 +1928,18 @@ def _adjust_config(config: EngineConfig):
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
                 )
-        override("moe_backend", default_backend)
-        logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+        override("moe_strategy", default_backend)
+        logger.info_rank0(f"Auto-selected MoE backend: {config.moe_strategy}")
 
         if (
-            is_offload_moe_backend(config.moe_backend)
+            is_offload_moe_strategy(config.moe_strategy)
             and config.moe_cache_size <= 0
             and config.moe_cache_rate is None
             and not getattr(config, "moe_cache_auto", False)
         ):
             # args.py's "no sizing flag -> default --moe-cache-auto" only fires when the
             # backend is already offload-family at *parse* time. A bare `ft serve <FTW MoE
-            # checkpoint>` (no --moe-backend, no cache flags) still has moe_backend=="auto" at
+            # checkpoint>` (no --moe-backend, no cache flags) still has moe_strategy=="auto" at
             # parse time -- the auto -> offload/cpu/hybrid resolution above is the first point
             # the concrete backend is known, so mirror the same default here: no sizing flag
             # was given, so let the scheduler resolve the cache size from free VRAM instead of
@@ -1441,10 +1947,10 @@ def _adjust_config(config: EngineConfig):
             override("moe_cache_auto", True)
             logger.info_rank0(
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
-                f"auto-selected backend {config.moe_backend!r}"
+                f"auto-selected backend {config.moe_strategy!r}"
             )
 
-    if is_moe and config.moe_backend == "fused":
+    if is_moe and config.moe_strategy == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
         # sizing flags no longer redirect the backend, so ignore them here and say so -- the
         # geometry the user asked for is what runs. Report the flag actually passed: --moe-cache-
@@ -1466,7 +1972,7 @@ def _adjust_config(config: EngineConfig):
             override("moe_cache_rate", None)
             override("moe_cache_auto", False)
 
-    if is_moe and config.moe_backend == "cpu":
+    if is_moe and config.moe_strategy == "cpu":
         # CPU-compute decode keeps experts in host RAM and computes them on the CPU;
         # the GPU only holds the two-layer prefill double buffer. So the slot cache is
         # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
@@ -1484,22 +1990,32 @@ def _adjust_config(config: EngineConfig):
     if (
         is_moe
         and expert_quant not in ("none", "fp8_block")
-        and not is_offload_moe_backend(config.moe_backend)
+        and not is_offload_moe_strategy(config.moe_strategy)
     ):
         raise ValueError(
             f"{expert_quant} experts require --moe-backend offload or cpu, "
-            f"got {config.moe_backend!r}"
+            f"got {config.moe_strategy!r}"
         )
 
-    if is_moe and config.moe_cpu_layers and config.moe_backend not in ("offload", "hybrid"):
+    if is_moe and config.moe_cpu_layers and config.moe_strategy not in ("offload", "hybrid"):
         # the layer split needs the offload host banks + slot cache; 'cpu' already runs every layer on CPU, 'fused' keeps experts resident on the GPU (no host banks)
         raise ValueError(
             "--moe-cpu-layers requires --moe-backend offload or hybrid (got "
-            f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
+            f"{config.moe_strategy!r}); use --moe-backend cpu to run all layers on CPU"
         )
 
     if is_moe:
-        object.__setattr__(model_config, "moe_backend", config.moe_backend)
+        object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
+        # The expert quant method is bound at layer-construction time and reads decode_target
+        # off the model config; resolve it from the flags here so the kernel table sees the
+        # same target the offload cache later picks in _init_offload_moe_cache.
+        if config.moe_strategy == "hybrid":
+            decode_target = "hybrid"
+        elif config.moe_strategy == "cpu" or config.moe_cpu_layers:
+            decode_target = "cpu"
+        else:
+            decode_target = "gpu"
+        object.__setattr__(model_config, "decode_target", decode_target)
     object.__setattr__(model_config, "nvfp4_backend", config.nvfp4_backend)
 
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
@@ -1531,7 +2047,7 @@ def _adjust_config(config: EngineConfig):
             )
 
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process
-    # before any of the resolution above ran -- so "moe_backend='auto'" is all it can say. This
+    # before any of the resolution above ran -- so "moe_strategy='auto'" is all it can say. This
     # is the one line that reports what actually runs, for every path (explicit backends never
     # hit an "Auto-selected ..." log at all).
     resolved = [
@@ -1540,5 +2056,5 @@ def _adjust_config(config: EngineConfig):
         f"page_size={config.page_size}",
     ]
     if is_moe:
-        resolved.insert(0, f"moe_backend={config.moe_backend!r}")
+        resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")

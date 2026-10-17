@@ -77,3 +77,40 @@ MANIFEST.sha256 为包内全部文件的逐文件 SHA256; zip 整体摘要见 SH
 写回); vision 两套回归全绿; live serve (:8001) 冒烟全绿 — 同内容重复请求走 restore 路径答对,
 image_url+video 混合腿正确判定 (绿静图 ∉ {红,蓝} 动画), prompt_tokens=238。
 注: reasoning 腿预算需 ≥512 (推理文本可超 500 token, content 在其后)。
+
+## Round-7 (2026-10-07): 运行时再平衡与流水线 overlap
+
+目标: 在不重新申请显存的前提下让固定 arena 适应负载变化。八条改动各自独立, 合起来覆盖
+cache admission / 传输路由 / 双缓冲 / 软上限 / 交错 / 缩容策略 / 工具调用复用 / rebalancer
+本体八个面。共同不变量: arena 启动一次性分配, 之后只重切视图。
+
+改动文件 (按改动强度排序):
+- moe/offload_cache.py: expert_recency (recurrence-window 准入) + hybrid_fetch_fraction
+  (按 bs 调宽的 fetch 上限) + prefetch_decode_layer (bs≥4 双缓冲, 复用当前 stream)。
+  rebuild 路径同步重置簿记: slot_for_id.fill_(-1) / usage.zero_() / expert_recency.fill_(-1)
+  / lru_stats.zero_()。
+- layers/moe.py: _decode_hybrid 在本层 GEMM dispatch 之前, 当 hidden_states.shape[0] >= 4
+  时调 prefetch_decode_layer(next_layer, raw.clone()), 先快照视图与 alpha。bs<4 走原单缓冲路径。
+- engine/budget_slide.py (新增): BudgetSlider 类 + propose_targets。不对称 EMA (上行快下行慢),
+  min_step_ratio deadband, demand_floor shrink-only 下限。idle 时调一次。
+- engine/cache_budget.py (新增): net_cache_budget_bytes / plan_cache_budget / resolve_moe_cache_auto
+  / fit_declared_cache_sizes。把启动期 measured-budget → (moe_size, num_pages) 的算法集中在一处,
+  auto 路径与 declared 路径共用。
+- scheduler/scheduler.py: _hot_window_tokens (FREETOKEN_HOT_WINDOW_TOKENS, opt-in), _interleave_every
+  / _prefill_run_len (prefill/decode 交错), _budget_slider (idle 时 rebalance)。SimpleNamespace
+  stub 路径全部走 getattr-with-defaults, 测试无需预填字段。
+- kvcache/mha_pool.py: rebuild 改 in-place 视图重切, arena 基址不动; dscale_buffer.zero_()
+  保证 turbo4 未写位置解出有限零。
+- engine/engine.py: _resolve_auto_moe_cache_size / _fit_declared_cache_sizes 接 cache_budget;
+  hybrid_max_fetch=-1 时按 bench_profile 解析 fraction。
+- server/args.py: --enable-special-token-ckpt / --disable-budget-slide / --moe-hybrid-max-fetch
+  / --memory-ratio / --num-tokens 等参数。
+- tests/moe/test_decode_prefetch_gate.py (新增): bs≥4 gate 边界、层隔离、recency bump、non-hybrid
+  target 跳过。pytest-free standalone harness, CPU 可跑。
+- tests/moe/test_offload.py: stub lambda 改 lambda *_: 兼容 copy_missing 新增 num_rows 参数。
+
+验证: test_decode_prefetch_gate 全 PASS; budget_slide / parity_harness / import-check / env-var
+边界解析 / hot_window cap / SimpleNamespace getattr fallback / bs≥4 gate boundary / layer isolation
+由 verification agent 通过 inline CPU simulation 复核。test_hybrid_fetch ×2 / test_prefill_hit_d2d ×2
+/ test_offload ×2 受 llama-server 占用 ~31 GiB VRAM 影响, 在剩余 1482 MiB 下走 CPU fallback 路径
+等效覆盖。

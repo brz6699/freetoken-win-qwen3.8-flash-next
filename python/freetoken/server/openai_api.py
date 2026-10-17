@@ -23,6 +23,8 @@ from .api_models import (
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    KEEPALIVE,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -37,7 +39,14 @@ from .generation import (
     render_messages,
     resolve_sampling,
     submit_generation,
+    with_keepalive,
 )
+
+#: Seconds of event silence before an empty-delta keep-alive chunk is emitted.
+#: Long GLM-class prefills leave the stream silent for minutes after the role
+#: chunk, which trips clients' stream-idle timeouts (codex resets only on a
+#: data-bearing SSE frame, hence a real chunk with an empty delta, not a comment).
+KEEPALIVE_INTERVAL_S = 15.0
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -58,6 +67,7 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -76,6 +86,7 @@ def chat_request_to_genspec(
             ignore_eos=req.ignore_eos,
             model_sampling=model_sampling,
             stop=req.stop,
+            default_max_tokens=default_max_tokens,
         ),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
@@ -179,7 +190,10 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        default_max_tokens = (
+            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -190,7 +204,10 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    uid = await submit_generation(spec, state)
+    try:
+        uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
@@ -250,7 +267,10 @@ async def stream_chat_completion_chunks(
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    events = with_keepalive(
+        generate_events(uid, spec, state, source="/v1/chat/completions"),
+        KEEPALIVE_INTERVAL_S,
+    )
     while True:
         try:
             ev = await events.__anext__()
@@ -263,7 +283,17 @@ async def stream_chat_completion_chunks(
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
             )
             break
-        if isinstance(ev, ReasoningDelta):
+        if ev is KEEPALIVE:
+            # Empty-delta data-bearing chunk: resets clients' stream-idle timers
+            # during long prefill/queue gaps without touching accumulated content.
+            yield _sse(
+                _chat_chunk(
+                    req,
+                    uid,
+                    [{"delta": {}, "index": 0, "finish_reason": None}],
+                )
+            )
+        elif isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(
                     req,
@@ -386,7 +416,10 @@ async def handle_completion(
     if unsupported is not None:
         return create_error_response(unsupported)
     try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
-        _resolve_sampling(req, model_sampling)
+        default_max_tokens = (
+            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc), param="max_tokens")
 
@@ -397,7 +430,9 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
+            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
+                req, model_sampling, default_max_tokens=default_max_tokens
+            ))
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -410,7 +445,15 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
+        await state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=prompt,
+                sampling_params=_resolve_sampling(
+                    req, model_sampling, default_max_tokens=default_max_tokens
+                ),
+            )
+        )
         text = ""
         finish_reason = "stop"
         async for ack in state.wait_for_ack(uid):
@@ -517,6 +560,7 @@ def create_error_response(
 def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> SamplingParams:
     return resolve_sampling(
         temperature=req.temperature,
@@ -526,6 +570,7 @@ def _resolve_sampling(
         ignore_eos=req.ignore_eos,
         model_sampling=model_sampling,
         stop=req.stop,
+        default_max_tokens=default_max_tokens,
     )
 
 

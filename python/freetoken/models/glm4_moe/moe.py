@@ -23,7 +23,7 @@ class Glm4MoeSparseBlock(BaseOP):
     ``routed_scaling_factor``. The shared expert is applied to the same input and added.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
         self.norm_topk_prob = config.norm_topk_prob
@@ -32,10 +32,8 @@ class Glm4MoeSparseBlock(BaseOP):
         self.topk_group = config.topk_group
 
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
-        # DeepSeek-style selection bias; a registered buffer in HF (kept fp32 there). We
-        # store it in the model's bf16 dtype and upcast at use, which is exact enough for
-        # the argmax-style top-k selection.
-        self.e_score_correction_bias = torch.empty(config.num_experts)
+        # Keep selection bias in fp32: rounding can change the selected experts.
+        self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
         # first_k_dense_replace), matching how the loader packs the expert banks. The
@@ -44,10 +42,14 @@ class Glm4MoeSparseBlock(BaseOP):
             config,
             layer_id=layer_id - config.first_k_dense_replace,
             renormalize=config.norm_topk_prob,
+            quant_config=config.quant,
+            prefix=f"{prefix}.experts",
         )
         self.shared_experts = GlmGatedMLP(
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
+            quant_config=config.quant,
+            prefix=f"{prefix}.shared_experts",
         )
 
     def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
@@ -78,8 +80,10 @@ class Glm4MoeSparseBlock(BaseOP):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         topk_weights, topk_ids = self._route(hidden_states)
+        # Routed kernels may overwrite hidden_states; shared experts need the original input.
+        shared = self.shared_experts.forward(hidden_states)
         out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
-        out = out + self.shared_experts.forward(hidden_states)
+        out = out + shared
         return out.view(num_tokens, hidden_dim)
 
 

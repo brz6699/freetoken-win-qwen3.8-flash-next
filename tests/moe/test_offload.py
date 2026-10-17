@@ -77,7 +77,7 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
     )
     monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("layer_id", layer_id))
-    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+    monkeypatch.setattr(cache, "copy_missing", lambda *_: calls.setdefault("copied", True))
 
     def fake_fused(
         hidden_states,
@@ -343,7 +343,7 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         expert_ids.copy_(torch.tensor([[5, 0]], dtype=torch.int32))
 
     monkeypatch.setattr(cache, "ensure_experts", fake_ensure)
-    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+    monkeypatch.setattr(cache, "copy_missing", lambda *_: calls.setdefault("copied", True))
 
     def fake_fused_decode(
         hidden_states,

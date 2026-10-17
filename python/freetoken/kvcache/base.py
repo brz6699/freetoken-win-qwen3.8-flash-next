@@ -30,7 +30,8 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     if getattr(config, "kv_cache_dtype", "bf16") == "turbo4":
         # 4-bit TurboQuant: head_dim/2 packed-nibble BYTES plus one bf16 dequant scale per
         # (token, head, slab). uint8's itemsize would double-count the nibbles, so the
-        # arithmetic is spelled out; the engine gate keeps turbo4 off MLA/DSA/BSA pools.
+        # arithmetic is spelled out; the engine gate keeps turbo4 on the QSA and MLA-latent
+        # families only -- an MLA row is heads=1, so the formula prices its one scale/row.
         per_token = slabs * (spec.head_dim // 2 + 2) * heads * spec.num_layers
     else:
         # paged-KV STORAGE itemsize: fp8 (--kv-cache-dtype) halves this term; the trailing
@@ -123,7 +124,13 @@ class BaseKVCachePool(ABC):
             fixed_cache_size + extra_fixed_bytes,
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
-        if need > budget:
+        # Tolerate a few MiB of accounting drift between the budget derivation (memory_ratio
+        # math) and need (which may double-count sibling-pool fixed bytes vs baseline_free):
+        # both sides are exact bytes, but the display rounds to GiB and showed "needs 14.40 GiB
+        # > budget 14.40 GiB" -- an equality reject that pinned KV in a shrunk state. The
+        # teardown path (gc + empty_cache before alloc) covers this slack in practice.
+        tol = max(32 << 20, budget // 512)
+        if need > budget + tol:
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
                 f"needs {mem_GB(need)} > budget {mem_GB(budget)}; old cache kept, still serving"
@@ -183,6 +190,15 @@ class BaseCacheHandle(ABC):
 
     @abstractmethod
     def get_matched_indices(self) -> torch.Tensor: ...
+
+    def commit_floor(self) -> int:
+        """Reclaim free-floor: the prefix length below which the request owns no KV pages to
+        return to the pool. Default (every tree handle) borrows the tree's pages for
+        [0, cached_len) and owns none of that span -> floor = cached_len. A RAM-tier restore
+        handle overrides this to 0: it allocated its OWN fresh pages for the whole [0,
+        cached_len) restore span, so the tree-covered part of that span is a request DUPLICATE
+        that must be freed, not a tree reuse to keep."""
+        return self.cached_len
 
 
 class SizeInfo(NamedTuple):

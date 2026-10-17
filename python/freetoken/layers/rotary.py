@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Mapping, Tuple
 
 import torch
 
@@ -14,60 +14,25 @@ class RotaryEmbedding(StateLessOP):
         self,
         head_size: int,
         rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
-        proportional: bool = False,
-        attention_factor: float = 1.0,
+        cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
-        mrope_section: Tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
+        assert 0 < rotary_dim <= head_size
+        assert rotary_dim % 2 == 0
+        assert head_size in [64, 128, 256, 512]
         self.head_size = head_size
         self.rotary_dim = rotary_dim
-        # Interleaved M-RoPE (Qwen3.8 / Qwen4Exp): frequency j draws its position from
-        # channel sel[j] of the per-token (t, h, w) triple. None keeps this a pure 1-D
-        # rope instance (every text-only serving path).
-        self._mrope_section = mrope_section
-        self._mrope_sel: torch.Tensor | None = None
         # NeoX (half-rotation, HF default) vs GPT-J interleaved (adjacent pairs,
         # ``rope_interleave`` models: GLM MLA lineage). Both underlying kernels
         # accept the flag; the cos/sin cache layout is identical.
         self.is_neox = is_neox
-        if proportional:
-            assert 0 < rotary_dim <= head_size
-            assert rotary_dim % 2 == 0
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, head_size, 2, dtype=torch.float) / head_size)
-            )
-            if rotary_dim < head_size:
-                inv_freq[rotary_dim // 2 :] = 0.0
-        else:
-            # Standard (NeoX) rope. Supports partial rotary (rotary_dim < head_size):
-            # rope is applied to the first ``rotary_dim`` dims of each head, the rest pass
-            # through. Frequencies are spaced over ``rotary_dim`` (matches HF default
-            # partial rope, e.g. Qwen3.5 partial_rotary_factor, MiniMax-M2's
-            # ``apply_rotary_pos_emb``). Full rope is rotary_dim == head_size and is
-            # unaffected. ``head_size`` is passed to flashinfer separately so it rotates
-            # only the first ``rotary_dim`` dims.
-            assert 0 < rotary_dim <= head_size
-            assert rotary_dim % 2 == 0
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
-            )
-        if post_process is not None:
-            inv_freq = post_process(inv_freq)
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos() * attention_factor
-        sin = freqs.sin() * attention_factor
-        # buffer, so don't load/save
-        self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
-        assert self.head_size in [64, 128, 256, 512]
+        # shared with every rope of the same frequencies (rope_cos_sin_table), so never written
+        self._cos_sin_cache = cos_sin_cache
 
-        from freetoken.kernel.backend import is_flashinfer_installed
+        from freetoken.kernel.backend import periph_flashinfer_ok
 
-        if is_flashinfer_installed():
+        if periph_flashinfer_ok():
             from flashinfer import apply_rope_with_cos_sin_cache_inplace
         else:
             from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
@@ -90,117 +55,169 @@ class RotaryEmbedding(StateLessOP):
         )
         return query, key
 
-    def _mrope_freq_channels(self, device: torch.device) -> torch.Tensor:
-        """[rotary_dim//2] channel (0=t, 1=h, 2=w) per frequency, mirroring HF
-        ``apply_interleaved_mrope``: channel d owns indices ``offset_d : 3*section_d : 3``."""
-        if self._mrope_sel is None or self._mrope_sel.device != device:
-            sel = torch.zeros(self.rotary_dim // 2, dtype=torch.long)
-            for d, offset in ((1, 1), (2, 2)):
-                sel[offset : 3 * self._mrope_section[d] : 3] = d
-            self._mrope_sel = sel.to(device)
-        return self._mrope_sel
 
-    def forward_mrope(
+def mrope_cos_sin_rows(
+    cos_sin_cache: torch.Tensor, positions: torch.Tensor, section_table: torch.Tensor
+) -> torch.Tensor:
+    """Per-token [cos | sin] rows for [3, n] positions: frequency slot i reads the cache row of axis section_table[i]."""
+    half = cos_sin_cache.shape[1] // 2
+    pos = positions[section_table.long(), :].transpose(0, 1)
+    # Group-start rows may hold stale/unwritten triples (a rebuilt pool re-zeroes the
+    # cache, and a straddling group's first slot can sit in a row this forward did not
+    # rewrite), so clamp into the table before the gather; graph-capture-safe like the
+    # out_loc clamp in the QSA planner.
+    pos = pos.clamp_(0, cos_sin_cache.shape[0] - 1).long()  # [n, half]
+    idx = torch.arange(half, device=cos_sin_cache.device)
+    return torch.cat((cos_sin_cache[pos, idx], cos_sin_cache[pos, half + idx]), dim=1)
+
+
+def _mrope_torch(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    section_table: torch.Tensor,
+) -> None:
+    """Pure-torch mrope for triton-less installs; same in-place NeoX contract as the kernel."""
+    nnz = query.shape[0]
+    if nnz == 0:
+        return
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+    rows = mrope_cos_sin_rows(cos_sin_cache, positions, section_table)
+    cos = rows[:, :half].unsqueeze(1).float()
+    sin = rows[:, half:].unsqueeze(1).float()
+    for t, heads in ((query, query.shape[1] // head_size), (key, key.shape[1] // head_size)):
+        v = t.view(nnz, heads, head_size)
+        lo, hi = v[..., :half].float(), v[..., half:rotary_dim].float()
+        v[..., :half] = (lo * cos - hi * sin).to(v.dtype)
+        v[..., half:rotary_dim] = (hi * cos + lo * sin).to(v.dtype)
+
+
+MROPE_LAYOUTS = ("contiguous", "interleaved", "interleaved_glm")
+
+
+def build_section_table(mrope_section: tuple[int, int, int], layout: str) -> torch.Tensor:
+    """Axis id (0=t, 1=h, 2=w) per frequency slot for a [t, h, w] section split.
+
+    contiguous: T|H|W blocks. interleaved: H at slots 1,4,.. and W at 2,5,.. until each share is used, T takes the rest.
+    interleaved_glm: round-robin over the three axes, skipping an axis once its share is used up.
+    """
+    st, sh, sw = mrope_section
+    half = st + sh + sw
+    sec = torch.zeros(half, dtype=torch.int32)
+    if layout == "contiguous":
+        sec[st : st + sh] = 1
+        sec[st + sh :] = 2
+    elif layout == "interleaved":
+        sec[1 : 3 * sh : 3] = 1
+        sec[2 : 3 * sw : 3] = 2
+        if int((sec == 1).sum()) != sh or int((sec == 2).sum()) != sw:
+            raise ValueError(f"mrope_section {mrope_section} is not representable in the interleaved layout")
+    elif layout == "interleaved_glm":
+        counts = [0, 0, 0]
+        for i in range(half):
+            ax = i % 3
+            while counts[ax] >= mrope_section[ax]:
+                ax = (ax + 1) % 3
+            sec[i] = ax
+            counts[ax] += 1
+    else:
+        raise ValueError(f"unknown mrope layout {layout!r}; expected one of {MROPE_LAYOUTS}")
+    return sec
+
+
+class MRotaryEmbedding(RotaryEmbedding):
+    """3-axis (t/h/w) rope over the parent's cos_sin_cache; section_table picks the axis row per frequency slot. Consumes positions [3, n]."""
+
+    def __init__(
+        self, *args, mrope_section: tuple, layout: str = "interleaved", **kwargs
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        assert self.is_neox, "mrope is defined on the NeoX half-rotation layout"
+        assert self._cos_sin_cache.shape[1] == self.rotary_dim, "mrope reads a rotary_dim-wide table, not a proportional rope's"
+        half = self.rotary_dim // 2
+        assert sum(mrope_section) == half, (mrope_section, half)
+        self._section_table = build_section_table(tuple(mrope_section), layout).to(
+            self._cos_sin_cache.device
+        )
+        try:
+            from freetoken.kernel.triton.rope import apply_mrope_with_cos_sin_cache_inplace
+
+            self._kernel = apply_mrope_with_cos_sin_cache_inplace
+        except ImportError:
+            self._kernel = None
+
+    def forward(
         self,
-        positions3: torch.Tensor,  # [T, 3] int32 (t/h/w per token)
-        query: torch.Tensor,  # [T, num_q_heads * head_size], rotated in place
-        key: torch.Tensor,  # [T, num_kv_heads * head_size], rotated in place
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """M-RoPE twin of :meth:`forward` for image-bearing batches.
-
-        Per-token cos/sin are assembled from the SAME fp32 cache the 1-D flashinfer path
-        reads, so text tokens (t==h==w) rotate bit-identically to ``forward``; only the
-        gather index changes. Eager-only by design (image batches never ride a graph).
-        """
-        r = self.rotary_dim // 2
-        sel = self._mrope_freq_channels(query.device)
-        channels = positions3.long()  # [T, 3]
-        pos_sel = torch.gather(channels, 1, sel.unsqueeze(0).expand(channels.shape[0], r))
-        dims = torch.arange(r, device=query.device)
-        cos = self._cos_sin_cache[pos_sel, dims]  # [T, r] fp32
-        sin = self._cos_sin_cache[pos_sel, r + dims]
-
-        for x in (query, key):
-            heads = x.shape[1] // self.head_size
-            v = x.view(-1, heads, self.head_size)
-            rot = v[..., : self.rotary_dim].float()
-            if not self.is_neox:
-                raise NotImplementedError("mrope is only wired for NeoX rope layout")
-            a, b = rot[..., :r], rot[..., r:]
-            c, s = cos.unsqueeze(1), sin.unsqueeze(1)  # [T, 1, r]
-            v[..., : self.rotary_dim] = torch.cat((a * c - b * s, b * c + a * s), dim=-1).to(
-                v.dtype
+        assert positions.dim() == 2, "mrope models feed [3, n] positions"
+        if self._section_table.device != query.device:
+            self._section_table = self._section_table.to(query.device)
+        if self._cos_sin_cache.device != query.device:
+            self._cos_sin_cache = self._cos_sin_cache.to(query.device)
+        positions = positions.contiguous().to(query.device)
+        if self._kernel is not None and query.is_cuda:
+            self._kernel(
+                positions=positions, query=query, key=key, head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache, section_table=self._section_table,
+            )
+        else:
+            _mrope_torch(
+                positions, query, key, self.head_size,
+                self._cos_sin_cache, self._section_table,
             )
         return query, key
 
 
-def _get_rope(
-    head_dim: int,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
-    rope_scaling: Dict[str, Any] | None = None,
-    is_neox: bool = True,
-    mrope_section: Tuple[int, ...] | None = None,
-) -> RotaryEmbedding:
-    if rope_scaling is None:
-        return RotaryEmbedding(
-            head_dim, rotary_dim, max_position, base, is_neox=is_neox, mrope_section=mrope_section
-        )
-    # need to test some cases:
-    match rope_scaling["rope_type"]:
-        case "default":
-            return RotaryEmbedding(
-                head_dim,
-                rotary_dim,
-                max_position,
-                base,
-                is_neox=is_neox,
-                mrope_section=mrope_section,
-            )
+def rope_table_positions(max_position: int, rope_scaling: Mapping[str, Any] | None) -> int:
+    """Rows the cos/sin table needs: YaRN serves ``original_max_position_embeddings * factor``,
+    above ``max_position_embeddings`` when only the rope parameters are overridden."""
+    if rope_scaling is None or rope_scaling.get("rope_type") != "yarn":
+        return max_position
+    extended = int(rope_scaling["original_max_position_embeddings"] * rope_scaling["factor"])
+    return max(max_position, extended)
 
-        case "proportional":
-            return RotaryEmbedding(
-                head_dim,
-                rotary_dim,
-                max_position,
-                base,
-                proportional=True,
-                is_neox=is_neox,
-                mrope_section=mrope_section,
-            )
+
+def _rope_frequencies(
+    head_size: int, rotary_dim: int, base: float, rope_scaling: Mapping[str, Any] | None
+) -> Tuple[torch.Tensor, float]:
+    """``inv_freq`` over the table's half width, and the factor cos and sin are both scaled by."""
+    rope_type = "default" if rope_scaling is None else rope_scaling["rope_type"]
+    if rope_type == "proportional":
+        # Frequencies spaced over the whole head; the pairs past rotary_dim do not rotate.
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_size, 2, dtype=torch.float) / head_size))
+        inv_freq[rotary_dim // 2 :] = 0.0
+        return inv_freq, 1.0
+    # Standard (NeoX) rope. Supports partial rotary (rotary_dim < head_size): rope is applied
+    # to the first ``rotary_dim`` dims of each head, the rest pass through, and frequencies
+    # are spaced over ``rotary_dim`` (HF default partial rope, e.g. Qwen3.5
+    # partial_rotary_factor, MiniMax-M2's ``apply_rotary_pos_emb``).
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+    match rope_type:
+        case "default":
+            return inv_freq, 1.0
 
         case "llama3":
             scaling_factor: float = rope_scaling["factor"]
             low_freq_factor: float = rope_scaling["low_freq_factor"]
             high_freq_factor: float = rope_scaling["high_freq_factor"]
             original_max_position: int = rope_scaling["original_max_position_embeddings"]
-
-            def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
-                # no smooth if low_freq_factor == high_freq_factor
-                wave_len = 2 * math.pi / inv_freq
-                if low_freq_factor == high_freq_factor:
-                    return torch.where(
-                        wave_len < original_max_position / high_freq_factor,
-                        inv_freq,
-                        inv_freq / scaling_factor,
-                    )
-
-                delta = high_freq_factor - low_freq_factor
-                smooth = (original_max_position / wave_len - low_freq_factor) / delta
-                smooth = torch.clamp(smooth, 0, 1)
-                factor = (1 - smooth) / scaling_factor + smooth
-                return factor * inv_freq
-
-            return RotaryEmbedding(
-                head_dim,
-                rotary_dim,
-                max_position,
-                base,
-                post_process,
-                is_neox=is_neox,
-                mrope_section=mrope_section,
-            )
+            wave_len = 2 * math.pi / inv_freq
+            # no smooth if low_freq_factor == high_freq_factor
+            if low_freq_factor == high_freq_factor:
+                return torch.where(
+                    wave_len < original_max_position / high_freq_factor,
+                    inv_freq,
+                    inv_freq / scaling_factor,
+                ), 1.0
+            delta = high_freq_factor - low_freq_factor
+            smooth = torch.clamp((original_max_position / wave_len - low_freq_factor) / delta, 0, 1)
+            return ((1 - smooth) / scaling_factor + smooth) * inv_freq, 1.0
 
         case "yarn":
             factor: float = rope_scaling["factor"]
@@ -246,25 +263,52 @@ def _get_rope(
             high = min(high, rotary_dim - 1)
             if low == high:  # HF nudges instead of flooring the gap at 1 ("truncate": false)
                 high += 0.001
-
-            def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
-                ramp = torch.clamp(
-                    (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / (high - low),
-                    0, 1,
-                )
-                return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
-
-            return RotaryEmbedding(
-                head_dim,
-                rotary_dim,
-                max_position,
-                base,
-                post_process,
-                attention_factor=float(attention_factor),
-                is_neox=is_neox,
+            ramp = torch.clamp(
+                (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / (high - low), 0, 1
             )
+            return (inv_freq / factor) * ramp + inv_freq * (1 - ramp), float(attention_factor)
 
     raise ValueError(f"Unsupported {rope_scaling = }")
+
+
+@functools.cache
+def _cos_sin_table(
+    head_size: int,
+    rotary_dim: int,
+    positions: int,
+    base: float,
+    rope_scaling: Tuple[Tuple[str, Any], ...] | None,
+    device: torch.device,
+) -> torch.Tensor:
+    inv_freq, attention_factor = _rope_frequencies(
+        head_size, rotary_dim, base, dict(rope_scaling) if rope_scaling is not None else None
+    )
+    freqs = torch.arange(positions, dtype=torch.float)[:, None] * inv_freq[None, :]
+    return torch.cat((freqs.cos() * attention_factor, freqs.sin() * attention_factor), dim=-1)
+
+
+def rope_cos_sin_table(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
+) -> torch.Tensor:
+    """The ``[positions, width]`` cos|sin table, one per distinct rope: only proportional rope
+    depends on the head size, so an indexer whose heads differ in width reads the attention's table."""
+    rope_map = dict(rope_scaling) if rope_scaling is not None else None
+    proportional = rope_map is not None and rope_map["rope_type"] == "proportional"
+    device = torch.get_default_device()
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _cos_sin_table(
+        head_size if proportional else rotary_dim,
+        rotary_dim,
+        rope_table_positions(max_position, rope_map),
+        base,
+        rope_scaling,
+        device,
+    )
 
 
 _ROPE_DEVICE: torch.device | None = None
@@ -284,8 +328,21 @@ def get_rope(
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
     is_neox: bool = True,
     mrope_section: Tuple[int, ...] | None = None,
+    mrope_layout: str = "interleaved",
 ) -> RotaryEmbedding:
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
+
+    def build() -> RotaryEmbedding:
+        table = rope_cos_sin_table(head_dim, rotary_dim, max_position, base, rope_scaling)
+        if mrope_section is not None:
+            assert rope_map is None or rope_map.get("rope_type", "default") == "default"
+            return MRotaryEmbedding(
+                head_dim, rotary_dim, table,
+                is_neox=is_neox, mrope_section=tuple(mrope_section),
+                layout=mrope_layout,
+            )
+        return RotaryEmbedding(head_dim, rotary_dim, table, is_neox=is_neox)
+
     t = torch.tensor([])
     if t.device == torch.device("meta"):
         # we cannot use meta device for rope
@@ -294,12 +351,17 @@ def get_rope(
                 "We cannot use meta device for rope. Please call set_rope_device() first."
             )
         with torch.device(_ROPE_DEVICE):
-            return _get_rope(
-                head_dim, rotary_dim, max_position, base, rope_map, is_neox, mrope_section
-            )
-    return _get_rope(
-        head_dim, rotary_dim, max_position, base, rope_map, is_neox, mrope_section
-    )
+            return build()
+    return build()
 
 
-__all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]
+__all__ = [
+    "MROPE_LAYOUTS",
+    "MRotaryEmbedding",
+    "RotaryEmbedding",
+    "build_section_table",
+    "get_rope",
+    "rope_cos_sin_table",
+    "rope_table_positions",
+    "set_rope_device",
+]

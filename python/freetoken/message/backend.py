@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 import torch
 from freetoken.core import SamplingParams
@@ -30,32 +30,55 @@ class ExitMsg(BaseBackendMsg):
 
 
 @dataclass
+class MMItem:
+    """One multimodal input of a request (an image, video or audio clip).
+
+    Family extras from the processor live in model_specific_data and read back as attributes (item.grid_thw).
+    offsets are half-open [start, end) spans in input_ids; an item may occupy several.
+    Exactly one of feature / precomputed_embeddings is set.
+    """
+
+    modality: str
+    hash: int
+    pad_value: int
+    offsets: List[List[int]]
+    feature: torch.Tensor | None = None  # raw processor output (CPU), encoded by the engine
+    precomputed_embeddings: torch.Tensor | None = None  # final encoder output, skips encoding
+    model_specific_data: Dict[str, Any] = field(default_factory=dict)
+
+    def __getattr__(self, name: str) -> Any:
+        data = self.__dict__.get("model_specific_data")
+        if data is not None and name in data:
+            return data[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    @property
+    def num_tokens(self) -> int:
+        return sum(end - start for start, end in self.offsets)
+
+    def is_image(self) -> bool:
+        return self.modality == "image"
+
+    def validate(self) -> None:
+        if not self.offsets or any(end <= start for start, end in self.offsets):
+            raise ValueError(f"MMItem offsets must be non-empty half-open spans: {self.offsets}")
+        if (self.feature is None) == (self.precomputed_embeddings is None):
+            raise ValueError("MMItem needs exactly one of feature / precomputed_embeddings")
+
+    def encoder(self) -> Dict:
+        return serialize_type(self)
+
+
+@dataclass
 class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
-    # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path, where
-    # the SCHEDULER produces it by encoding msg.mm_data_path with the vision tower.
-    mm_embeds: torch.Tensor | None = None
-    # M-RoPE table for an image-bearing prompt: flat [prompt_len*3] int32 (t/h/w per
-    # token). The online serializer carries 1-D tensors only, so the tokenizer worker
-    # flattens and the scheduler reshapes with view(-1, 3). None = pure text: every rope
-    # consumer stays on the unchanged 1-D logical-positions path.
-    mm_mrope: torch.Tensor | None = None
-    # Staged pixel payload path ({"pixel_values", "image_grid_thw"} .pt file) the
-    # tokenizer worker wrote as the cross-process side channel for the tens of MB that
-    # do not belong in a serialized message. The scheduler loads it, encodes, deletes it.
-    mm_data_path: str | None = None
-    # P4: content-addressed PREFIX-CACHE key for an image-bearing prompt -- a copy of
-    # input_ids with every image_pad position replaced by a payload-hash-derived id.
-    # The radix tree keys on token ids, and image_pad ids are identical across images
-    # while their KV differs, so matching on raw ids would serve the wrong image's KV.
-    # Keying the span by the content id makes identical images reuse KV and different
-    # images never false-match. Same length as input_ids, int32, None for text-only
-    # (every consumer stays on the unchanged raw-id path) and for offline mm (which
-    # precomputes mm_embeds in-process and carries no payload path to hash).
-    mm_cache_key: torch.Tensor | None = None
+    # per-image processor outputs, in prompt order
+    mm_items: List[MMItem] | None = None
+    # precomputed [3, len(input_ids)] mrope positions and decode delta; None for text-only requests and 1-D rope models
+    mrope_positions: torch.Tensor | None = None
+    mrope_delta: int = 0
 
 
 @dataclass

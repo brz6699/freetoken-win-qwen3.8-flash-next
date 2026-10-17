@@ -416,7 +416,10 @@ class DSV4PagedKVCache(BaseKVCachePool):
         need = target_moe * per_expert_bytes + dsv4_pool_bytes(
             kv_sizes, dsv4_args, config.max_running_req + 1
         )
-        if need > budget:
+        # Same near-equality tolerance as the base fit-check: exact-byte sides displayed at
+        # GiB rounding reject every grow at a full envelope, pinning KV in a shrunk state.
+        tol = max(32 << 20, budget // 512)
+        if need > budget + tol:
             kv_part = f"kv={num_pages} P-pages" if num_pages is not None else "kv=current pool"
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, {kv_part}) needs "

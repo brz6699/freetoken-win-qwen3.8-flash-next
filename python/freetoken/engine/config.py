@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+import sys
+from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.models.register import _load_attr, get_model_spec
+from freetoken.layers.quantization import set_quant_config
+from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
+from freetoken.models.register import ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config
 
 if TYPE_CHECKING:
@@ -18,11 +22,22 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
+    hf_overrides: Mapping[str, Any] = field(default_factory=dict)
+    # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
+    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
     max_running_req: int = 4
     attention_backend: str = "auto"
-    moe_backend: str = "auto"
+    moe_strategy: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
+    # Kernel-per-layer-kind quant backend selection (--quant-backend): comma-separated
+    # layer[.kind]=name entries, parsed into a QuantBackend before the model is built.
+    quant_backend: str | None = None
+    # PLE table backend (--ple-backend): "disk" reads rows from the checkpoint files per fill,
+    # "pinned" preloads the table into page-locked host RAM. The disk backend's C++ store
+    # (_ple_store) is built on Linux only, so other platforms default to "pinned".
+    ple_backend: str = "disk" if sys.platform == "linux" else "pinned"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -32,7 +47,14 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Runtime KV<->MoE rebalancing on top of the startup plan: KV occupancy is sampled
+    # per batch and the byte envelope is traded with the expert-slot cache at the idle
+    # safe point (engine/budget_slide.py). Disable to freeze the startup split.
+    budget_slide: bool = True
     moe_cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits only its routed experts into the slot
+    # cache (GPU decode only), like decode; 0 streams whole layers.
+    moe_prefill_demand_tokens: int = 0
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
@@ -54,10 +76,24 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # MTP speculative decoding (--mtp-draft-len): the checkpoint's native 1-layer head drafts
+    # this many tokens on the GPU per decode step; the full model verifies them in one extend
+    # forward and keeps the greedy-longest prefix. Setting the length IS the switch (None =
+    # off); single greedy requests only.
+    mtp_draft_len: int | None = None
+    # MTP draft+verify compute device (--mtp-device): "gpu" runs the whole MTP path on the GPU;
+    # "cpu" hides the head draft + verify compute on the CPU behind the GPU main-model forward.
+    mtp_device: str = "gpu"
+    # Storage dtype of the MTP head's routed-expert bank (--mtp-expert-quant):
+    # "none" bf16 | "fp8" e4m3 + per-tensor scale | "q4_0" nibble-packed groups of 32.
+    mtp_expert_quant: str = "none"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
-    memory_ratio: float = 0.9
+    # None = Algorithm 2 (declared sizes drive the budget: --num-tokens/--num-pages first,
+    # then --moe-cache-size, with full VRAM as the ceiling). A float = Algorithm 1: ratio x
+    # measured baseline minus weights is the budget envelope. Priority: ratio > KV > MoE.
+    memory_ratio: float | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -88,6 +124,11 @@ class EngineConfig:
     # Every per-byte budget formula must price kv_dtype/kv_cache_dtype, never dtype.
     kv_cache_dtype: str = "bf16"
 
+    @property
+    def enable_mtp(self) -> bool:
+        """Derived from --mtp-draft-len: naming a draft length is what turns MTP on."""
+        return self.mtp_draft_len is not None
+
     @cached_property
     def kv_dtype(self) -> torch.dtype:
         if self.kv_cache_dtype in ("fp8_e4m3", "fp8"):
@@ -101,13 +142,48 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+        return cached_load_hf_config(self.model_path, self.hf_overrides)
+
+    @cached_property
+    def model_spec(self) -> ModelSpec:
+        return get_model_spec(self.hf_config.architectures[0])
+
+    @cached_property
+    def active_encoders(self) -> "tuple":
+        """The encoder towers this process builds: the family registers them, the checkpoint config
+        carries their section, and --mm-disable / --text-model-only did not name them."""
+        return tuple(
+            e
+            for e in self.model_spec.encoders
+            if getattr(self.hf_config, e.config_key, None) is not None
+            and e.kind not in self.mm.disabled_encoders
+        )
+
+    @cached_property
+    def served_modalities(self) -> frozenset:
+        """Modalities this process accepts."""
+        return frozenset(m for e in self.active_encoders for m in e.modalities)
 
     @cached_property
     def model_config(self) -> ModelConfig:
-        spec = get_model_spec(self.hf_config.architectures[0])
+        # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
+        hf_config = copy.copy(self.hf_config)
+        built = {e.config_key for e in self.active_encoders}
+        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
+            if key not in built:
+                setattr(hf_config, key, None)
+        spec = self.model_spec
+        # The checkpoint's quant dialect is installed once here, before the weight
+        # readers run: models/weight.py resolves each module through get_quant_config().
+        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
+        set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return parse_config(self.hf_config)
+        return replace(
+            parse_config(hf_config),
+            quant=quant,
+            enable_mtp=self.enable_mtp,
+            mtp_draft_len=self.mtp_draft_len,
+        )
 
     @property
     def max_seq_len(self) -> int:

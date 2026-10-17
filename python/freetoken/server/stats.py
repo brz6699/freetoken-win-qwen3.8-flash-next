@@ -30,6 +30,10 @@ class StatsTracker:
         # "cost saved by running locally" accounting. Monotonic; resets when the process restarts.
         self.prompt_tokens_total = 0
         self.completion_tokens_total = 0
+        # Prefix-cache hits: lifetime count of prompt tokens served from cache (diff against
+        # prompt_tokens_total for a hit ratio) plus the last reported per-request hit length.
+        self.cached_tokens_total = 0
+        self.cached_last = 0
         self.kv_used_pages = 0
         self.kv_total_pages = 0
         self.mamba_used_slots = 0
@@ -37,6 +41,13 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # MTP speculation lifetime totals, summed once per finished request (the counters ride
+        # the terminal reply only). Prometheus-counter semantics: clients diff two polls.
+        self.mtp_steps_total = 0
+        self.mtp_drafts_total = 0
+        self.mtp_accepted_total = 0
+        self.mtp_first_match_total = 0
+        self.mtp_full_accept_total = 0
 
     @property
     def active(self) -> int:
@@ -63,6 +74,9 @@ class StatsTracker:
         if getattr(reply, "prompt_tokens_delta", 0) > 0:
             self._prefill.append((t, reply.prompt_tokens_delta))
             self.prompt_tokens_total += reply.prompt_tokens_delta
+        if getattr(reply, "cached_tokens", 0) > 0:  # arrives once per request, with prompt_tokens_delta
+            self.cached_tokens_total += reply.cached_tokens
+            self.cached_last = reply.cached_tokens
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
             self.kv_used_pages = reply.kv_used_pages
             self.kv_total_pages = reply.kv_total_pages
@@ -75,6 +89,14 @@ class StatsTracker:
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
         if getattr(reply, "finished", False):
+            # MTP counters arrive only on the terminal reply of MTP-stepped requests; a plain
+            # or non-MTP finish has them at 0 and leaves the totals (and the stats node) alone.
+            if getattr(reply, "mtp_steps", 0) > 0:
+                self.mtp_steps_total += reply.mtp_steps
+                self.mtp_drafts_total += reply.mtp_drafts
+                self.mtp_accepted_total += reply.mtp_accepted
+                self.mtp_first_match_total += reply.mtp_first_match
+                self.mtp_full_accept_total += reply.mtp_full_accept
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
                 self._inflight.discard(uid)
@@ -102,7 +124,7 @@ class StatsTracker:
 
 
 def derive_model_card(config: Any) -> dict:
-    """attn enum + moe bool + ctx from the model config."""
+    """attn enum + moe bool + ctx from the model config; input_modalities is what the API accepts right now."""
     mc = config.model_config
     if getattr(mc, "has_linear_attention", False):
         attn = "hybrid_linear"
@@ -115,6 +137,7 @@ def derive_model_card(config: Any) -> dict:
         "ctx": config.max_seq_len,
         "attn": attn,
         "moe": bool(getattr(mc, "is_moe", False)),
+        "input_modalities": ["text", *sorted(config.served_modalities)],
     }
 
 
@@ -152,6 +175,20 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
+    mtp = (
+        {
+            "steps_total": tr.mtp_steps_total,
+            "drafts_total": tr.mtp_drafts_total,
+            "accepted_total": tr.mtp_accepted_total,
+            "acceptance": round(tr.mtp_accepted_total / tr.mtp_drafts_total, 4)
+            if tr.mtp_drafts_total
+            else 0.0,
+            "first_match_total": tr.mtp_first_match_total,
+            "full_accept_total": tr.mtp_full_accept_total,
+        }
+        if tr.mtp_steps_total > 0
+        else None
+    )
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
@@ -159,6 +196,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "kv": kv,
         "mamba": mamba,
         "swa": swa,
+        "mtp": mtp,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
@@ -172,5 +210,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "ttft_mean_ms": ttft_mean_ms,
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
+            "cached_tokens_total": tr.cached_tokens_total,
+            "cached_last": tr.cached_last,
         },
     }

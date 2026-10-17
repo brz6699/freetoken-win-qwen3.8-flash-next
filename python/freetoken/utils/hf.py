@@ -1,11 +1,11 @@
+import copy
 import functools
 import json
 import os
-from typing import Any
-
-from typing import FrozenSet
+from typing import Any, FrozenSet, Mapping
 
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.utils import EntryNotFoundError
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoConfig,
@@ -14,6 +14,12 @@ from transformers import (
     PretrainedConfig,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+
+from freetoken.utils.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
@@ -164,6 +170,17 @@ class RawConfigShim:
         return json.loads(json.dumps(self._data))  # deep copy, callers may mutate
 
 
+def optional_hf_file(model_path: str, filename: str) -> str | None:
+    """Local path of ``filename`` in a checkpoint dir or Hub repo; None when the checkpoint has no such file."""
+    if os.path.isdir(model_path):
+        path = os.path.join(model_path, filename)
+        return path if os.path.isfile(path) else None
+    try:
+        return hf_hub_download(repo_id=model_path, filename=filename)
+    except EntryNotFoundError:
+        return None
+
+
 def _raw_config_json(model_path: str) -> dict:
     if os.path.isdir(model_path):
         path = os.path.join(model_path, "config.json")
@@ -173,35 +190,98 @@ def _raw_config_json(model_path: str) -> dict:
         return json.load(f)
 
 
+def sidecar_quantization_config(model_path: str) -> dict | None:
+    """The ``quantization_config`` an old ModelOpt export keeps only in ``hf_quant_config.json``, or None."""
+    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
+    if sidecar is None:
+        return None
+    with open(sidecar, encoding="utf-8") as f:
+        quant = json.load(f).get("quantization")
+    if not isinstance(quant, dict):
+        return None
+    return {"quant_method": "modelopt", **quant}
+
+
+def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
+    # config.json wins when it has one; the sidecar is only read for exports that never wrote it there
+    if getattr(config, "quantization_config", None) is not None:
+        return
+    if getattr(getattr(config, "text_config", None), "quantization_config", None) is not None:
+        return
+    quant = sidecar_quantization_config(model_path)
+    if quant is None:
+        return
+    if isinstance(config, RawConfigShim):
+        config._data["quantization_config"] = quant
+    else:
+        config.quantization_config = quant
+
+
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
     # trust_remote_code: checkpoints that ship a custom config class via ``auto_map``
     # (e.g. MiniMax-M2) refuse to load without it. FreeToken only reads config fields
     # (parse_config) and never instantiates the checkpoint's modeling code.
     try:
-        return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except ValueError as exc:
         # Unknown model_type on this transformers version: serve off the raw JSON.
         # Anything else (bad path, malformed JSON) stays fatal.
         if "model type" not in str(exc):
             raise
-        return RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
+        config = RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
+    _merge_sidecar_quantization_config(config, model_path)
+    return config
 
 
-def cached_load_hf_config(model_path: str) -> PretrainedConfig:
+def _with_overrides(config: Any, data: dict, overrides: Mapping[str, Any]) -> dict:
+    merged = dict(data)
+    for key, value in overrides.items():
+        section = getattr(config, key, None)
+        if isinstance(value, Mapping) and isinstance(section, (PretrainedConfig, RawConfigShim)):
+            merged[key] = _with_overrides(section, merged.get(key) or {}, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def cached_load_hf_config(
+    model_path: str, overrides: Mapping[str, Any] | None = None
+) -> PretrainedConfig:
+    """A fresh copy of the checkpoint's config with ``overrides`` applied as vLLM's --hf-overrides
+    does: nested config sections update key by key, every other value is replaced whole."""
     # A .gguf file (or an FTW dir converted from one) carries its own metadata (no HF
     # config.json); return a shim the model registry dispatches on instead of a
     # PretrainedConfig.
     from freetoken.models.gguf.reader import gguf_config_source
 
     if (gguf_src := gguf_config_source(model_path)) is not None:
+        if overrides:
+            raise ValueError("--hf-overrides applies to a HF config.json; a GGUF carries its own metadata")
         from freetoken.models.gguf.config import build_gguf_shim
 
         return build_gguf_shim(gguf_src)
     config = _load_hf_config(model_path)
+    data = config.to_dict()
+    if overrides:
+        data = _with_overrides(config, data, overrides)
     if isinstance(config, RawConfigShim):
-        return RawConfigShim(config.to_dict())
-    return type(config)(**config.to_dict())
+        return RawConfigShim(data)
+    return type(config)(**data)
+
+
+def _weight_allow_patterns(repo_id: str) -> list[str]:
+    try:
+        index = hf_hub_download(repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm)
+        with open(index, encoding="utf-8") as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    except Exception as e:
+        logger.warning(
+            "no usable %s for %s (%s); falling back to *.safetensors",
+            SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
+        )
+        return ["*.safetensors"]
+    return shards or ["*.safetensors"]
 
 
 def download_hf_weight(model_path: str) -> str:
@@ -210,7 +290,7 @@ def download_hf_weight(model_path: str) -> str:
     try:
         return snapshot_download(
             model_path,
-            allow_patterns=["*.safetensors"],
+            allow_patterns=_weight_allow_patterns(model_path),
             tqdm_class=DisabledTqdm,
         )
     except Exception as e:

@@ -20,6 +20,13 @@ struct device_vec {
 
 namespace details {
 
+#if FREETOKEN_USE_ROCM
+// Use native Clang vector types so each __builtin_nontemporal_load/store
+// maps to one vectorized 8B/16B global memory instruction.
+using native_uint2 = uint32_t __attribute__((ext_vector_type(2)));
+using native_uint4 = uint32_t __attribute__((ext_vector_type(4)));
+#endif
+
 template <std::size_t kUnit>
 inline constexpr auto get_mem_package() {
     if constexpr (kUnit == 16) {
@@ -33,49 +40,77 @@ inline constexpr auto get_mem_package() {
     }
 }
 
-__forceinline__ __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+#if FREETOKEN_USE_ROCM
+    return uint1{__builtin_nontemporal_load(&src->x)};
+#else
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
+#endif
 }
 
-__forceinline__ __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+#if FREETOKEN_USE_ROCM
+    const auto value = __builtin_nontemporal_load(reinterpret_cast<const native_uint2*>(src));
+    return __builtin_bit_cast(uint2, value);
+#else
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
+#endif
 }
 
-__forceinline__ __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+#if FREETOKEN_USE_ROCM
+    const auto value = __builtin_nontemporal_load(reinterpret_cast<const native_uint4*>(src));
+    return __builtin_bit_cast(uint4, value);
+#else
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
+#endif
 }
 
-__forceinline__ __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#if FREETOKEN_USE_ROCM
+    __builtin_nontemporal_store(value.x, &dst->x);
+#else
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#endif
 }
 
-__forceinline__ __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#if FREETOKEN_USE_ROCM
+    __builtin_nontemporal_store(
+        __builtin_bit_cast(native_uint2, value), reinterpret_cast<native_uint2*>(dst));
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     asm volatile("st.global.wt.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#endif
 }
 
-__forceinline__ __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#if FREETOKEN_USE_ROCM
+    __builtin_nontemporal_store(
+        __builtin_bit_cast(native_uint4, value), reinterpret_cast<native_uint4*>(dst));
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     uint32_t tmp2 = value.z;
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#endif
 }
 
-__forceinline__ __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
+__always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
     while (atomicAdd(flag, 0) > 0) {
-#if __CUDA_ARCH__ >= 700
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 700
         __nanosleep(sleep_ns);
 #endif
         sleep_ns = sleep_ns < 2048 ? (sleep_ns << 1) : 2048;
@@ -86,7 +121,7 @@ template <std::size_t kUnit>
 using mem_package_t = decltype(get_mem_package<kUnit>());
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads>
-__forceinline__ __device__ auto load_vec(const void* __restrict__ src) {
+__always_inline __device__ auto load_vec(const void* __restrict__ src) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -106,7 +141,7 @@ __forceinline__ __device__ auto load_vec(const void* __restrict__ src) {
 }
 
 template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads, typename Tp>
-__forceinline__ __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
+__always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
     using Package = mem_package_t<kUnit>;
     constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
     constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -147,7 +182,7 @@ inline bool host_ptr_identity() {
 }
 
 inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || host_ptr_identity()) {
+    if (dev.device_type == kDLCUDA || dev.device_type == kDLROCM || host_ptr_identity()) {
         return ptr;
     }
     void* mapped = nullptr;
@@ -267,9 +302,13 @@ inline auto get_sync_flag_ptr(
     host::SymbolicDevice& device
 ) -> int32_t* {
     auto flag_dtype = host::SymbolicDType{};
+    // pre-set options on the shared symbol: the explicit-template
+    // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the same
+    // chain fails to compile under nvcc (CUDA 13.1) + MSVC
+    flag_dtype.set_options<int32_t>();
     host::TensorMatcher({1})
         .with_dtype(flag_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
 }
@@ -341,20 +380,25 @@ struct FastIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto device = SymbolicDevice{};
         auto num_indices_dtype = SymbolicDType{};
+        // pre-set options on the shared symbols: the explicit-template
+        // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the
+        // same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+        indices_dtype.set_options<int32_t, int64_t>();
+        num_indices_dtype.set_options<int64_t>();
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(dst);
 
         TensorMatcher({L})
         .with_dtype(indices_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -363,7 +407,7 @@ struct FastIndexCopyKernel {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
                 .with_dtype(num_indices_dtype)
-                .with_device<kDLCUDA>(device)
+                .with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices_tensor);
 
             num_indices_data_ptr = static_cast<const int64_t*>(num_indices_tensor.data_ptr());
@@ -528,15 +572,21 @@ struct MultiIndexCopyKernel {
         auto ptr_dtype = SymbolicDType{};
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
+        // pre-set options on the shared symbols: the explicit-template
+        // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the
+        // same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+        ptr_dtype.set_options<int64_t>();
+        indices_dtype.set_options<int32_t, int64_t>();
+        num_indices_dtype.set_options<int64_t>();
 
-        TensorMatcher({B}).with_dtype(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_dtype(ptr_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
-        TensorMatcher({L}).with_dtype(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_dtype(indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_dtype(num_indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }

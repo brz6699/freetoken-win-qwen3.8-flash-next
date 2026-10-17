@@ -15,11 +15,6 @@
 // stored bf16 to match the GPU decode path. ISA is chosen once at construction
 // (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
-// getenv on MSVC raises C4996 (deprecation); we only read short A/B-testing knobs.
-#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
-#define _CRT_SECURE_NO_WARNINGS 1
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -34,92 +29,39 @@
 #include <thread>
 #include <vector>
 
-#include <cuda_runtime_api.h>
+#include <freetoken/hip_compat.h>
 #include <torch/extension.h>
 
-// ------------------------------ platform gates ------------------------------
-// Thread pinning: Linux uses pthread affinity, Windows uses SetThreadAffinityMask.
-// Both are load-bearing here -- one worker per *physical* core, pinned, is what
-// keeps the bandwidth-bound GEMV at peak (see the executor's bandwidth notes).
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
-#define CPU_MOE_AFFINITY_LINUX 1
-#define CPU_MOE_HAS_AFFINITY 1
-#elif defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#define CPU_MOE_AFFINITY_WIN 1
 #define CPU_MOE_HAS_AFFINITY 1
 #else
 #define CPU_MOE_HAS_AFFINITY 0
 #endif
 
+// _M_X64/_M_IX86: MSVC never defines the GCC-style __x86_64__/__i386__ macros,
+// which previously left the whole Windows/MSVC build on CPU_MOE_X86=0 -- every
+// SIMD kernel preprocessed out, executor pinned to scalar regardless of CPUID.
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h>  // __cpuidex / _xgetbv (the MSVC feature-probe path below)
+#endif
 #define CPU_MOE_X86 1
 #else
 #define CPU_MOE_X86 0
 #endif
 
-// GCC/Clang gate intrinsics behind ISA macros, so each kernel must carry a target
-// attribute to be compiled at all; that attribute is also what keeps the wide encodings
-// out of the other tiers. MSVC gates nothing -- every intrinsic compiles at the default
-// baseline, and cl only emits an encoding where the intrinsic is spelled -- so the
-// attribute is unnecessary there and expands to nothing. Both compilers therefore produce
-// one portable binary whose tier is chosen at runtime (see pick_isa). The TU must be built
-// WITHOUT /arch: on MSVC, or cl is free to hoist AVX-512 into every tier (see setup.py).
-#if defined(_MSC_VER)
+// Per-function ISA enablement. GCC/Clang raise the baseline per function via
+// target(); MSVC has no such attribute, but it compiles explicit intrinsics
+// (immintrin.h/zmmintrin.h declare AVX-512/AVXVNNI unconditionally on x64) at
+// the SSE2 TU baseline, so the emitted VEX/EVEX code pairs fine with runtime
+// dispatch by function pointer.
+#ifdef _MSC_VER
 #define CPU_MOE_TARGET(...)
 #else
 #define CPU_MOE_TARGET(...) __attribute__((target(__VA_ARGS__)))
-#endif
-
-// Runtime ISA detection. GCC/Clang expose __builtin_cpu_supports; MSVC needs CPUID.
-#if CPU_MOE_X86
-#if defined(_MSC_VER)
-#include <intrin.h>
-inline bool cpu_moe_supports(const char* f) {
-  int a[4] = {0};
-  __cpuid(a, 0);
-  const int maxleaf = a[0];
-  int i1[4] = {0}, i7_0[4] = {0}, i7_1[4] = {0};
-  if (maxleaf >= 1) __cpuidex(i1, 1, 0);
-  if (maxleaf >= 7) __cpuidex(i7_0, 7, 0);
-  if (maxleaf >= 7) __cpuidex(i7_1, 7, 1);
-  // CPUID feature bits say the silicon can; XCR0 says the OS saves/restores the register
-  // state. __builtin_cpu_supports gates on this internally, so mirror it: without the gate
-  // a host whose OS/hypervisor masked xsave state (VM, xsavedisable boot) advertises AVX
-  // in CPUID but #UDs on the first VEX/EVEX instruction -- the exact crash this runtime
-  // dispatch exists to prevent. leaf1 ECX[27] = OSXSAVE (XCR0 readable via xgetbv);
-  // XCR0 bits 1|2 = XMM|YMM state, bits 5|6|7 = opmask|ZMM_hi256|hi16_ZMM.
-  const bool osxsave = (i1[2] >> 27) & 1;
-  const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0;
-  const bool os_avx = osxsave && (xcr0 & 0x6) == 0x6;
-  const bool os_avx512 = os_avx && (xcr0 & 0xE0) == 0xE0;
-  if (!std::strcmp(f, "avx2")) return os_avx && ((i7_0[1] >> 5) & 1);          // leaf7/0 EBX[5]
-  if (!std::strcmp(f, "fma")) return os_avx && ((i1[2] >> 12) & 1);            // leaf1   ECX[12]
-  if (!std::strcmp(f, "avx512f")) return os_avx512 && ((i7_0[1] >> 16) & 1);   // leaf7/0 EBX[16]
-  if (!std::strcmp(f, "avx512bf16")) return os_avx512 && ((i7_1[0] >> 5) & 1); // leaf7/1 EAX[5]
-  if (!std::strcmp(f, "avxvnni")) return os_avx && ((i7_1[0] >> 4) & 1);       // leaf7/1 EAX[4]
-  return false;
-}
-#define CPU_MOE_SUPPORTS(f) cpu_moe_supports(f)
-#else
-#define CPU_MOE_SUPPORTS(f) __builtin_cpu_supports(f)
-#endif
-#endif  // CPU_MOE_X86
-
-// AVX-VNNI (VEX-256 VPDPBUSD) W4A8 path. _mm256_dpbusd_avx_epi32 is available on every
-// x86 compiler we build with -- on MSVC at the default baseline, on GCC/Clang under the
-// "avxvnni" target attribute -- and cpu_has_avxvnni() gates it on CPUID at runtime.
-#if CPU_MOE_X86
-#define CPU_MOE_HAS_AVXVNNI 1
 #endif
 
 namespace {
@@ -146,7 +88,15 @@ inline bf16_t f32_to_bf16(float f) {
 // MiniMax-M3): gate/up are combined jointly with the runtime alpha/limit
 // scalars, so it is handled in the do_pass1 epilogue (act_apply never sees it;
 // the mxfp4 kernel additionally fuses its own copy of the same math).
-enum ActKind { ACT_SILU = 0, ACT_GELU = 1, ACT_GELU_TANH = 2, ACT_SWIGLUOAI = 3 };
+// ACT_SWIGLU_CLAMP (GLM-5.3 "swiglu_limit") is the same clamped form WITHOUT
+// the (up + 1) bias: clamp(gate, max=lim) * sigmoid(alpha*gate) * clamp(up, +-lim).
+enum ActKind {
+  ACT_SILU = 0,
+  ACT_GELU = 1,
+  ACT_GELU_TANH = 2,
+  ACT_SWIGLUOAI = 3,
+  ACT_SWIGLU_CLAMP = 4,
+};
 
 inline float act_apply(int act, float x) {
   if (act == ACT_SILU) return x / (1.0f + std::exp(-x));
@@ -206,10 +156,7 @@ float dot_avx512f(const bf16_t* w, const bf16_t* x, int n) {
   return s;
 }
 
-// _mm512_dpbf16_ps landed in GCC 10 / clang / MSVC 19.28 (VS 2019 16.8). Note MSVC types
-// __m512bh as a union, so load_bh's memcpy -- not a reinterpret_cast -- is what makes the
-// __m512i -> __m512bh pun portable across all three.
-#if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__) || (defined(_MSC_VER) && _MSC_VER >= 1928)
+#if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
 #define CPU_MOE_HAS_AVX512BF16 1
 CPU_MOE_TARGET("avx512bf16,avx512f")
 static inline __m512bh load_bh(const bf16_t* p) {
@@ -477,7 +424,6 @@ float dot_nvfp4_avx2(const uint8_t* packed, const uint8_t* scale, float global,
 // AVX-VNNI W4A8: decode 8 packed bytes (16 nibbles) of one 16-block to int8 [lo(8),hi(8)]
 // via PSHUFB against the e2m1*2 LUT (replaces the 2 vpermps fp32 expands -- ~4x less
 // port-5 traffic). lo=even-K weights, hi=odd-K, matching the [even(8),odd(8)] act layout.
-#ifdef CPU_MOE_HAS_AVXVNNI
 CPU_MOE_TARGET("avx2,avxvnni,fma")
 inline __m128i nvfp4_decode_block_i8(const uint8_t* pk, __m128i lut) {
   __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pk));   // 8 bytes
@@ -520,7 +466,6 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
   }
   return s * (0.5f * global);
 }
-#endif  // CPU_MOE_HAS_AVXVNNI
 
 #if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
 #define CPU_MOE_HAS_AVX512VNNI 1
@@ -551,7 +496,7 @@ static int nvfp4_pf_blocks() {
 // One 4-block group (64 int8) -> scaled fp32 partial (16 lanes). Isolated as a helper so
 // the caller can run several independent chains into separate accumulators (the decode ->
 // dpbusd -> scale chain is long, so a single accumulator leaves the core latency-bound).
-__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+CPU_MOE_TARGET("avx512f,avx512bw,avx512vnni,avx2")
 static inline __m512 nvfp4_i8_grp4(const uint8_t* packed, const uint8_t* scale,
                                    const int8_t* asi8, const float* e4m3, const float* asb,
                                    int b, __m512i lut, __m512i idx, __m512i mask0F,
@@ -581,7 +526,7 @@ static inline __m512 nvfp4_i8_grp4(const uint8_t* packed, const uint8_t* scale,
   return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+CPU_MOE_TARGET("avx512f,avx512bw,avx512vnni,avx2")
 float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float global,
                               const int8_t* asi8, int K, const float* e4m3, const float* asb) {
   const __m512i lut = _mm512_broadcast_i32x4(
@@ -748,14 +693,60 @@ enum IsaTier { ISA_SCALAR = 0, ISA_AVX2 = 1, ISA_AVX512 = 2, ISA_AVX512BF16 = 3 
 // Best tier the CPU+build supports, optionally capped DOWN by
 // FREETOKEN_CPU_MOE_ISA={scalar,avx2,avx512,avx512bf16} (A/B testing on a machine
 // that supports more). FREETOKEN_CPU_MOE_SCALAR=1 forces scalar (legacy alias).
+
+// Feature probe. GCC/Clang have __builtin_cpu_supports; MSVC does not (its stub
+// resolves false for everything, which silently pinned the whole executor to the
+// scalar dot on Windows builds -- the AVX-512 kernels compiled fine but were
+// never selected). Dispatch via __cpuidex + XGETBV instead, mirroring the
+// builtins' semantics including the OS-enabled XSTATE checks.
+#ifdef _MSC_VER
+inline bool msvc_cpu_supports(const char* f) {
+  int regs[4];
+  if (!std::strcmp(f, "avx2") || !std::strcmp(f, "fma") || !std::strcmp(f, "avxvnni")) {
+    __cpuidex(regs, 7, 0);
+    if (!std::strcmp(f, "avx2") && !(regs[1] >> 5 & 1)) return false;      // EBX bit 5
+    if (!std::strcmp(f, "avxvnni") && !(regs[2] >> 11 & 1)) return false;  // ECX bit 11
+    if (!std::strcmp(f, "fma")) {
+      __cpuidex(regs, 1, 0);
+      if (!(regs[2] >> 12 & 1)) return false;
+    }
+    // VEX-encoded: need OSXSAVE + XCR0[XMM|YMM]
+    __cpuidex(regs, 1, 0);
+    if (!(regs[2] >> 27 & 1)) return false;
+    return (_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0x6) == 0x6;
+  }
+  if (!std::strcmp(f, "avx512f") || !std::strcmp(f, "avx512bf16") ||
+      !std::strcmp(f, "avx512vnni")) {
+    if (!std::strcmp(f, "avx512f")) {
+      __cpuidex(regs, 7, 0);
+      if (!(regs[1] >> 16 & 1)) return false;  // leaf 7 EBX bit 16
+    } else if (!std::strcmp(f, "avx512bf16")) {
+      __cpuidex(regs, 7, 1);                   // AVX512-BF16: subleaf 1, EAX bit 22
+      if (!(regs[0] >> 22 & 1)) return false;
+    } else {
+      __cpuidex(regs, 7, 0);
+      if (!(regs[2] >> 11 & 1)) return false;  // AVX512-VNNI: leaf 7 ECX bit 11
+    }
+    __cpuidex(regs, 1, 0);
+    if (!(regs[2] >> 27 & 1)) return false;    // OSXSAVE
+    // opmask | ZMM_Hi256 | Hi16_ZMM on top of XMM|YMM
+    return (_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0xE6) == 0xE6;
+  }
+  return false;
+}
+#define CPU_MOE_CPU_SUPPORTS(f) msvc_cpu_supports(f)
+#else
+#define CPU_MOE_CPU_SUPPORTS(f) __builtin_cpu_supports(f)
+#endif
+
 inline IsaTier pick_isa() {
 #if CPU_MOE_X86
   if (getenv("FREETOKEN_CPU_MOE_SCALAR")) return ISA_SCALAR;
   IsaTier best = ISA_SCALAR;
-  if (CPU_MOE_SUPPORTS("avx2") && CPU_MOE_SUPPORTS("fma")) best = ISA_AVX2;
-  if (best >= ISA_AVX2 && CPU_MOE_SUPPORTS("avx512f")) best = ISA_AVX512;
+  if (CPU_MOE_CPU_SUPPORTS("avx2") && CPU_MOE_CPU_SUPPORTS("fma")) best = ISA_AVX2;
+  if (best >= ISA_AVX2 && CPU_MOE_CPU_SUPPORTS("avx512f")) best = ISA_AVX512;
 #ifdef CPU_MOE_HAS_AVX512BF16
-  if (best >= ISA_AVX512 && CPU_MOE_SUPPORTS("avx512bf16")) best = ISA_AVX512BF16;
+  if (best >= ISA_AVX512 && CPU_MOE_CPU_SUPPORTS("avx512bf16")) best = ISA_AVX512BF16;
 #endif
   if (const char* f = getenv("FREETOKEN_CPU_MOE_ISA")) {
     IsaTier want = best;
@@ -797,10 +788,10 @@ nvdot_fn select_nvdot() {
 // AVX-VNNI (VEX-256 VPDPBUSD) availability: Alder/Raptor Lake, Sapphire Rapids+, Zen5.
 // Distinct from AVX-512 VNNI. Opt out with FREETOKEN_CPU_MOE_NO_VNNI=1 (A/B the W4A8 path).
 inline bool cpu_has_avxvnni() {
-#ifdef CPU_MOE_HAS_AVXVNNI
+#if CPU_MOE_X86
   const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
   if (no && no[0] && no[0] != '0') return false;  // ignore unset/empty/"0"
-  return CPU_MOE_SUPPORTS("avx2") && CPU_MOE_SUPPORTS("avxvnni");
+  return CPU_MOE_CPU_SUPPORTS("avx2") && CPU_MOE_CPU_SUPPORTS("avxvnni");
 #else
   return false;
 #endif
@@ -817,7 +808,7 @@ inline bool cpu_has_avx512vnni() {
   if (no && no[0] && no[0] != '0') return false;
   const char* no_vnni = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
   if (no_vnni && no_vnni[0] && no_vnni[0] != '0') return false;
-  return __builtin_cpu_supports("avx512vnni");
+  return CPU_MOE_CPU_SUPPORTS("avx512vnni");
 #else
   return false;
 #endif
@@ -826,7 +817,7 @@ inline bool cpu_has_avx512vnni() {
 // Best W4A8 (int8-activation) nvfp4 dot, or nullptr if no SIMD VNNI (caller keeps the
 // faithful fp32 nvdot path). The scalar i8 dot exists only as a correctness reference.
 nvi8dot_fn select_nvi8dot() {
-#ifdef CPU_MOE_HAS_AVXVNNI
+#if CPU_MOE_X86
 #if defined(CPU_MOE_HAS_AVX512VNNI)
   if (cpu_has_avx512vnni()) return dot_nvfp4_i8_avx512vnni;
 #endif
@@ -1254,7 +1245,6 @@ float q4_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int
   return hsum256(accF);
 }
 
-#ifdef CPU_MOE_HAS_AVXVNNI
 // AVX-VNNI W4A8: one VPDPBUSD per block (the fast path on modern CPUs).
 CPU_MOE_TARGET("avx2,avxvnni,fma,f16c")
 float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
@@ -1278,7 +1268,6 @@ float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int
   }
   return hsum256(accF);
 }
-#endif  // CPU_MOE_HAS_AVXVNNI
 #endif  // CPU_MOE_X86
 
 // All tiers are W4A8 (int8 activations pre-quantized to Q8_0). AVX-VNNI is orthogonal to
@@ -1287,9 +1276,7 @@ float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int
 q4dot_fn select_q4dot() {
   const IsaTier t = pick_isa();
 #if CPU_MOE_X86
-#ifdef CPU_MOE_HAS_AVXVNNI
   if (cpu_has_avxvnni()) return q4_0_dot_i8_vnni;
-#endif
   if (t >= ISA_AVX2) return q4_0_dot_i8_avx2;
 #endif
   (void)t;
@@ -1604,16 +1591,10 @@ struct CpuMoeExecutor {
 #if CPU_MOE_HAS_AFFINITY
     if (core_ids.empty()) return;
     const int cpu = core_ids[tid % static_cast<int>(core_ids.size())];
-#if defined(CPU_MOE_AFFINITY_LINUX)
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-#elif defined(CPU_MOE_AFFINITY_WIN)
-    // Single processor group (<= 64 logical CPUs); one worker per physical core.
-    if (cpu >= 0 && cpu < 64)
-      SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << cpu);
-#endif
 #else
     (void)tid;
 #endif
@@ -1694,7 +1675,8 @@ struct CpuMoeExecutor {
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
-    const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
+    const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
@@ -1702,14 +1684,15 @@ struct CpuMoeExecutor {
           gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
                            xe, xo, xi8, xas) * w_in;
-      if (swigluoai) {
-        // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + 1)
-        // -- same math as the mxfp4 kernel's fused epilogue (lim == +inf: no clamp).
+      if (clamped) {
+        // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
+        // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
+        // (GLM-5.3) does not. lim == +inf: no clamp.
         if (gate > lim) gate = lim;
         if (up > lim) up = lim;
         else if (up < -lim) up = -lim;
         const float glu = gate / (1.0f + std::exp(-gate * alpha));
-        g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+        g_row[i] = f32_to_bf16(glu * (up + up_bias));
       } else {
         g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
       }
@@ -1948,15 +1931,6 @@ struct CpuMoeExecutor {
 
   void worker_loop(int tid) {
     pin_self(tid);
-#if defined(CPU_MOE_AFFINITY_WIN)
-    // Opt out of EcoQoS: Win11 otherwise throttles/parks pinned worker threads.
-    const char* eco = getenv("FREETOKEN_MOE_ECOQOS_OPTOUT");
-    if (!eco || *eco != '0') {
-      THREAD_POWER_THROTTLING_STATE tp{THREAD_POWER_THROTTLING_CURRENT_VERSION,
-                                       THREAD_POWER_THROTTLING_EXECUTION_SPEED, 0};
-      SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &tp, sizeof(tp));
-    }
-#endif
     uint64_t my_gen = 0;
     for (;;) {
       MoeTask* t;
@@ -2095,16 +2069,10 @@ struct CpuMoeExecutor {
     coord_thread = std::thread([this, pin_core] {
 #if CPU_MOE_HAS_AFFINITY
       if (pin_core >= 0) {
-#if defined(CPU_MOE_AFFINITY_LINUX)
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(pin_core, &set);
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-#elif defined(CPU_MOE_AFFINITY_WIN)
-        // Single processor group (<= 64 logical CPUs) -- same rule as pin_self.
-        if (pin_core < 64)
-          SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << pin_core);
-#endif
       }
 #endif
       coordinator_loop();
@@ -2251,5 +2219,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // accepts id 3 without error and silently computes the wrong activation
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
-  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
 }

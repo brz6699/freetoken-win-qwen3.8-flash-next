@@ -150,7 +150,7 @@ class CheckpointManager:
         cancel-during-spawn path)."""
         osproc.signal_group(child.pid, signal.SIGTERM)
         if not child.reaped.wait(timeout=self._grace_s):
-            osproc.signal_group(child.pid, signal.SIGKILL)
+            osproc.signal_group(child.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
     def status(self) -> dict:
         with self._lock:

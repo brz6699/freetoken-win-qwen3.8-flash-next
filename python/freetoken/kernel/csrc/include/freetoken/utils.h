@@ -1,5 +1,12 @@
 #pragma once
 
+// MSVC (Windows) does not recognize the GCC/Clang `__always_inline` spelling that the 0.1.3
+// kernels use; map it to the nvcc `__forceinline__` spelling (the one 0.1.2 used, which compiles
+// on Windows). All usages are `__device__` (nvcc device path), so the nvcc spelling is correct.
+#if defined(_WIN32) && !defined(__always_inline)
+#define __always_inline __forceinline__
+#endif
+
 // ref:
 // https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__

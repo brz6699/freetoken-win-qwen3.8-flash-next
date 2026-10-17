@@ -88,7 +88,7 @@ def main() -> int:
     cm._tier_store(req1)
     check("store.entry", len(cm._mm_tier) == 1)
     digest = cm._tier_digest(key)
-    ekey, rows, gdn, b_e, nbytes = cm._mm_tier[digest]
+    ekey, rows, gdn, b_e, nbytes, _tx = cm._mm_tier[digest]
     check("store.boundary", b_e == B and nbytes > 0, f"b={b_e} bytes={nbytes}")
     check("store.bytes", cm._mm_tier_bytes == nbytes, f"{cm._mm_tier_bytes} vs {nbytes}")
     check("store.gdn", gdn is not None and torch.equal(gdn[0], torch.full_like(gdn[0], 7.0)))
@@ -180,6 +180,124 @@ def main() -> int:
     cm._tier_store(req1)
     check("evict.lru", len(cm._mm_tier) == 1 and cm._tier_digest(key2) in cm._mm_tier
           and cm._mm_tier_bytes <= cm._mm_tier_cap)
+
+    # ---------------- text tier (park on finish / prefix-match restore) ----------
+    from freetoken.kvcache.radix_cache import RadixCacheHandle  # noqa: F811
+    cm_t = CacheManager(
+        num_pages=8, page_size=PAGE, page_table=torch.zeros(2, 32, dtype=torch.int32),
+        type="radix", kv_pool=pool,
+    )
+    treq = type("R", (), {})()
+    t_ids = torch.arange(100, 112, dtype=torch.int32)  # 12-token prompt, b = align_down(12, 4)
+    treq.mm_cache_key, treq.mm_embeds = None, None
+    treq.input_ids, treq.max_device_len, treq.output_len = t_ids, 20, 8
+    treq.mamba_last_track_seqlen, treq.mamba_ping_pong, treq.mamba_next_track_idx = None, None, 0
+    treq.linear_slot_idx, treq.table_idx, treq.cached_len = None, 0, 12
+    cm_t._tier_store(treq)
+    check("text.store", len(cm_t._mm_tier) == 1, f"n={len(cm_t._mm_tier)} b={cm_t._mm_tier_bytes}")
+
+    def _t0(mgr):
+        return _MR(mgr.prefix_cache.match_prefix(torch.arange(100, 101, dtype=torch.int32)).cuda_handle)
+
+    tp = PendingReq.__new__(PendingReq)
+    tp.input_ids = torch.cat([t_ids, torch.arange(120, 128, dtype=torch.int32)])  # grown history
+    tp.mm_embeds, tp.mm_cache_key, tp.mm_gdn = None, None, None
+    mr_t = cm_t.restore_mm(tp, _t0(cm_t))
+    check("text.restore_prefix", mr_t.cuda_handle.cached_len == 12, str(mr_t.cuda_handle.cached_len))
+
+    # turn 3: history grows again -- the SAME parked window still matches the head
+    tp2 = PendingReq.__new__(PendingReq)
+    tp2.input_ids = torch.cat([tp.input_ids, torch.arange(130, 138, dtype=torch.int32)])
+    tp2.mm_embeds, tp2.mm_cache_key, tp2.mm_gdn = None, None, None
+    mr_t2 = cm_t.restore_mm(tp2, _t0(cm_t))
+    check("text.grow_history", mr_t2.cuda_handle.cached_len == 12)
+
+    # different conversation head -> no false match
+    tp3 = PendingReq.__new__(PendingReq)
+    tp3.input_ids = torch.cat([torch.arange(200, 208, dtype=torch.int32), t_ids])
+    tp3.mm_embeds, tp3.mm_cache_key, tp3.mm_gdn = None, None, None
+    mr_t3 = cm_t.restore_mm(tp3, _t0(cm_t))
+    check("text.no_false_match", mr_t3.cuda_handle.cached_len == 0)
+
+    # budget-slide rebuild: the RAM tier survives (rows are geometry-independent), tree wipes
+    cm_t.rebuild(8, torch.zeros(2, 32, dtype=torch.int32))
+    check("text.tier_survives_rebuild", len(cm_t._mm_tier) == 1)
+    tp.mm_gdn = None
+    mr_t4 = cm_t.restore_mm(tp, _t0(cm_t))
+    check("text.restore_after_rebuild", mr_t4.cuda_handle.cached_len == 12)
+
+    # ---------------- hybrid chunked-prefill tier fallback (last_committed_boundary) ----
+    # A 13-token prompt, prefill chunked at 8 (page-aligned xCHUNK boundary). The commit
+    # consumes mamba_last_track_seqlen, so at finish neither the pending-track branch nor
+    # the page-aligned live-slot branch fires (13 % 4 != 0) -- the tier must park at the
+    # deepest committed boundary (8) or the agent's next turn re-prefills cold after every
+    # rebuild wipe. Dedicated manager: the commit inserts into ITS tree (tree match is 0,
+    # mirroring a just-wiped tree, so the tier entry must beat the tree to be visible).
+    pool2 = QSAKVCache(
+        num_kv_heads=2, num_layers=2, head_dim=32, num_pages=8, page_size=PAGE,
+        dtype=torch.float16, device=dev, index_head_dim=4, num_index_layers=1,
+        index_ratio=2, num_req_slots=2, kv_dtype=torch.uint8, kv_quant="turbo4",
+    )
+    pool2._kv_buffer.copy_(torch.arange(pool2._kv_buffer.numel(), dtype=torch.float16).view_as(pool2._kv_buffer))
+    lsp2 = LinearStatePool(
+        group, num_slots=4, dtype=torch.float32, device=dev, tp_size=1,
+        slot_states=(SlotStateSpec(name="anchor", shape=(3,), layer_ids=(0,), fill_value=-1.0),),
+    )
+    pt2 = torch.zeros(2, 32, dtype=torch.int32)
+    cm2 = CacheManager(
+        num_pages=8, page_size=PAGE, page_table=pt2, type="hybrid_radix",
+        linear_state_pool=lsp2, kv_pool=pool2,
+    )
+    c_ids = torch.arange(500, 513, dtype=torch.int32)  # 13 tokens, unaligned prompt end
+    # Original prompt lives in slots 4..16 so the restore below lands on DIFFERENT slots.
+    pt2[0, :13] = torch.arange(4, 4 + 13, dtype=torch.int32)
+    c_src = lsp2.alloc(1)[0]
+    lsp2.conv_states[:, c_src] = 5.0
+    lsp2.recurrent_states[:, c_src] = 6.0
+    lsp2.slot_states["anchor"][:, c_src] = 1.0
+    c_live = lsp2.alloc(1)[0]
+    cm2.free_slots = torch.tensor([0, 20, 24, 28], dtype=torch.int32)
+    creq = type("R", (), {})()
+    creq.input_ids, creq.mm_cache_key, creq.mm_embeds = c_ids, None, None
+    creq.cached_len, creq.max_device_len, creq.output_len = 13, 17, 4  # prompt_len = 13
+    creq.mamba_last_track_seqlen = 8
+    creq.mamba_ping_pong, creq.mamba_next_track_idx = (c_src, c_src), 0
+    creq.linear_slot_idx, creq.table_idx = c_live, 0
+    creq.last_committed_boundary = None
+    creq.cache_handle = HybridCacheHandle(0, cm2.prefix_cache.root, torch.empty(0, dtype=torch.int32))
+    cm2._cache_req_hybrid(creq, finished=False)  # chunk commit at 8
+    check("chunk.commit_boundary", creq.last_committed_boundary is not None
+          and creq.last_committed_boundary[0] == 8, str(creq.last_committed_boundary))
+    check("chunk.seqlen_consumed", creq.mamba_last_track_seqlen is None)
+    creq.cached_len = 13  # prompt end after the tail of the chunk
+    cm2._cache_req_hybrid(creq, finished=True)   # finish -> _tier_store fallback
+    check("chunk.tier_parked", len(cm2._mm_tier) == 1, f"n={len(cm2._mm_tier)}")
+    cekey, crows, cgdn, cb, cnb, _tx = cm2._mm_tier[cm2._mm_tier and next(iter(cm2._mm_tier))]
+    check("chunk.tier_b", cb == 8, f"b={cb}")
+    check("chunk.tier_gdn", cgdn is not None and torch.equal(cgdn[0], torch.full_like(cgdn[0], 5.0)))
+    cm2.free_slots = torch.tensor([0, 20, 24, 28], dtype=torch.int32)
+    cpend = PendingReq.__new__(PendingReq)
+    cpend.input_ids = torch.cat([c_ids, torch.arange(513, 519, dtype=torch.int32)])  # grown history
+    cpend.mm_embeds, cpend.mm_cache_key, cpend.mm_gdn = None, None, None
+    cmr = cm2.restore_mm(cpend, _MR(HybridCacheHandle(0, cm2.prefix_cache.root, torch.empty(0, dtype=torch.int32))))
+    ch = cmr.cuda_handle
+    check("chunk.restore_b", ch.cached_len == 8, str(ch.cached_len))
+    check("chunk.restore_gdn_host", cmr.gdn_host is not None and torch.equal(cmr.gdn_host[0], cgdn[0]))
+    cmatched = ch.get_matched_indices()
+    ckv64 = pool2._kv_buffer.view(pool2._kv_buffer.shape[1] * 2, pool2._kv_buffer.shape[2] * pool2._kv_buffer.shape[3], -1)
+    check("chunk.restore_rows", torch.equal(
+        ckv64[:, cmatched.to(torch.int64)], ckv64[:, torch.arange(4, 12, dtype=torch.int64)]))
+    # prompt end had aligned to a page and no chunk crossed a boundary -> no committed
+    # boundary, no track, unaligned... but page-aligned live slot still parks (regression guard).
+    creq2 = type("R", (), {})()
+    creq2.input_ids = c_ids[:12]
+    creq2.mm_cache_key, creq2.mm_embeds = None, None
+    creq2.cached_len, creq2.max_device_len, creq2.output_len = 12, 16, 4
+    creq2.mamba_last_track_seqlen, creq2.mamba_ping_pong, creq2.mamba_next_track_idx = None, None, 0
+    creq2.linear_slot_idx, creq2.table_idx = c_live, 0
+    creq2.last_committed_boundary = None
+    cm2._tier_store(creq2)  # page-aligned live-slot branch parks; no commit needed to test it
+    check("chunk.live_slot_parks", len(cm2._mm_tier) == 2)
 
     print()
     if FAIL:

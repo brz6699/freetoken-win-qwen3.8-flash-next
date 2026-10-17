@@ -37,11 +37,14 @@ class HybridSWAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         num_swa_tokens: int | None = None,
+        arena: torch.Tensor | None = None,
     ) -> None:
         specs = {group.name: group for group in groups if group.num_layers > 0}
         if set(specs) != {"full", "swa"}:
             raise ValueError(f"HybridSWAKVCache requires full and swa groups, got {sorted(specs)}")
 
+        self._arena = arena
+        self._arena_next = 0
         self._num_layers = num_layers
         self._device = device
         self._dtype = dtype
@@ -80,8 +83,27 @@ class HybridSWAKVCache(BaseKVCachePool):
         if self._swa_paged:
             self._init_swa_paged_state()
 
-    @staticmethod
+    def _arena_alloc(self, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        # Left-anchor carve from the shared cache arena (same protocol as MHAKVCache):
+        # resize is offset math, no free/realloc cycle. 16B alignment keeps vectorized
+        # store kernels valid; the assert catches arena overcommit at boot.
+        if self._arena is None:
+            return torch.empty(shape, dtype=dtype, device=device)
+        elem_size = torch.empty(0, dtype=dtype).element_size()
+        numel = 1
+        for d in shape:
+            numel *= int(d)
+        nbytes = numel * elem_size
+        off = (self._arena_next + 15) & ~15
+        assert off + nbytes <= self._arena.numel(), (
+            f"cache arena overcommit: need {off + nbytes} B, arena has {self._arena.numel()} B"
+        )
+        view = self._arena.narrow(0, off, nbytes).view(dtype).view(shape)
+        self._arena_next = off + nbytes
+        return view
+
     def _allocate_group(
+        self,
         spec: KVCacheGroupSpec,
         tp_size: int,
         outer_size: int,
@@ -90,10 +112,10 @@ class HybridSWAKVCache(BaseKVCachePool):
         device: torch.device,
     ) -> _KVGroupStorage:
         local_kv_heads = div_even(spec.num_kv_heads, tp_size, allow_replicate=True)
-        buffer = torch.empty(
+        buffer = self._arena_alloc(
             (2, spec.num_layers, outer_size, inner_size, local_kv_heads, spec.head_dim),
-            device=device,
-            dtype=dtype,
+            dtype,
+            device,
         )
         return _KVGroupStorage(
             buffer=buffer,
@@ -249,14 +271,11 @@ class HybridSWAKVCache(BaseKVCachePool):
         _, num_layers, _old_outer, _old_inner, local_kv_heads, head_dim = group.buffer.shape
         return (num_layers, local_kv_heads, head_dim, group.buffer.device, group.buffer.dtype)
 
-    @staticmethod
-    def _alloc_group(geom: tuple, outer_size: int, inner_size: int) -> _KVGroupStorage:
+    def _alloc_group(self, geom: tuple, outer_size: int, inner_size: int) -> _KVGroupStorage:
         # Only the outer (page/token) dimension changes; the rest comes from ``geom``.
         num_layers, local_kv_heads, head_dim, device, dtype = geom
-        buffer = torch.empty(
-            (2, num_layers, outer_size, inner_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        buffer = self._arena_alloc(
+            (2, num_layers, outer_size, inner_size, local_kv_heads, head_dim), dtype, device
         )
         return _KVGroupStorage(
             buffer=buffer,
@@ -274,6 +293,10 @@ class HybridSWAKVCache(BaseKVCachePool):
         page_size = self.full_kv_pool.buffer.shape[3]
         self._full_num_tokens = num_full_pages * page_size
         self._swa_num_tokens = num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
+        # Arena mode: re-carve from the left anchor. Old views share the arena storage (kept
+        # alive by self._arena), so the shrink path is pure offset math -- the drop/sync below
+        # only matters on the plain-allocation fallback.
+        self._arena_next = 0
         # Capture geometry, then DROP all references to the old buffers before allocating
         # the replacements so empty_cache() can actually reclaim them. Otherwise the old
         # and new KV buffers are live simultaneously and the rebuild can OOM even when the
