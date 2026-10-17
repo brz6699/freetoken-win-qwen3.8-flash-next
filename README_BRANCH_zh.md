@@ -2,7 +2,7 @@
 
 English version: [README.md](README.md).
 
-基于 [FreeToken](https://github.com/FlashML-org/FreeToken)(基线 `0.1.2+g816c324d0`,上游 main `58f4b9e`)的补丁分支,针对 **一张消费级 GPU + 大容量系统内存** 调优——例如 RTX 5090 32 GiB 配 ~254 GiB RAM——通过 OpenAI-/Anthropic-兼容 HTTP API 服务大型 MoE checkpoint。上游 Apache-2.0 LICENSE 保留;详见 [Provenance](#provenance)。
+基于 [FreeToken](https://github.com/FlashML-org/FreeToken)(上游 main `58f4b9e`,packaged `__version__ = "0.1.3"`)的补丁分支,针对 **一张消费级 GPU + 大容量系统内存** 调优——例如 RTX 5090 32 GiB 配 ~254 GiB RAM——通过 OpenAI-/Anthropic-兼容 HTTP API 服务大型 MoE checkpoint。上游 Apache-2.0 LICENSE 保留;详见 [Provenance](#provenance)。
 
 下面这些功能是一个接一个堆起来的——每一条都是在前一条工作上跑起来之后才暴露出来的下一层问题。从左到右读可以看到推理链,只想查参数也可以直接跳到对应小节。
 
@@ -56,17 +56,17 @@ Stage A 把 1M profile 跑起来了。下一个问题:流量组合在几小时�
 
 **(2)** `engine/budget_slide.py` 加 `BudgetSlider` 类,在 idle transition 重分配 KV pages ↔ MoE slots。Asymmetric EMA:α 上升时高(burst 期间不要欠配),下降时低(load 回落时不要 pingpong)。`min_step_ratio` deadband 忽略阈值以下抖动;`demand_floor` 防 shrink-only 跌破下一请求 working set。`mha_pool.rebuild` / `OffloadMoeCache.rebuild` 切视图自 arena left end;base pointer 不动,CUDA graph 仍有效。只在 idle transition 触发——唯一同时没有 live page-index 引用也没有 in-flight graph replay 的时刻。Preserve-residency:已 pinned experts 不动。
 
-**(3)** bs=4 mixed-decode aggregate 跨 round 稳 ~104 tok/s;bs=8 ~187/~193 tok/s;bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling。Rebuild 节奏:burst 时每几条请求一次,idle ~每分钟一次。`budget_slide_test.py` 全绿。
+**(3)** bs=4 mixed-decode aggregate 跨 round 稳 ~104 tok/s;bs=8 ~187/~193 tok/s;bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling。Rebuild 节奏:burst 时每几条请求一次,idle ~每分钟一次。`tests/test_budget_slide.py` 与 `tests/test_budget_slide_wiring.py` 全绿。
 
 ---
 
 ### 4. Verify 阶段统计排除(从 hot-expert LRU)
 
-**(1)** BudgetSlider 让 pool sizes 跟上 live demand 之后,signal 质量本身重要了。Hot-expert LRU 由 `OffloadMoeCache` 链上的 hit/miss 计数驱动——同一链 MTP verify 也用。MTP verify batch 携带 K+1-row 分布,与 decode-phase routing 不同。混入 hot-expert LRU 会晋升只有 verify 用得上的 expert,踢掉真实 decode working set——BudgetSlider 紧接着把这被污染的计数当作 demand signal 读。上游 recurrence-window admission 没区分 verify 与 decode 阶段。
+**(1)** BudgetSlider 让 pool sizes 跟上 live demand 之后,signal 质量本身重要了。Hot-expert LRU 由 cache 实例上的 hit/miss histogram 驱动。这套 histogram 在 cuda graph capture 时被烘进 graph 节点——如果 capture 时 histogram 还在累加,那 graph replay 期间 routing 改变不会反映到 histogram 上(只反映到 cuda-graph 节点重跑的 stats kernel)。Stats 收集开关需要在 capture 之前定下来,否则 verify-vs-decode 阶段的 routing 差异会把 noise 烘进 graph,后续 replay 解不开。上游 recurrence-window admission(`expert_recency`)解决了 first-sighting fetch gating,但没处理 stats 收集本身。
 
-**(2)** `MtpExpertBank` 与 `OffloadMoeCache` 链(`load_experts` / `ensure_experts` / `ensure_experts_hybrid` / `prefetch_decode_layer`)透传 `record_stats: bool` kwarg,由 scheduler 中 `ctx.batch.moe_force_decode` 决定取值。Verify admission 更新 hit/miss 计数,**不**晋升 LRU。Decode admission 两者都做。
+**(2)** `OffloadMoeCache.collect_stats` 是 cache 实例上的 boolean attribute,在 engine init 一次性从 `config.moe_collect_stats` 设(`engine/engine.py:830`)。每个 MoE call site(`models/deepseek_v4/moe.py`、`layers/moe.py`)在调用 stats recorder 之前检查 `cache.collect_stats`,为 true 时才调 `cache.record_decode_stats(layer_id)` 或 `cache.record_decode_stats_hybrid(layer_id)`。关闭时 `ensure_experts_hybrid` 仍晋升 LRU 但跳过 per-layer histogram 累加,cuda graph capture 走 no-stats 路径,verify-vs-decode 阶段差异不再被烘进 graph。配合上游 `expert_recency` recurrence-window admission 一起用,first-sighting miss 走 CPU 算不污染 hot-tier 计数。
 
-**(3)** Expert residency 跟随真实 decode demand,不被 verify-phase 噪声拉偏。bs=8 mixed-decode aggregate ~187/~193 tok/s 跨 round;bs=4→bs=8 scaling ×1.85——PCIe BW ceiling 之内,无 LRU-thrash 凹陷。
+**(3)** Expert residency 跟随真实 decode demand,verify-phase 噪声不进 graph。bs=8 mixed-decode aggregate ~187/~193 tok/s 跨 round;bs=4→bs=8 scaling ×1.85——PCIe BW ceiling 之内,无 LRU-thrash 凹陷。
 
 ---
 
@@ -167,7 +167,7 @@ python <launcher>.py `
   --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 1048576 --moe-cache-size 2048 `
   --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
-  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
+  --quant-backend moe.nvfp4=b12x `
   --max-running-req 4 `
   --host 0.0.0.0 --port 8001
 ```
@@ -181,8 +181,8 @@ python <launcher>.py `
   --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 65536 --moe-cache-size 1024 `
   --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
-  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
-  --cuda-graph-max-bs 1 --mtp-expert-quant q4_0 --text-model-only `
+  --quant-backend moe.nvfp4=b12x `
+  --cuda-graph-max-bs 1 --text-model-only `
   --host 0.0.0.0 --port 8001
 ```
 
@@ -196,8 +196,6 @@ Flags worth understanding:
 - `--text-model-only` — skip all encoder towers;它们的 VRAM 给 KV / expert caches。只想 skip certain kinds 用 `--mm-disable vision audio`。Vision / audio towers 默认 load,disabled 时 clean skip。上游已提供 flags。
 - `--moe-prefill-hit-d2d` — prefill expert hits 走 device-to-device copies。上游已提供。
 - `--cuda-graph-max-bs N` — CUDA-graph ladder cap;bs=1-dominated 设 1,共享 mempool 下 bs=4 burst slot 加 `4`。上游已提供 flag。
-- `--moe-prefill-demand-tokens` — demand-prefill chunk-row threshold;默认 `64` 适配 cached-prefix incremental prefill。上游已提供 flag。
-- `--mtp-expert-quant q4_0` — shrink the MTP draft expert bank to q4_0,让 verify peak fit inside tight VRAM。配合 `--mtp-device gpu` 才真启 MTP;本分支默认 off(见 §4)。
 - `--disable-budget-slide` — opt-out of BudgetSlider(§3),freeze KV/MoE pool sizes from startup。Workload single-model fixed-footprint、想让 CUDA-graph captures pin to stable addresses 时用。
 
 ## Requirements & install
@@ -214,18 +212,19 @@ ft-venv\Scripts\pip install .
 
 ## Verification suite
 
-| script | covers |
-|---|---|
-| `p4_splice_test.py` | mm splice invariant (pad-span alignment, COW no-op) — 21 cases |
-| `p4_finish_key_test.py` | finish-key + SWA regression legs |
-| `p4_content_key_test.py` | content-hash prefix keys (reuse / isolation) |
-| `mm_prefill_chunk_test.py` | whole-segment mm prefill rollback |
-| `r4_adv_probe.py` | adversarial fuzz:`page_size ∈ {1,4,8}` × shapes × rounds + cross-span gaps + page ownership |
-| `kv_tier_test.py` | RAM-tier KV swap-in/out round-trip |
-| `budget_slide_test.py` | runtime KV/expert pool resize without restart |
-| `serve_video_smoke.py`, `vision_video_test.py`, `vision_p3_media_test.py` | end-to-end vision/media requests |
+| script | covers | location |
+|---|---|---|
+| `p4_splice_test.py` | mm splice invariant (pad-span alignment, COW no-op) — 21 cases | `verification/` |
+| `p4_finish_key_test.py` | finish-key + SWA regression legs | `verification/` |
+| `p4_content_key_test.py` | content-hash prefix keys (reuse / isolation) | `verification/` |
+| `mm_prefill_chunk_test.py` | whole-segment mm prefill rollback | `verification/` |
+| `r4_adv_probe.py` | adversarial fuzz:`page_size ∈ {1,4,8}` × shapes × rounds + cross-span gaps + page ownership | `verification/` |
+| `kv_tier_test.py` | RAM-tier KV swap-in/out round-trip | `verification/` |
+| `serve_video_smoke.py`, `vision_video_test.py`, `vision_p3_media_test.py` | end-to-end vision/media requests | `verification/` |
+| `test_budget_slide.py`, `test_budget_slide_wiring.py` | runtime KV/expert pool resize without restart;wiring smoke | `tests/` |
+| `tests/moe/test_decode_prefetch_gate.py` | bs≥4 prefetch gate | `tests/moe/` |
 
-Package root + venv Python:`python verification/p4_splice_test.py`。
+`verification/` 下脚本独立可跑,从 package root + venv Python:`python verification/p4_splice_test.py`。`tests/` 下走 pytest:`pytest tests/test_budget_slide.py tests/moe/test_decode_prefetch_gate.py`。
 
 ## Environment variables
 
@@ -239,4 +238,4 @@ Package root + venv Python:`python verification/p4_splice_test.py`。
 
 <a name="provenance"></a>
 
-Derived from upstream FreeToken commit `58f4b9e`(release `0.1.2+g816c324d0`)。Upstream PRs merged in:#377、#375、#343、#336、#332、#329、#319、#311、#310、#257、#243,加基础的 #1 / #2 / #3 / #4 / #5 / #6 / #7 / #25 / #75 / #117。Kernel-cache wheel unchanged from upstream。Upstream LICENSE(Apache-2.0)和 copyright preserved in `package/`。第三方 checkpoint Qwen3.8-Flash-Next-ABLITERATED-NVFP4 runtime 从其 HF hub 下载,不属于本 repo。
+Derived from upstream FreeToken commit `58f4b9e`(packaged `__version__ = "0.1.3"`)。Upstream PRs merged in:#377、#375、#343、#336、#332、#329、#319、#311、#310、#257、#243,加基础的 #1 / #2 / #3 / #4 / #5 / #6 / #7 / #25 / #75 / #112 / #117。Kernel-cache wheel unchanged from upstream。Upstream LICENSE(Apache-2.0)和 copyright preserved in `package/`。第三方 checkpoint Qwen3.8-Flash-Next-ABLITERATED-NVFP4 runtime 从其 HF hub 下载,不属于本 repo。

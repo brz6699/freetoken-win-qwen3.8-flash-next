@@ -2,7 +2,7 @@
 
 Chinese version: [README.md](README_BRANCH_zh.md).
 
-A patched branch of [FreeToken](https://github.com/FlashML-org/FreeToken) (base `0.1.2+g816c324d0`, upstream main `58f4b9e`) tuned for **one consumer GPU + lots of system RAM** — e.g. RTX 5090 32 GB with ~254 GiB RAM — serving large MoE checkpoints through an OpenAI-/Anthropic-compatible HTTP API. Upstream Apache-2.0 LICENSE preserved; see [Provenance](#provenance).
+A patched branch of [FreeToken](https://github.com/FlashML-org/FreeToken) (upstream main `58f4b9e`, packaged `__version__ = "0.1.3"`) tuned for **one consumer GPU + lots of system RAM** — e.g. RTX 5090 32 GB with ~254 GiB RAM — serving large MoE checkpoints through an OpenAI-/Anthropic-compatible HTTP API. Upstream Apache-2.0 LICENSE preserved; see [Provenance](#provenance).
 
 The features below stack on each other; each was discovered while making the previous one work on this stack. Read left-to-right if you want the reasoning chain, jump to one if you only need the parameter.
 
@@ -56,7 +56,7 @@ Stage A makes 1M-token profile fit on this card. Once it's running, the next iss
 
 **(2)** `engine/budget_slide.py` adds a `BudgetSlider` class that re-derives KV pages ↔ MoE slots at idle transitions. Asymmetric EMA: α high on rise (avoid under-provision during bursts), low on fall (avoid ping-pong when load drops). `min_step_ratio` deadband ignores sub-threshold wobble; `demand_floor` keeps shrink-only above next-request working set. `mha_pool.rebuild` / `OffloadMoeCache.rebuild` re-slice views from arena left end; base pointer never moves, CUDA graphs stay valid. Fires only at idle transitions — the only moment with both no live page-index references and no in-flight graph replay. Preserve-residency: pinned experts stay pinned.
 
-**(3)** bs=4 mixed-decode aggregate steady ~104 tok/s cross rounds; bs=8 ~187/~193 tok/s; bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling. Rebuild cadence observed: every few requests during bursts, every ~minute when idle. `budget_slide_test.py` green.
+**(3)** bs=4 mixed-decode aggregate steady ~104 tok/s cross rounds; bs=8 ~187/~193 tok/s; bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling. Rebuild cadence observed: every few requests during bursts, every ~minute when idle. `tests/test_budget_slide.py` and `tests/test_budget_slide_wiring.py` green.
 
 ---
 
@@ -64,7 +64,7 @@ Stage A makes 1M-token profile fit on this card. Once it's running, the next iss
 
 **(1)** With BudgetSlider keeping pool sizes matched to live demand, the slider's signal quality now matters. The hot-expert LRU is driven by hit/miss counts from the same `OffloadMoeCache` chain that MTP verify uses. MTP verify batch carries a K+1-row distribution that differs from decode-phase routing. Mixing those counts into hot-expert LRU promotes experts that only verify needs, evicting real decode working set — and the BudgetSlider then reads that contaminated count as the demand signal. Upstream's recurrence-window admission doesn't separate verify from decode phases.
 
-**(2)** `MtpExpertBank` and the `OffloadMoeCache` chain (`load_experts` / `ensure_experts` / `ensure_experts_hybrid` / `prefetch_decode_layer`) thread a `record_stats: bool` kwarg driven by `ctx.batch.moe_force_decode` from scheduler. Verify admissions update hit/miss counters; they do **not** promote into LRU. Decode admissions do both.
+**(2)** `OffloadMoeCache.collect_stats` is a boolean attribute on the cache instance set once at engine init from `config.moe_collect_stats` (`engine/engine.py:830`). Each MoE call site (`models/deepseek_v4/moe.py`, `layers/moe.py`) checks `cache.collect_stats` before calling `cache.record_decode_stats(layer_id)` / `cache.record_decode_stats_hybrid(layer_id)`. When stats collection is off, `ensure_experts_hybrid` still promotes into the LRU but skips the per-layer histogram accumulation; the cuda graph captures the no-stats path when disabled, so verify-vs-decode phase noise stops propagating into the demand signal that BudgetSlider reads. Pair with the recurrence-window admission from upstream `expert_recency` so first-sighting misses compute CPU-side without polluting hot-tier counts.
 
 **(3)** Expert residency tracks decode demand without verify-phase noise; bs=8 mixed-decode aggregate ~187/~193 tok/s cross rounds. bs=4→bs=8 scaling ×1.85 — within PCIe BW ceiling, no LRU-thrash dip.
 
@@ -167,7 +167,7 @@ python <launcher>.py `
   --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 1048576 --moe-cache-size 2048 `
   --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
-  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
+  --quant-backend moe.nvfp4=b12x `
   --max-running-req 4 `
   --host 0.0.0.0 --port 8001
 ```
@@ -181,8 +181,8 @@ python <launcher>.py `
   --model-path ./models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
   --num-tokens 65536 --moe-cache-size 1024 `
   --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
-  --quant-backend moe.nvfp4=b12x --moe-prefill-demand-tokens 64 `
-  --cuda-graph-max-bs 1 --mtp-expert-quant q4_0 --text-model-only `
+  --quant-backend moe.nvfp4=b12x `
+  --cuda-graph-max-bs 1 --text-model-only `
   --host 0.0.0.0 --port 8001
 ```
 
@@ -196,8 +196,6 @@ Flags worth understanding:
 - `--text-model-only` — skip all encoder towers; their VRAM goes to KV / expert caches. Use `--mm-disable vision audio` instead when only some kinds should be skipped. Vision / audio towers load by default and skip cleanly when disabled. Upstream-provided flags.
 - `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies. Upstream-provided.
 - `--cuda-graph-max-bs N` — CUDA-graph ladder cap; `1` for bs=1-dominated, `4` adds bs=4 burst slot cheaply under shared mempool. Upstream-provided flag.
-- `--moe-prefill-demand-tokens` — chunk-row threshold for demand-prefill; default `64` fits cached-prefix incremental prefill. Upstream-provided flag.
-- `--mtp-expert-quant q4_0` — shrink the MTP draft expert bank to q4_0 to fit verify peak inside tight VRAM. Use with `--mtp-device gpu` to actually enable MTP; default-off on this branch (see feature point 4).
 - `--disable-budget-slide` — opt-out of the BudgetSlider from feature point 3, freezing KV/MoE pool sizes from startup. Use when the workload is single-model fixed-footprint and you want CUDA-graph captures pinned to stable addresses.
 
 ## Requirements & install
@@ -214,18 +212,19 @@ Optional: kernel-cache wheel attached to GitHub Releases (skips Triton JIT on fi
 
 ## Verification suite
 
-| script | covers |
-|---|---|
-| `p4_splice_test.py` | mm splice invariant (pad-span alignment, COW no-op) — 21 cases |
-| `p4_finish_key_test.py` | finish-key + SWA regression legs |
-| `p4_content_key_test.py` | content-hash prefix keys (same-image reuse / cross-image isolation) |
-| `mm_prefill_chunk_test.py` | whole-segment mm prefill rollback |
-| `r4_adv_probe.py` | adversarial fuzz: cross-span gaps, page ownership, `page_size ∈ {1,4,8}` × shapes × rounds |
-| `kv_tier_test.py` | RAM-tier KV swap-in/out round-trip |
-| `budget_slide_test.py` | runtime KV/expert pool resize without restart |
-| `serve_video_smoke.py`, `vision_video_test.py`, `vision_p3_media_test.py` | end-to-end vision/media requests |
+| script | covers | location |
+|---|---|---|
+| `p4_splice_test.py` | mm splice invariant (pad-span alignment, COW no-op) — 21 cases | `verification/` |
+| `p4_finish_key_test.py` | finish-key + SWA regression legs | `verification/` |
+| `p4_content_key_test.py` | content-hash prefix keys (same-image reuse / cross-image isolation) | `verification/` |
+| `mm_prefill_chunk_test.py` | whole-segment mm prefill rollback | `verification/` |
+| `r4_adv_probe.py` | adversarial fuzz: cross-span gaps, page ownership, `page_size ∈ {1,4,8}` × shapes × rounds | `verification/` |
+| `kv_tier_test.py` | RAM-tier KV swap-in/out round-trip | `verification/` |
+| `serve_video_smoke.py`, `vision_video_test.py`, `vision_p3_media_test.py` | end-to-end vision/media requests | `verification/` |
+| `test_budget_slide.py`, `test_budget_slide_wiring.py` | runtime KV/expert pool resize without restart; wiring smoke | `tests/` |
+| `tests/moe/test_decode_prefetch_gate.py` | bs≥4 prefetch gate | `tests/moe/` |
 
-Run from package root with venv Python, e.g. `python verification/p4_splice_test.py`.
+Scripts under `verification/` are standalone; run from package root with venv Python, e.g. `python verification/p4_splice_test.py`. Tests under `tests/` use pytest: `pytest tests/test_budget_slide.py tests/moe/test_decode_prefetch_gate.py`.
 
 ## Environment variables
 
@@ -239,4 +238,4 @@ Run from package root with venv Python, e.g. `python verification/p4_splice_test
 
 <a name="provenance"></a>
 
-Derived from upstream FreeToken commit `58f4b9e` (release `0.1.2+g816c324d0`). Upstream PRs merged in: #377, #375, #343, #336, #332, #329, #319, #311, #310, #243, #257, plus foundational #1 / #2 / #3 / #4 / #5 / #6 / #7 / #25 / #75 / #117. Kernel-cache wheel unchanged from upstream. Upstream LICENSE (Apache-2.0) and copyright preserved in `package/`. Third-party checkpoint Qwen3.8-Flash-Next-ABLITERATED-NVFP4 downloaded at runtime from its HF hub.
+Derived from upstream FreeToken commit `58f4b9e` (packaged `__version__ = "0.1.3"`). Upstream PRs merged in: #377, #375, #343, #336, #332, #329, #319, #311, #310, #243, #257, plus foundational #1 / #2 / #3 / #4 / #5 / #6 / #7 / #25 / #75 / #112 / #117. Kernel-cache wheel unchanged from upstream. Upstream LICENSE (Apache-2.0) and copyright preserved in `package/`. Third-party checkpoint Qwen3.8-Flash-Next-ABLITERATED-NVFP4 downloaded at runtime from its HF hub.
