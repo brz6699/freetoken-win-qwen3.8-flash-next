@@ -73,16 +73,6 @@ def grouped_gemma_rmsnorm(
     group_dim = DIM // num_groups
     assert weight.numel() in (group_dim, DIM)
 
-    # Pure-torch path for CPU tensors (the CPU-hidden MTP head); bit-matches the kernel: per-group
-    # rmsnorm with a GemmaPlusOne affine, shared-weight or per-offset depending on weight width.
-    if not x.is_cuda:
-        xf = x.float().reshape(N, num_groups, group_dim)
-        rrms = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-        wf = weight.float()
-        w = wf.reshape(1, -1) if wf.numel() == group_dim else wf.reshape(num_groups, group_dim)
-        y = (xf * rrms * (1.0 + w)).reshape(N, DIM)
-        return y.to(x.dtype)
-
     y = x.new_empty(x.shape)
     _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
         x,

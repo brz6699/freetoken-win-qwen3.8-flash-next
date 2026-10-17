@@ -159,16 +159,7 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
-    raw = list(argv) if argv is not None else list(sys.argv[1:])
-    # Split the opaque serve passthrough BEFORE argparse: subparsers cannot reliably capture
-    # post-dash-dash tokens (argparse drops them into "unrecognized"), so everything from the
-    # first bare "--" onward is stashed here and appended to the start/switch body verbatim.
-    passthrough: list[str] = []
-    if "--" in raw:
-        i = raw.index("--")
-        passthrough = raw[i + 1:]
-        raw = raw[:i]
-    args = _build_parser(prog).parse_args(raw)
+    args = _build_parser(prog).parse_args(list(argv) if argv is not None else None)
     timeout = _effective_timeout(args.verb, args.timeout)
     try:
         if args.verb == "logs":
@@ -187,7 +178,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
             ),
         }
         if args.verb in ("start", "switch"):
-            body: dict[str, Any] = {"model": args.model, "args": list(args.serve_args) + passthrough}
+            body: dict[str, Any] = {"model": args.model, "args": list(args.serve_args)}
             if args.port is not None:
                 body["port"] = args.port
             if args.verb == "switch" and args.force:

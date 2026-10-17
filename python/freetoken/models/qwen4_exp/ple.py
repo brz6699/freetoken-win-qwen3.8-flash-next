@@ -334,19 +334,13 @@ def build_ple_metadata(
     )
     fla = getattr(batch, "fla_metadata", None)
     slots_dev = getattr(batch, "linear_table_idx", None)
-    # The n-gram pool is GPU-resident even when the head is CPU-hidden, so the whole
-    # metadata (ids + cu/slots/fresh + context) must agree on the pool's device or the
-    # gather/searchsorted below mixes CUDA and CPU. Rebind the build target to the pool.
-    device = context_pool.device
     # image rows hash as the placeholder token, never as the content pad ids
-    input_ids = batch.input_ids.to(device)
+    input_ids = batch.input_ids
     if args.image_token_id is not None:
         input_ids = restore_placeholder(input_ids, args.image_token_id)
 
     if batch.is_decode and slots_dev is not None:
-        # The head (possibly CPU-hidden) may hand the verify batch its slot metadata on
-        # CPU while the n-gram pool is GPU-resident; align the index to the pool.
-        slots = slots_dev.long().to(context_pool.device)
+        slots = slots_dev.long()
         bs = slots.numel()
         return PLEMetadata(
             input_ids=input_ids,
@@ -360,17 +354,16 @@ def build_ple_metadata(
 
     lens = [r.extend_len for r in reqs]
     if fla is not None and fla.has_initial_state is not None:
-        cu = fla.cu_seqlens.to(device)
-        slots = fla.cache_indices.long().to(device)
-        fresh = (~fla.has_initial_state).to(device)
+        cu = fla.cu_seqlens
+        slots = fla.cache_indices.long()
+        fresh = ~fla.has_initial_state
     else:  # direct-op callers (tests) with no scheduler metadata
         pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
         cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
         slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
         fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
-    cdev = context_pool.device
-    context = context_pool.index_select(0, slots.long().to(cdev)).long()
-    context = torch.where(fresh.to(cdev).unsqueeze(1), context.new_full((), eos), context)
+    context = context_pool.index_select(0, slots).long()
+    context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
         input_ids=input_ids,
         cu_seqlens=cu,

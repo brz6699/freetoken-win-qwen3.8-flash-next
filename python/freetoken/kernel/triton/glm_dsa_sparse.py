@@ -58,7 +58,6 @@ def _glm_dsa_sparse_kernel(
 
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
-    offs_v = tl.arange(0, D_V)
 
     n_active = TOPK
     if HAS_COUNTS:
@@ -66,12 +65,6 @@ def _glm_dsa_sparse_kernel(
 
     idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
     q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
-    q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-    if HAS_ROPE:
-        # NoPE checkpoints (glm5_next) have D_R == 0: tl.arange needs a non-empty
-        # span, so the whole rope half is compiled out on the constexpr.
-        offs_r = tl.arange(0, D_R)
-        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)

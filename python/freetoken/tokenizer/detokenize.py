@@ -91,7 +91,8 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
-        incremental_strs: List[str] = []
+        read_ids: List[List[int]] = []
+        surr_ids: List[List[int]] = []
         for msg in msgs:
             if msg.uid not in self.decode_map:
                 self.decode_map[msg.uid] = DecodeStatus(
@@ -104,14 +105,15 @@ class DetokenizeManager:
             s = self.decode_map[msg.uid]
             if not (msg.finished and msg.next_token in self.eos_token_ids):
                 s.decoded_ids.append(msg.next_token)
-            # Slice against the CURRENT offsets: an MTP step delivers several msgs in one
-            # batch, and each one must see the offsets its predecessor advanced. Snapshotting
-            # the slices for the whole batch first (with surr/read frozen) makes every delta
-            # carry the accumulated window instead of just its own token.
-            read_str = self.tokenizer.batch_decode([s.decoded_ids[s.surr_offset :]])[0]
-            surr_str = self.tokenizer.batch_decode(
-                [s.decoded_ids[s.surr_offset : s.read_offset]]
-            )[0]
+            read_ids.append(s.decoded_ids[s.surr_offset :])
+            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
+
+        read_texts = self.tokenizer.batch_decode(read_ids)
+        surr_texts = self.tokenizer.batch_decode(surr_ids)
+
+        incremental_strs: List[str] = []
+        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+            s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
             if len(new_text) > 0 and not new_text.endswith("�"):

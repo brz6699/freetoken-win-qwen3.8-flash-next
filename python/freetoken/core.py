@@ -84,14 +84,6 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
-    # MTP speculative-decoding acceptance counters (--mtp): drafts proposed / accepted and the
-    # two head-sanity signals (first draft matched the model's own prediction; full K-chain
-    # accepted). Accumulated per request, surfaced by the scheduler's acceptance-rate report.
-    mtp_drafts_total: int = 0
-    mtp_accepted_total: int = 0
-    mtp_steps: int = 0
-    mtp_first_match: int = 0
-    mtp_full_accept: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

@@ -116,9 +116,6 @@ class OffloadMoeCache:
     cache_size: int
     device: torch.device
     cache_policy: str = "lru"
-    # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
-    # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
-    prefill_demand_tokens: int = 0
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -164,10 +161,6 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
-        if self.prefill_demand_tokens and self.decode_target != "gpu":
-            raise ValueError(
-                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
-            )
         if self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         # Right-anchored carve cursor into the shared arena (bytes still free on its left).
@@ -270,15 +263,6 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
-        # Route-persistence trackers (also gated by collect_decode_freq): recall of THIS step's
-        # selected experts using the previous step's selection as the candidate set, i.e. how much
-        # an "adjacent step reuses last step's routing" prefetch would cover. All device-side.
-        self._persist_prev = torch.zeros(
-            (self.num_layers, self.num_experts), dtype=torch.bool, device=self.device
-        )
-        self._persist_hits = torch.zeros(self.num_layers, dtype=torch.float32, device=self.device)
-        self._persist_cur = torch.zeros(self.num_layers, dtype=torch.float32, device=self.device)
-        self._persist_steps = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -993,93 +977,19 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def load_experts(self, layer_id: int, topk_ids: torch.Tensor, *, record_stats: bool = True) -> torch.Tensor:
-        """Make the experts ``topk_ids`` routes to resident, copying in the missing ones, and return
-        ``topk_ids`` as slot ids. A step of at most ``ENSURE_ONE_CALL_WIDTH`` routes is one
-        admission that rewrites ``topk_ids`` in place. A wider one goes to the slot cache as its
-        distinct experts, ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the
-        next query evicts: LRU evicts an earlier query's slots last, and a layer never routes to
-        more experts than the cache holds. The statistics count either step once.
-
-        ``record_stats=False`` skips the routing histogram / lru_stats bookkeeping while still
-        running the LRU + copy machinery. Used for verify-phase admissions, which carry a batched
-        K+1-window routing distribution rather than steady-state decode; counting them biases the
-        recurrence-window promotion toward verify-specific experts."""
-        from freetoken.moe.offload_kernels import ENSURE_ONE_CALL_WIDTH, ENSURE_QUERY_WIDTH, ensure_experts
-
-        if topk_ids.numel() <= ENSURE_ONE_CALL_WIDTH:
-            self.ensure_experts(layer_id, topk_ids, record_stats=record_stats)
-            self.copy_missing()
-            return topk_ids
-        if record_stats:
-            self._count_routing(layer_id, topk_ids)
-        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
-        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
-        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
-        # the routed experts in ascending order, then the first of them again, which the admission
-        # dedups; a step's routes reach at most as many experts as there are routes
-        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
-        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
-        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
-        missed = torch.zeros((), dtype=torch.int64, device=self.device)
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = False
-        for piece in query.split(ENSURE_QUERY_WIDTH):
-            ensure_experts(self, layer_id, piece, record_stats=False)
-            missed += self.num_indices[0]
-            self.copy_missing()
-        if record_stats and self.collect_stats:
-            stats = self.lru_stats[layer_id]
-            stats[Stat.ACTIVE] += routed.sum()
-            stats[Stat.MISS] += missed
-            stats[Stat.CALLS] += 1
-        return self.slot_for_id[layer_id][topk_ids.long()]
-
-    def loads_prefill_on_demand(self, num_tokens: int) -> bool:
-        return 0 < num_tokens <= self.prefill_demand_tokens
-
-    def load_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
-        """Make a demand prefill chunk's routed experts resident, copying in the missing ones,
-        and return ``topk_ids`` as slot ids. The chunk's distinct experts go to the slot cache
-        ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the next query
-        evicts: LRU evicts an earlier query's slots last, and a layer never routes to more
-        experts than the cache holds. The admissions stay out of the decode statistics."""
-        from freetoken.moe.offload_kernels import ENSURE_QUERY_WIDTH, ensure_experts
-
-        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
-        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
-        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
-        # the routed experts in ascending order, then the first of them again, which the admission
-        # dedups; a chunk's routes reach at most as many experts as there are routes
-        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
-        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
-        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = False
-        for piece in query.split(ENSURE_QUERY_WIDTH):
-            ensure_experts(self, layer_id, piece, record_stats=False)
-            self.copy_missing()
-        return self.slot_for_id[layer_id][topk_ids.long()]
-
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to slot ids in
-        # place), so snapshot the routing histogram before that happens. Skipped when the caller
-        # is a verify-phase batch -- see ``load_experts``.
-        if record_stats:
-            self._count_routing(layer_id, expert_ids)
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids, record_stats=record_stats)
-
-    def _count_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         if self.collect_decode_freq:
+            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
+            # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
-            self._observe_route_persist(layer_id, ids)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
+    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -1088,23 +998,19 @@ class OffloadMoeCache:
         left non-resident and ``expert_ids`` is rewritten to their cache slot (hit or
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
-        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe.
-
-        ``record_stats=False`` skips the decode_freq / route-persist histogram while still
-        running the capped-fetch LRU + copy path; see :meth:`load_experts`."""
+        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
-        if record_stats and self.collect_decode_freq:
+        if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
-            self._observe_route_persist(layer_id, ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
 
-    def prefetch_decode_layer(self, layer_id: int, hint_ids: torch.Tensor, *, record_stats: bool = True) -> None:
+    def prefetch_decode_layer(self, layer_id: int, hint_ids: torch.Tensor) -> None:
         """Warm next-decode-layer's cache while current GPU compute runs (bs>=4 double buffer).
 
         Same shape as ``ensure_experts_hybrid`` + ``copy_missing`` on the current layer's
@@ -1117,7 +1023,7 @@ class OffloadMoeCache:
         """
         if self.decode_target != "hybrid":
             return
-        self.ensure_experts_hybrid(layer_id, hint_ids, record_stats=record_stats)
+        self.ensure_experts_hybrid(layer_id, hint_ids)
         self.copy_missing(hint_ids.numel())
 
     def materialize_layer(self, layer_id: int) -> None:
@@ -1223,20 +1129,6 @@ class OffloadMoeCache:
             })
         return {"per_layer": per_layer}
 
-    def _observe_route_persist(self, layer_id: int, ids: torch.Tensor) -> None:
-        """Track how well THIS step's routed-expert set is covered by the PREVIOUS step's set.
-
-        recall = |curr ∩ prev| / |curr|. A high recall means an "adjacent-step reuse" prefetch
-        (no trained predictor needed) already covers most of the next fetch; a low recall says a
-        real route predictor is worth building. All device-side, no host sync."""
-        prev = self._persist_prev[layer_id]
-        curr = torch.zeros_like(prev)
-        curr.scatter_(0, ids, True)
-        self._persist_hits[layer_id] += (curr & prev).sum().to(torch.float32)
-        self._persist_cur[layer_id] += curr.sum().to(torch.float32)
-        prev.copy_(curr)
-        self._persist_steps += 1
-
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
@@ -1260,12 +1152,6 @@ class OffloadMoeCache:
         p = freq / total.clamp(min=1).unsqueeze(1)
         ent = -(p * p.clamp(min=1e-12).log()).sum(dim=1)[valid]
         norm_ent = (ent / torch.log(torch.tensor(float(self.num_experts)))).mean().item()
-        # Route-persistence recall: fraction of each step's selected experts already selected the
-        # previous step. Mean over layers with traffic. Near 1.0 => adjacent-step reuse prefetch is
-        # enough; low => a real predictor (MoE-SpeQ-style) is worth building.
-        pc = self._persist_cur[valid]
-        recall = (self._persist_hits[valid] / pc.clamp(min=1)).mean().item()
-        mean_cur = pc.mean().item()
         return {
             "slots_per_layer": slots_per_layer,
             "working_set_mean": ws[valid].mean().item(),
@@ -1273,9 +1159,6 @@ class OffloadMoeCache:
             "experts_for_90pct": cover90.mean().item(),
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
-            "route_recall_prev_step": recall,
-            "route_selected_mean_per_step": mean_cur,
-            "route_steps": self._persist_steps,
         }
 
     def copy_missing(self, num_rows: int | None = None) -> None:

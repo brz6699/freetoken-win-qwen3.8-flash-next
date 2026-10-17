@@ -42,14 +42,6 @@ from .reasoning_parser import (
     strip_special_tokens,
 )
 
-try:
-    # EXP-ONLY raw-output recorder: captures the model's raw emitted tokens to a file
-    # (default G:\freetoken_raw_log) for independent analysis. Import is guarded and every
-    # call site is `if raw_log is not None:` so a logging problem can never break generation.
-    from . import raw_log
-except Exception:  # pragma: no cover — the recorder must never take generation down
-    raw_log = None
-
 
 class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
@@ -611,7 +603,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
-    raw_output = ""
     pending = ""
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
@@ -708,7 +699,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         content_delta = ack.incremental_output
-        raw_output += content_delta
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
             if reasoning_delta:
@@ -787,14 +777,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         elif parse_tools and pending:
             yield ContentDelta(strip_special_tokens(pending, specials))
 
-    if raw_log is not None:
-        raw_log.record_generation(
-            uid, stream=True, raw=raw_output,
-            finish_reason=finish_reason,
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens, matched_stop=engine_matched_stop,
-            sampling=getattr(spec, "sampling_params", None),
-        )
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
@@ -833,15 +815,6 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
             finish_reason = "tool_calls"
 
     specials = _leaked_special_tokens(state)
-    if raw_log is not None:
-        raw_log.record_generation(
-            uid, stream=False, raw=full_content,
-            reasoning=reasoning_text, content=content_text,
-            finish_reason=finish_reason,
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens, matched_stop=engine_matched_stop,
-            sampling=getattr(spec, "sampling_params", None),
-        )
     return GenResult(
         reasoning=strip_special_tokens(reasoning_text, specials).strip(),
         content=strip_special_tokens(content_text, specials),

@@ -6,10 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-The MTP speculative head (``mtp.*``) is loaded too: its dense tensors fold into the state dict
-(``mtp.layers.0.`` stripped to a flat ``mtp.``; the QSA indexer is dropped since the MTP layer
-runs dense attention), and its stacked bf16 routed experts go to the ``MtpExpertBank`` via
-:func:`load_mtp_experts`. Only ``model.visual.*`` is still dropped when no tower was built.
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -34,9 +31,7 @@ from freetoken.models.nvfp4_banks import (
 from freetoken.layers.quantization import get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, download_hf_weight, init_logger
-
-logger = init_logger(__name__)
+from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -92,18 +87,7 @@ _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
-        # QSA indexer is ignored: the MTP layer runs DENSE attention, a superset of the sparse
-        # selection the indexer would pick, so its tensors have no model counterpart.
-        if ".self_attn.indexer." in raw_name:
-            return None
-        # The stacked routed experts (bf16, [E, ...]) are NOT per-expert NVFP4; they go to the
-        # MtpExpertBank (load_mtp_experts), not the state dict.
-        if ".mlp.experts." in raw_name:
-            return None
-        # The MTP module is flat (no "layers.0"): strip it so mtp.layers.0.X -> mtp.X.
-        if raw_name.startswith("mtp.layers.0."):
-            return "mtp." + raw_name[len("mtp.layers.0.") :]
-        return raw_name
+        return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -402,50 +386,9 @@ def nvfp4_expert_spec(model_path: str, config):
     return _NVFP4_SOURCE_SPEC
 
 
-# ======================================================================================
-# MTP head expert bank
-# ======================================================================================
-
-_MTP_EXPERT_SUFFIXES = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
-
-
-def load_mtp_experts(
-    model_path: str, bank, device: torch.device | None = None, quant: str = "none"
-) -> int:
-    """Fill the MTP head's stacked bf16 routed experts into its ``MtpExpertBank``.
-
-    The checkpoint stores the head's routed experts as two stacked tensors
-    (``mtp.layers.0.mlp.experts.gate_up_proj`` ``[E, 2I, H]`` and ``.down_proj``
-    ``[E, H, I]``, bf16 -- not the NVFP4 per-expert packing of the main model). With
-    ``device`` the bank stays GPU-resident (drafts pay zero PCIe, the engine prices
-    ``bank.gpu_bytes`` into its GPU budget); on OOM or without a device it lives in pinned
-    host RAM. Returns the pinned host bytes the engine reserves from its pin budget
-    (0 when the bank went GPU-resident)."""
-    folder = download_hf_weight(model_path)
-    found: dict[str, torch.Tensor] = {}
-    for path in iter_weight_files(folder):
-        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if not key.startswith("mtp.") or not key.endswith(_MTP_EXPERT_SUFFIXES):
-                    continue
-                found[key.rsplit(".", 1)[-1]] = f.get_tensor(key)
-        if len(found) == len(_MTP_EXPERT_SUFFIXES):
-            break
-    if len(found) != len(_MTP_EXPERT_SUFFIXES):
-        raise ValueError(f"MTP expert bank needs both stacked tensors, found {sorted(found)}")
-    bank.load(found["gate_up_proj"], found["down_proj"], device=device, quant=quant)
-    nbytes = bank.stored_bytes
-    logger.info_rank0(
-        f"MTP expert bank: {nbytes / (1 << 30):.2f} GiB ({quant} storage),"
-        f" {'GPU-resident' if bank.gpu_bytes else 'pinned host RAM'}"
-    )
-    return 0 if bank.gpu_bytes else nbytes
-
-
 __all__ = [
     "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",
     "load_ple_table",
-    "load_mtp_experts",
 ]

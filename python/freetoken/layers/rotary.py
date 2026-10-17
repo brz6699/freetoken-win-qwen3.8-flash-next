@@ -139,9 +139,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert self._cos_sin_cache.shape[1] == self.rotary_dim, "mrope reads a rotary_dim-wide table, not a proportional rope's"
         half = self.rotary_dim // 2
         assert sum(mrope_section) == half, (mrope_section, half)
-        self._section_table = build_section_table(tuple(mrope_section), layout).to(
-            self._cos_sin_cache.device
-        )
+        self._section_table = build_section_table(tuple(mrope_section), layout)
         try:
             from freetoken.kernel.triton.rope import apply_mrope_with_cos_sin_cache_inplace
 
@@ -158,10 +156,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.dim() == 2, "mrope models feed [3, n] positions"
         if self._section_table.device != query.device:
             self._section_table = self._section_table.to(query.device)
-        if self._cos_sin_cache.device != query.device:
-            self._cos_sin_cache = self._cos_sin_cache.to(query.device)
-        positions = positions.contiguous().to(query.device)
-        if self._kernel is not None and query.is_cuda:
+        positions = positions.contiguous()
+        if self._kernel is not None:
             self._kernel(
                 positions=positions, query=query, key=key, head_size=self.head_size,
                 cos_sin_cache=self._cos_sin_cache, section_table=self._section_table,

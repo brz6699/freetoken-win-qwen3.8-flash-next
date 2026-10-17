@@ -318,12 +318,10 @@ def parse_args(
     parser.add_argument(
         "--memory-ratio",
         type=float,
-        default=None,
+        default=ServerArgs.memory_ratio,
         help=(
             "Fraction of total GPU free memory the engine may use for weights + MoE "
-            "cache + KV cache combined; the remainder is reserved runtime headroom. "
-            "When omitted, sizing is driven by --num-tokens / --num-pages and "
-            "--moe-cache-size directly (these declared sizes are authoritative)."
+            "cache + KV cache combined; the remainder is reserved runtime headroom."
         ),
     )
 
@@ -626,48 +624,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--mtp-draft-len",
-        dest="mtp_draft_len",
-        type=_positive_int,
-        default=argparse.SUPPRESS,
-        help=(
-            "Drafts per MTP speculative-decoding step; naming a length turns MTP on, omitting "
-            "it keeps the plain decode path. The checkpoint's native 1-layer head drafts this "
-            "many tokens and the full model verifies them in one forward. Applies to single "
-            "greedy requests; everything else keeps the plain path. Longer chains raise "
-            "per-step accepted length but pay more verify bytes per step; verify batching "
-            "usually wins while acceptance stays high."
-        ),
-    )
-
-    parser.add_argument(
-        "--mtp-device",
-        dest="mtp_device",
-        default=argparse.SUPPRESS,
-        choices=["gpu", "cpu"],
-        help=(
-            "Where MTP draft+verify compute runs. 'gpu' runs the whole speculative path on the "
-            "GPU; 'cpu' hides the head draft and verify compute on the CPU behind the GPU "
-            "main-model forward (current-hardware trade-off: CPU compute overlaps the GPU "
-            "instead of contending for PCIe on a pure-GPU path). Default: gpu."
-        ),
-    )
-
-    parser.add_argument(
-        "--mtp-expert-quant",
-        dest="mtp_expert_quant",
-        default=argparse.SUPPRESS,
-        choices=["none", "fp8", "q4_0"],
-        help=(
-            "Storage dtype for the MTP head's stacked routed-expert bank. 'none' keeps the "
-            "checkpoint bf16 (~4.7 GiB GPU-resident); 'fp8' stores e4m3 with one scale per "
-            "tensor (~2.4 GiB); 'q4_0' groups of 32 with a bf16 scale per group (~1.3 GiB). "
-            "Draft quality is only used for speculative acceptance, so a coarser bank mostly "
-            "costs acceptance rate, not output quality. Default: none."
-        ),
-    )
-
-    parser.add_argument(
         "--quant-backend",
         default=None,
         type=_parse_quant_backend,
@@ -697,20 +653,6 @@ def parse_args(
             "NVFP4 routed-expert GEMM backend (default: triton, the portable inline-dequant "
             "kernel). auto picks by GPU (marlin on sm80-99 + vLLM; flashinfer b12x on sm120+ "
             "& CUDA>=13; else triton). Force one to override; it fails loudly if it cannot run."
-        ),
-    )
-
-    parser.add_argument(
-        "--periph-kernels",
-        default="auto",
-        choices=["auto", "triton", "flashinfer"],
-        help=(
-            "Backend for the peripheral kernels (activation silu_and_mul / rope / norm / "
-            "sampling). 'auto' (default) uses flashinfer when installed; 'triton' forces the "
-            "triton kernels; 'flashinfer' forces flashinfer. On MSVC-only Windows boxes the "
-            "flashinfer peripheral kernels cannot JIT-build (they link with `c++ -lcudart`, "
-            "which needs g++), so pass 'triton' there. The b12x fused-MoE kernel is a separate "
-            "CuTe-DSL path and is NOT affected by this switch."
         ),
     )
 
@@ -826,17 +768,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--moe-prefill-demand-tokens",
-        type=int,
-        default=ServerArgs.moe_prefill_demand_tokens,
-        help=(
-            "A prefill chunk of at most this many tokens loads only the experts it routes to, "
-            "through the expert cache as decode does, instead of every expert of each layer. "
-            "0 streams whole layers for every chunk."
-        ),
-    )
-
-    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",
@@ -911,17 +842,6 @@ def parse_args(
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
-
-    # Route the peripheral kernels (activation/rope/norm/sampling) via the flag instead of a
-    # manual FREETOKEN_FLASHINFER_PERIPH env var. periph_flashinfer_ok() (kernel/backend.py)
-    # reads that var; set it here, in the parent, before launch_server spawns the engine
-    # workers (spawn inherits this process's env), so the gate is visible to the engine.
-    # 'auto' leaves the env untouched (flashinfer-if-installed default).
-    periph_kernels = kwargs.pop("periph_kernels", "auto")
-    if periph_kernels == "triton":
-        os.environ["FREETOKEN_FLASHINFER_PERIPH"] = "0"
-    elif periph_kernels == "flashinfer":
-        os.environ["FREETOKEN_FLASHINFER_PERIPH"] = "1"
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])

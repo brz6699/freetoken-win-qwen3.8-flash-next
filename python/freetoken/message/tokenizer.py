@@ -48,14 +48,6 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
-    # MTP speculation counters for this request, attached once on the terminal (finished)
-    # message: accepted draft tokens vs drafted, steps, first-position matches, and fully
-    # accepted steps. All 0 on the plain path, so non-MTP replies keep their exact shape.
-    mtp_steps: int = 0
-    mtp_drafts: int = 0
-    mtp_accepted: int = 0
-    mtp_first_match: int = 0
-    mtp_full_accept: int = 0
 
 
 @dataclass

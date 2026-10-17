@@ -7,8 +7,6 @@ from typing import Dict, Tuple
 import torch
 from freetoken.utils import div_ceil
 
-from .base import BaseMoeBackend
-
 
 def _torch_fused_topk(
     gating_output: torch.Tensor,
@@ -44,11 +42,6 @@ def fused_topk(
     from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
-
-
-# sgl_kernel's moe_align_block_size counts experts in one 1024-thread block and reads out of
-# bounds past it; a prefill over the offload slot cache aligns against the slot count.
-_SGL_ALIGN_MAX_EXPERTS = 1024
 
 
 def moe_align_block_size(
@@ -93,7 +86,7 @@ def moe_align_block_size(
     """
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
-    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS:
+    if not is_sgl_kernel_installed():
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )
@@ -386,32 +379,3 @@ def fused_experts_decode_impl(
     out_hidden_states = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(intermediate_cache3, out_hidden_states)
     return out_hidden_states
-
-
-class FusedMoe(BaseMoeBackend):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-    ) -> torch.Tensor:
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=gating_output,
-            topk=topk,
-            renormalize=renormalize,
-        )
-        return fused_experts_impl(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )

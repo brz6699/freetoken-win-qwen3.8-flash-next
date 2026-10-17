@@ -202,9 +202,7 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        # moe_force_decode: an MTP verify extend is a short prefill-phase batch whose experts
-        # should be moved on demand (decode path), not streamed whole like a prefill.
-        if ctx.batch.is_prefill and not getattr(ctx.batch, "moe_force_decode", False):
+        if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -227,7 +225,7 @@ class OffloadMoELayer(MoELayer):
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill and not getattr(ctx.batch, "moe_force_decode", False):
+        if ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
@@ -285,21 +283,19 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
-        # Verify-phase batches carry a batched K+1-window routing distribution rather than steady-state
-        # decode; their admissions should update the LRU but not the routing histogram / lru_stats.
-        record_stats = not getattr(get_global_ctx().batch, "moe_force_decode", False)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, record_stats=record_stats)
-        slots = cache.load_experts(self.layer_id, topk_ids, record_stats=record_stats)
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        cache.ensure_experts(self.layer_id, topk_ids)
+        cache.copy_missing(topk_ids.numel())
         return self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
-            slots,
+            topk_ids,
             views=cache.bank_views(),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
@@ -312,8 +308,6 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        *,
-        record_stats: bool = True,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
@@ -323,14 +317,12 @@ class OffloadMoELayer(MoELayer):
         routing split is device-side elementwise and the CPU submit/sync are host nodes.
         Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
         routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
-
-        ``record_stats`` gates the routing histogram + hybrid stats updates while leaving the
-        capped-fetch LRU + CPU overflow path intact. See :meth:`_decode_routed`."""
+        """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids, record_stats=record_stats)  # -> slot (hit/fetched) or -1
-        if record_stats and cache.collect_stats:
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
@@ -361,7 +353,7 @@ class OffloadMoELayer(MoELayer):
         bs_hint = int(hidden_states.shape[0])
         next_layer = self.layer_id + 1
         if bs_hint >= _DECODE_PREFETCH_MIN_BS and next_layer < int(cache.num_layers):
-            cache.prefetch_decode_layer(next_layer, raw.clone(), record_stats=record_stats)
+            cache.prefetch_decode_layer(next_layer, raw.clone())
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -387,20 +379,6 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
-        # Short chunk: load only the routed experts through the slot cache as decode does and
-        # run the same grouped GEMM over the slots, instead of streaming every expert of the layer.
-        if cache.loads_prefill_on_demand(hidden_states.shape[0]):
-            slots = cache.load_prefill_experts(self.layer_id, topk_ids)
-            return self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                slots,
-                views=cache.bank_views(),
-                n=None,
-                alphas=cache.alphas_for_slots(self.layer_id),
-                is_prefill=True,
-            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

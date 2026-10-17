@@ -64,6 +64,27 @@ def _find_all(ids: list[int], target: list[int]) -> list[int]:
     return found
 
 
+def _split_patterns(placeholder: list[int] | list[list[int]]) -> list[list[int]]:
+    """Normalize a placeholder into a list of equal-length token patterns to match."""
+    if placeholder and isinstance(placeholder[0], list):
+        return placeholder  # type: ignore[list-item]
+    return [placeholder]  # type: ignore[list-item]
+
+
+def _find_any(ids: list[int], patterns: list[list[int]]) -> list[int]:
+    """Start index of every non-overlapping occurrence of ANY pattern (all same length)."""
+    n = len(patterns[0])
+    found: list[int] = []
+    i = 0
+    while i <= len(ids) - n:
+        if any(ids[i : i + n] == p for p in patterns):
+            found.append(i)
+            i += n
+        else:
+            i += 1
+    return found
+
+
 class MMProcessor(ABC):
     """How a checkpoint's images become items, tokens and positions; apply is the family-agnostic driver, subclasses fill the hooks.
 
@@ -109,21 +130,26 @@ class MMProcessor(ABC):
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         """The smallest encodable item of each modality the family serves, for warming the encoders."""
 
-    def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
-        """Swap each image placeholder for its replacement sequence and precompute rope positions."""
+    def _decode_part(self, raw: bytes) -> Any:
+        """Decode one fetched media blob into what ``process`` consumes: a single RGB PIL image by default; a family that supports video returns its sampled frames."""
         from PIL import Image
 
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+
+    def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
+        """Swap each media placeholder for its replacement sequence and precompute rope positions."""
         ids = input_ids.tolist()
-        target = self.placeholder
-        slots = _find_all(ids, target)
+        patterns = _split_patterns(self.placeholder)
+        plen = len(patterns[0])
+        slots = _find_any(ids, patterns) if len(patterns) > 1 else _find_all(ids, patterns[0])
         if len(slots) != len(images):
             raise ValueError(
-                f"prompt renders {len(slots)} image placeholders but the request "
-                f"carries {len(images)} images"
+                f"prompt renders {len(slots)} vision placeholders but the request "
+                f"carries {len(images)} media items"
             )
 
-        pils = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
-        items = self.process(pils)
+        parts = [self._decode_part(raw) for raw in images]
+        items = self.process(parts)
         out: list[int] = []
         cursor = 0
         for slot, item in zip(slots, items):
@@ -138,7 +164,7 @@ class MMProcessor(ABC):
             out.extend(full)
             item.offsets = [[base + lo, base + hi] for lo, hi in spans]
             item.validate()
-            cursor = slot + len(target)
+            cursor = slot + plen
         out.extend(ids[cursor:])
         new_ids = torch.tensor(out, dtype=input_ids.dtype)
 

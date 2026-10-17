@@ -291,10 +291,6 @@ class ModelConfig:
     dense_quant: str = "none"
     # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
-    # --mtp-draft-len: build the checkpoint's native MTP head (dense part ~180MB + lazy expert
-    # bank). Off (None) keeps the head unbuilt and its checkpoint keys unloaded.
-    enable_mtp: bool = False
-    mtp_draft_len: int | None = None
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----

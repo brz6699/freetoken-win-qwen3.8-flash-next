@@ -142,61 +142,31 @@ class LinearStatePool:
 
         Geometry (layers, conv dim, head dims) and dtypes are taken from the existing
         tensors; only the slot count changes. Object identity is preserved so cached
-        references (ctx.linear_state_pool) stay valid. Idle-only.
-
-        The first ``min(old, new)`` slots carry their content and ownership over from the
-        old tensors; slots past ``num_slots`` are dropped and brand-new slots start zeroed.
-        Preserving the overlap is what keeps a resumed decode from reading cold (zeroed)
-        recurrent state for its first chunk after a budget slide -- without it the delta-rule
-        recurrence has to refill from scratch and the output degenerates (repeated-punctuation
-        runs) for ~one chunk before it recovers.
+        references (ctx.linear_state_pool) stay valid. Idle-only and destructive: every
+        live/snapshot state is dropped, so the caller must guarantee no running request
+        holds a slot and the radix tree owning donated snapshots is discarded too.
         """
-        old_conv, old_rec = self.conv_states, self.recurrent_states
-        old_slot = self.slot_states
-        old_num = self._num_slots
-        old_free = set(self._free_slots)
-
-        n_layers, _, local_conv_dim, km1 = old_conv.shape
-        _, _, local_v_heads, key_head_dim, value_head_dim = old_rec.shape
-        conv_dtype, rec_dtype = old_conv.dtype, old_rec.dtype
+        n_layers, _, local_conv_dim, km1 = self.conv_states.shape
+        _, _, local_v_heads, key_head_dim, value_head_dim = self.recurrent_states.shape
+        conv_dtype, rec_dtype = self.conv_states.dtype, self.recurrent_states.dtype
         device = self._device
+        self.conv_states = None
+        self.recurrent_states = None
+        self.slot_states = {}
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-
-        new_conv = torch.zeros(
+            torch.cuda.empty_cache()
+        self.conv_states = torch.zeros(
             (n_layers, num_slots, local_conv_dim, km1), dtype=conv_dtype, device=device
         )
-        new_rec = torch.zeros(
+        self.recurrent_states = torch.zeros(
             (n_layers, num_slots, local_v_heads, key_head_dim, value_head_dim),
             dtype=rec_dtype,
             device=device,
         )
-        new_slot = self._alloc_slot_states(num_slots)
-
-        ov = min(old_num, num_slots)
-        if ov > 1:  # slot 0 is the padding sink; copy only the usable range 1..ov
-            new_conv[:, :ov].copy_(old_conv[:, :ov])
-            new_rec[:, :ov].copy_(old_rec[:, :ov])
-            for name, nt in new_slot.items():
-                ot = old_slot.get(name)
-                if ot is not None:
-                    nt[:, :ov].copy_(ot[:, :ov])
-
-        # Drop the old tensors only after the overlap is copied so the transient peak is one
-        # pool, then hand the freed segments back (no expandable_segments on Windows).
-        del old_conv, old_rec, old_slot
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        self.conv_states = new_conv
-        self.recurrent_states = new_rec
-        self.slot_states = new_slot
+        self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
-        # Keep exactly the slots that were already allocated and still exist; everything else
-        # (the padding slot aside) is free. Slots dropped by a shrink return to the free-list,
-        # and previously-free overlap slots are not handed out a second time.
-        allocated = {s for s in range(1, ov) if s not in old_free}
-        self._free_slots = [s for s in range(1, num_slots) if s not in allocated]
+        self._free_slots = list(range(1, num_slots))
 
     def free(self, slots) -> None:
         """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
@@ -306,7 +276,7 @@ def linear_state_bytes_per_req(
     return int(total)
 
 
-__all__ = ["LinearStatePool", "linear_state_bytes_per_req", "fit_linear_pool_slots"]
+__all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
 
 
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
@@ -348,45 +318,3 @@ def _linear_pool_min_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1
     return 4 * mr + 1
-
-
-# Fraction of the free VRAM measured right before the GDN pool is allocated that the pool may
-# take. The remainder is left for CUDA-graph capture scratch + activations that run afterwards;
-# filling 100% of the measured free reliably OOMs the later graph capture.
-_GDN_FIT_HEADROOM = 0.90
-
-
-def fit_linear_pool_slots(config, free_bytes: int) -> int:
-    """Largest LinearStatePool slot count that fits in ``free_bytes`` of free VRAM, clamped to
-    the [non-evictable floor, startup default] range.
-
-    Shrinks ONLY the cross-request snapshot cache (the portion of the slot count above the
-    floor): that cache is a pure reuse optimization and dropping it never affects correctness,
-    it just reduces cross-request snapshot hits. The floor is what admission needs to run, so
-    if even it does not fit this raises with an actionable message instead of OOMing on the
-    (unfit) allocation.
-
-    ``free_bytes`` must be the free VRAM measured AFTER the model weights, MoE banks, KV pool
-    and any MTP bank are resident -- the caller passes ``self._sync_get_memory()[0]`` taken at
-    the point of no return just before the pool tensor is allocated.
-    """
-    default = _linear_pool_num_slots(config)
-    minimum = _linear_pool_min_slots(config)
-    per_req = linear_state_bytes_per_req(
-        config.model_config.linear_attention_group(),
-        config.tp_info.size, config.dtype,
-        getattr(config.model_config, "slot_states", ()),
-    )
-    if per_req <= 0:
-        return default
-    usable = int(free_bytes * _GDN_FIT_HEADROOM)
-    fit = usable // per_req
-    if fit < minimum:
-        raise MemoryError(
-            f"GDN (GatedDeltaNet) state pool needs at least {minimum} slots "
-            f"(~{minimum * per_req / 1e9:.2f} GiB) but only "
-            f"{usable / 1e9:.2f} GiB of free VRAM is available. Lower --max-running-req, "
-            f"reduce --moe-cache-size / --num-tokens, or set FREETOKEN_MAMBA_SSM_DTYPE=bfloat16 "
-            f"to halve the recurrent (SSM) state."
-        )
-    return max(minimum, min(default, fit))

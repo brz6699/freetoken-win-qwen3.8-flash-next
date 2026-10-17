@@ -17,7 +17,6 @@ experts into a GPU slot cache. Rules every kernel here follows:
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 
@@ -421,20 +420,6 @@ def _b12x_swizzle_block_scales(scale: torch.Tensor) -> torch.Tensor:
 _B12X_WORKSPACE: dict[torch.device, torch.Tensor] = {}
 
 
-def _b12x_prefill_transient() -> bool:
-    """Whether the prefill MoE uses a fresh per-call workspace that is freed after the layer
-    instead of the persistent module-cached one (flashinfer's ``_get_cached_workspace``).
-
-    The persistent one is sized to routed_rows = chunk*top_k and pinned for the whole process
-    (~0.5 GiB at an 8192 chunk), which is the extra VRAM that tips this model's first-request
-    PLE OOM under b12x (triton's equivalent is allocated per layer and freed). Mirroring
-    triton -- allocate the big prefill buffers for the layer, drop the reference when the layer
-    finishes -- reclaims them for the PLE/attention transient. decode keeps the pinned
-    (CUDA-graph-stable) workspace, so its address never moves. Default on; FREETOKEN_B12X_PREFILL_FREE=0
-    reverts to the pinned workspace for A/B."""
-    return os.environ.get("FREETOKEN_B12X_PREFILL_FREE", "1") != "0"
-
-
 @torch.no_grad()
 def _b12x_small_workspace(device: torch.device) -> torch.Tensor:
     ws = _B12X_WORKSPACE.get(device)
@@ -460,7 +445,6 @@ def b12x_fused_experts(
     topk_ids: torch.Tensor,
     activation: str,
     apply_router_weight_on_input: bool,
-    is_prefill: bool = False,
     limit: float | None = None,
 ) -> torch.Tensor:
     """SM12x W4A16 fused MoE over cache slots (same calling convention as
@@ -480,7 +464,6 @@ def b12x_fused_experts(
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
         _get_cached_workspace,
         _validate_w4a16_workspace,
-        allocate_sm120_moe_workspace,
     )
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
         run_w4a16_moe,
@@ -515,38 +498,18 @@ def b12x_fused_experts(
     )
     top_k = topk_ids.size(1)
     routed_rows = hidden_states.size(0) * top_k
-    # decode (is_prefill False) keeps the pinned, CUDA-graph-stable workspace. prefill uses a
-    # FRESH per-call workspace that is freed when this layer's call returns, so the big
-    # routed_rows-sized buffers (~0.5 GiB at an 8192 chunk) don't pin VRAM for the whole
-    # process -- mirrors triton's per-layer ic1/ic2/ic3 and reclaims them for the PLE/attention
-    # transient at layer 2. The decode cache entry is only ever grown by decode calls (tiny
-    # routed_rows), so its address never moves and the captured graph stays valid.
-    if is_prefill and _b12x_prefill_transient():
-        workspace = allocate_sm120_moe_workspace(
-            state_E=num_experts,
-            weight_E=num_experts,
-            k=hidden_size,
-            n=intermediate_size,
-            num_topk=top_k,
-            device=hidden_states.device,
-            routed_rows=routed_rows,
-            quant_mode="w4a16",
-            backend="w4a16",
-            activation="silu",
-        )
-    else:
-        workspace = _get_cached_workspace(
-            backend="w4a16",
-            state_E=num_experts,
-            weight_E=num_experts,
-            routed_rows=routed_rows,
-            k=hidden_size,
-            n=intermediate_size,
-            num_topk=top_k,
-            device=hidden_states.device,
-            quant_mode="w4a16",
-            activation="silu",
-        )
+    workspace = _get_cached_workspace(
+        backend="w4a16",
+        state_E=num_experts,
+        weight_E=num_experts,
+        routed_rows=routed_rows,
+        k=hidden_size,
+        n=intermediate_size,
+        num_topk=top_k,
+        device=hidden_states.device,
+        quant_mode="w4a16",
+        activation="silu",
+    )
     _validate_w4a16_workspace(
         workspace,
         state_E=num_experts,
@@ -667,7 +630,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
         t = view.tensors
         assert view.alphas is not None
         limit = float(layer.limit) if layer.activation == "swiglu_clamp" and layer.limit is not None else None
-        return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, is_prefill=is_prefill, limit=limit)
+        return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, limit=limit)
 
 
 @register_method(QuantKind.NVFP4, LayerKind.MOE)

@@ -14,7 +14,6 @@ from freetoken.kernel.fla.index import (
     prepare_chunk_offsets,
 )
 from freetoken.kernel.fla.op import exp, safe_exp
-from freetoken.kernel.fla.prefill_scratch import prefill_scratch
 from freetoken.kernel.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
@@ -22,18 +21,8 @@ from freetoken.kernel.fla.utils import (
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-# Pre-Volta defaults (BV16, 8 warps) are 11.3x (BV32, 4 warps) on GP102 (20.3 -> 1.8 ms
-# per layer per 1536-token chunk, 16Kg/32H heads): the 4-warp launch sits on the wrong
-# side of an occupancy cliff for this shape. BV only splits the independent V columns,
-# so the tile choice is math-neutral; the env knobs still override.
-from freetoken.utils.arch import is_arch_supported
-
-if is_arch_supported(7, 0):
-    _H_BV, _H_WARPS = "32", "4"
-else:
-    _H_BV, _H_WARPS = "16", "8"
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", _H_BV))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", _H_WARPS))
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
@@ -332,12 +321,9 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    # GDN prefill transients carved from the pinned slab pool (prefill_scratch.py) so the
-    # caching allocator never frees/re-fragments them between prefill steps. `h` is the
-    # dominant transient (scales with NT chunks); both are kernel-written accumulators.
-    h = prefill_scratch((B, NT, H, V, K), "gdn_h", k)
+    h = k.new_empty(B, NT, H, V, K)
 
-    v_new = prefill_scratch(u.shape, "gdn_v_new", u) if save_new_value else None
+    v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
