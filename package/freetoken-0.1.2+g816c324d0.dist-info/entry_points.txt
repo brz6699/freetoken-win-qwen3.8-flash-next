@@ -1,0 +1,2 @@
+[console_scripts]
+ft = freetoken.cli:main
