@@ -60,13 +60,13 @@ Stage A 把 1M profile 跑起来了。下一个问题:流量组合在几小时�
 
 ---
 
-### 4. Verify 阶段统计排除(从 hot-expert LRU)
+### 4. 可选开的 per-layer MoE stats histogram
 
-**(1)** BudgetSlider 让 pool sizes 跟上 live demand 之后,signal 质量本身重要了。Hot-expert LRU 由 cache 实例上的 hit/miss histogram 驱动。这套 histogram 在 cuda graph capture 时被烘进 graph 节点——如果 capture 时 histogram 还在累加,那 graph replay 期间 routing 改变不会反映到 histogram 上(只反映到 cuda-graph 节点重跑的 stats kernel)。Stats 收集开关需要在 capture 之前定下来,否则 verify-vs-decode 阶段的 routing 差异会把 noise 烘进 graph,后续 replay 解不开。上游 recurrence-window admission(`expert_recency`)解决了 first-sighting fetch gating,但没处理 stats 收集本身。
+**(1)** Hot-expert LRU 在这套 PCIe-bound 栈上要跟随真实 decode working set 大小——这部分是上游 `expert_recency` recurrence-window admission 在做的事。另一条独立路径是给 cache-analysis tooling 用的 per-layer hit/miss histogram(`oracle_hit` rate、per-expert skew、cache-size curve)。这套 histogram 必须在 cuda-graph-replayable kernel launch 里累加,这样每次 replay 的真实 routing 都能反映到 histogram(不只是 capture-time routing)。Histogram 没人读的时候(steady-state serving,没在跑分析),累加本身就是 per-step kernel 里的 overhead,应该从 capture graph 里去掉。BudgetSlider 自己不读这套 histogram;它的 demand signal 来自 KV page occupancy + admission-required-token count(scheduler 里的 `BudgetSlider.observe(used_pages, total_pages)` / `observe_need(tokens)`),两条独立信号路径,互不耦合。
 
-**(2)** `OffloadMoeCache.collect_stats` 是 cache 实例上的 boolean attribute,在 engine init 一次性从 `config.moe_collect_stats` 设(`engine/engine.py:830`)。每个 MoE call site(`models/deepseek_v4/moe.py`、`layers/moe.py`)在调用 stats recorder 之前检查 `cache.collect_stats`,为 true 时才调 `cache.record_decode_stats(layer_id)` 或 `cache.record_decode_stats_hybrid(layer_id)`。关闭时 `ensure_experts_hybrid` 仍晋升 LRU 但跳过 per-layer histogram 累加,cuda graph capture 走 no-stats 路径,verify-vs-decode 阶段差异不再被烘进 graph。配合上游 `expert_recency` recurrence-window admission 一起用,first-sighting miss 走 CPU 算不污染 hot-tier 计数。
+**(2)** Cache 实例上有两个独立的 toggle。`OffloadMoeCache.collect_stats`(`moe/offload_cache.py:238`,在 `engine/engine.py:830` 一次性从 `config.moe_collect_stats` 设)gate kernel-side histogram:`offload_kernels.py:46` 通过 `stats=cache.lru_stats[layer_id] if cache.collect_stats else None` 传入,关闭时 stats write 整个从 captured graph 里消失。`collect_decode_freq`(`offload_cache.py:262`)gate `ensure_experts` / `ensure_experts_hybrid` 里另一段 host-side scatter,把 per-expert counts 累到 `decode_freq`;这条只在 cuda graph off 时才工作(captured graph replay 不会重跑 host-side scatter)。两个都默认 off;profiling cache-size-vs-hit-rate curve 或 per-expert skew 时才打开。`record_decode_stats` / `record_decode_stats_hybrid` 方法是 no-op stub,真正的累发生在 kernel 里(`stats=` kwarg)。
 
-**(3)** Expert residency 跟随真实 decode demand,verify-phase 噪声不进 graph。bs=8 mixed-decode aggregate ~187/~193 tok/s 跨 round;bs=4→bs=8 scaling ×1.85——PCIe BW ceiling 之内,无 LRU-thrash 凹陷。
+**(3)** Steady-state serving 两个 toggle 都 off:bs=8 mixed-decode aggregate ~187/~193 tok/s 跨 round;bs=4→bs=8 scaling ×1.85 within PCIe BW ceiling,无 LRU-thrash 凹陷。Histogram 临时开做 cache-size curve:slots 1024→2048→3072 long-text steady-state ≈33→40→44 tok/s,Bench findings 里的 +36% 曲线。
 
 ---
 
