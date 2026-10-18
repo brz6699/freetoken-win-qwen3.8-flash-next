@@ -124,6 +124,31 @@ def _act_and_mul_kernel(
     tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+def _torch_act_and_mul(kind: int, x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    """Pure-torch ``act(gate) * up`` for the CPU-hidden MTP path (and triton-less
+    installs): same math as the kernel, computed in fp32 and cast back."""
+    d = x.shape[-1] // 2
+    xf = x.float()
+    gate, up = xf[..., :d], xf[..., d:]
+    if kind == SILU:
+        act = gate * torch.sigmoid(gate)
+        y = act * up
+    elif kind == GELU_TANH:
+        inner = _SQRT_2_OVER_PI * (gate + 0.044715 * gate.pow(3))
+        y = (0.5 * gate * (1.0 + torch.tanh(inner))) * up
+    elif kind == SWIGLUOAI:
+        g = torch.clamp(gate, max=limit)
+        u = torch.clamp(up, -limit, limit)
+        y = g * torch.sigmoid(alpha * g) * (u + 1.0)
+    elif kind == SWIGLU_CLAMP:
+        g = torch.clamp(gate, max=limit)
+        u = torch.clamp(up, -limit, limit)
+        y = g * torch.sigmoid(alpha * g) * u
+    else:  # GELU (erf)
+        y = (0.5 * gate * (1.0 + torch.erf(gate * 0.7071067811865476))) * up
+    return y.to(x.dtype)
+
+
 def _act_and_mul(
     kind: int,
     x: torch.Tensor,
@@ -131,7 +156,13 @@ def _act_and_mul(
     alpha: float = 0.0,
     limit: float = 0.0,
 ):
-    assert x.is_cuda and x.is_contiguous()
+    if not x.is_cuda:
+        y = _torch_act_and_mul(kind, x, alpha, limit)
+        if out is None:
+            return y
+        out.copy_(y)
+        return out
+    assert x.is_contiguous()
     d = x.shape[-1] // 2
     out_shape = x.shape[:-1] + (d,)
     if out is None:

@@ -144,8 +144,16 @@ class GatedResidual(BaseOP):
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
         return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
 
-    def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
+    def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor | None) -> torch.Tensor:
+        """Inject the block output ``y [T, hidden]`` back into every stream of ``R``.
+
+        ``s = None`` selects the unit-weight combine (vLLM nvidia/hyperconnection.py: "a missing
+        injection applies the block output to every stream with unit weight"), used by the MTP
+        head's embedding branch before its first mix.
+        """
+        if s is None:
+            out = R.unflatten(-1, (self.hc_count, self.hidden_size))
+            return (out + y.unsqueeze(-2)).flatten(-2).to(R.dtype)
         if R.is_cuda:
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)

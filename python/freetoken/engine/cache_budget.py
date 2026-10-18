@@ -13,6 +13,18 @@ from freetoken.utils import div_ceil
 if TYPE_CHECKING:
     import torch
 
+# Physical-ceiling fraction used when --memory-ratio is omitted. With no ratio declared the
+# ceiling is simply "everything still free after weights" (ratio 1.0). The arena takes only the
+# kv+moe footprint, so the CUDA-graph / activation headroom is whatever VRAM the arena leaves
+# unused -- consumed and self-sized by the live capture rather than a guessed fraction. The ratio
+# only matters when explicitly given, where its (1-ratio) remainder is the headroom by definition.
+DEFAULT_MEMORY_RATIO = 1.0
+
+
+def effective_ratio(memory_ratio: float | None) -> float:
+    """Resolve a possibly-None memory_ratio into the concrete ceiling fraction to apply."""
+    return DEFAULT_MEMORY_RATIO if memory_ratio is None else float(memory_ratio)
+
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
@@ -29,13 +41,20 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
 
 
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float | None, baseline_free: int, weights_bytes: int, fixed_cache_size: int
 ) -> int:
-    """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
-    baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
-    is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
-    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    """Net GPU bytes available for the MoE + KV pools.
+
+    With an explicit ``memory_ratio``, the budget is ``ratio x baseline`` minus weights and
+    fixed (non-paged) cache; the ``(1-ratio)`` remainder is the CUDA-graph/activation
+    headroom. With ``memory_ratio=None`` (the default), sizing follows Algorithm 2: declared
+    KV + MoE sizes are authoritative, so the ceiling is the full post-weights free VRAM
+    (equivalent to ratio=1.0 here) and the fit step clamps each pool to its declared size
+    inside that ceiling. Single source of truth for startup auto-sizing and the runtime
+    rebuild fit check.
+    """
+    ratio = effective_ratio(memory_ratio)
+    return int(ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
 def required_bytes(

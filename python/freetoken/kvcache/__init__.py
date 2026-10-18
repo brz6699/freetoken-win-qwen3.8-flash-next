@@ -211,6 +211,10 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        # spec decode keeps the last (1 + K) pre-RoPE index keys pending per request
+        # (vLLM sizing): the ring widens by the draft depth so a straddling group still
+        # finds its members. With MTP off this is the plain index_ratio sizing.
+        num_spec = (model_config.mtp_draft_len or 0) + 1 if model_config.enable_mtp else 0
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -223,6 +227,7 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_spec),
             layer_ids=spec.layer_ids,
             kv_dtype=kv_dtype,
             kv_quant=kv_quant,

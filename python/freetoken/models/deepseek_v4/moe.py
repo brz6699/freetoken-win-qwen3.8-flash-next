@@ -106,15 +106,14 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
-        cache.copy_missing()
+        slots = cache.load_experts(self.layer_id, topk_ids)
         if cache.collect_stats:
             cache.record_decode_stats(self.layer_id)
         return self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
-            topk_ids,
+            slots,
             views=cache.bank_views(),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),

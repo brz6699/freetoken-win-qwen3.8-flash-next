@@ -30,8 +30,9 @@ import time
 # EVERY accepted rebuild wipes the prefix tree (stale page indices from the old geometry);
 # continuous occupancy-following therefore wipes the tree every few turns and the prefix
 # hit ratio never climbs off zero. On tiers, settled load proposes desired == current and
-# the proposal gate returns None. Env FREETOKEN_KV_TIERS overrides the fractions as
-# percentages ("25,50,75,100"); a single 100 disables the ladder (plain follow).
+# the proposal gate returns None. --kv-tiers N (N evenly spaced tiers, translated into the
+# FREETOKEN_KV_TIERS percentage list here) overrides the fractions; a single 100 disables
+# the ladder (plain follow).
 _TIER_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
 
 
@@ -73,6 +74,8 @@ def propose_targets(
     demand_pages: int = 0,
     max_kv_pages: int | None = None,
     allow_small: bool = False,
+    arena_bytes: int | None = None,
+    kv_fixed_bytes: int = 0,
 ) -> dict | None:
     """Rebalance (num_pages, moe_cache_size) inside the CURRENT byte envelope.
 
@@ -104,7 +107,13 @@ def propose_targets(
         # the tree-wiping rebuild only lands when a tier is actually crossed.
         desired_pages = _snap_to_tier(desired_pages, int(max_kv_pages))
     if cur_moe is None:
-        # No slot cache to trade with (dense / owned cache): KV-only resize.
+        # No slot cache to trade with (dense / owned cache): KV-only resize. The pool still
+        # carves the shared arena (left-anchored), so the proposal respects the boundary.
+        if arena_bytes and cache_per_page > 0:
+            desired_pages = min(
+                desired_pages,
+                (arena_bytes - kv_fixed_bytes) // cache_per_page,
+            )
         if desired_pages == cur_pages:
             return None
         if not allow_small and abs(desired_pages - cur_pages) < max(1, round(cur_pages * min_step_ratio)):
@@ -113,13 +122,16 @@ def propose_targets(
 
     hi = min(total_experts, max_slots)
     floor = min(hi, max(num_experts, 2 * num_experts if prefill_overlap else num_experts))
-    # Slide in EXPERT-SLOT units. The old lcm(cache_per_page, per_expert_bytes) step assumed
-    # the two unit sizes share large common factors (Qwen's MB-scale bf16 KV pages vs MB-scale
-    # slots); GLM-class latent-KV geometries put a 0.2 MiB page against a 13.5 MiB slot --
-    # nearly coprime, lcm 747 GiB vs a 7 GiB envelope -- so the chunk count rounded to zero on
-    # every proposal and the slider never moved for that family. Slot units plus the
-    # back-derivation of new_pages below keep the envelope conserved to within one page
-    # (bounded sub-cache_per_page drift per slide; every rebuild's fit-check re-validates it).
+    # Slide in EXPERT-SLOT units. cpp and peb both sit on the gcd(cpp, peb) byte lattice,
+    # so any (pages, slots) trade moves whole-lattice bytes; the integer division below
+    # truncates the trade in the SHRINKING direction, so the (moe, pages) byte total never
+    # exceeds the current geometry's -- the drift is bounded (at most one page's bytes per
+    # slide) and does NOT accumulate, because every proposal re-derives from the CURRENT
+    # geometry. (The old lcm(cpp, peb) step assumed the two unit sizes share large common
+    # factors; GLM-class latent-KV geometries put a 0.2 MiB page against a 13.5 MiB slot --
+    # nearly coprime, lcm 747 GiB vs a 7 GiB envelope -- so the chunk count rounded to
+    # zero on every proposal and the slider never moved for that family. Slot units fixed
+    # that; the min-step gate below keeps every move worth at least several MoE slots.)
     delta_slots = round((desired_pages - cur_pages) * cache_per_page / per_expert_bytes)
     new_moe = max(floor, min(cur_moe - delta_slots, hi))
     # Pages follow what the MoE side ACTUALLY afforded after clamping, so the byte
@@ -140,6 +152,57 @@ def propose_targets(
         new_moe = min(
             hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
         )
+    if max_kv_pages is not None and new_pages > max_kv_pages:
+        # The slot delta rounds UP, so the back-derived page count can overshoot the
+        # user's declared KV ceiling by a page or two (e.g. 333 slots = 2049.1 pages of
+        # trade against a 2048-page gap to the cap). The ceiling is a hard contract --
+        # users size max-tokens to the model's acceptance -- so clamp it back; MoE
+        # keeps the bytes the extra pages would have taken.
+        new_moe = min(
+            hi,
+            max(
+                floor,
+                new_moe + (new_pages - max_kv_pages) * cache_per_page // per_expert_bytes,
+            ),
+        )
+        new_pages = max_kv_pages
+    if arena_bytes:
+        # Hard envelope: both pools carve the ONE shared cache arena (KV left-anchored,
+        # MoE banks right-anchored), allocated once at cold start and never grown. A
+        # target whose (moe, pages) footprint exceeds it aliases the two carves onto
+        # each other (corrupted experts/KV -> garbled output), so the proposal itself
+        # must land inside the boundary: the MoE half (the elastic side) absorbs the
+        # excess first; if the slot floor still overflows, the page count gives ground
+        # back so the pair sits exactly on the boundary.
+        def _fits(moe, pages):
+            return (
+                moe * per_expert_bytes + pages * cache_per_page + kv_fixed_bytes
+                <= arena_bytes
+            )
+
+        if per_expert_bytes > 0 and not _fits(new_moe, new_pages):
+            new_moe = max(
+                floor,
+                min(
+                    new_moe,
+                    (arena_bytes - kv_fixed_bytes - new_pages * cache_per_page)
+                    // per_expert_bytes,
+                ),
+            )
+            if not _fits(new_moe, new_pages):
+                new_pages = max(
+                    min_kv_pages,
+                    (arena_bytes - kv_fixed_bytes - new_moe * per_expert_bytes)
+                    // cache_per_page,
+                )
+                new_moe = max(
+                    floor,
+                    min(
+                        new_moe,
+                        (arena_bytes - kv_fixed_bytes - new_pages * cache_per_page)
+                        // per_expert_bytes,
+                    ),
+                )
     if not allow_small and (
         abs(new_moe - cur_moe) < max(4, round(cur_moe * min_step_ratio))
         and abs(new_pages - cur_pages) < max(1, round(cur_pages * min_step_ratio))

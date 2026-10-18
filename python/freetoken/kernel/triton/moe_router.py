@@ -118,6 +118,22 @@ def fused_topk_softmax(
     """
     assert gating_output.ndim == 2, "gating_output must be 2D"
     M, N = gating_output.shape
+
+    if not gating_output.is_cuda:
+        # Softmax over all experts, top-k, optional renormalize; rows at/past the
+        # non-padded limit get expert id -1 (mirrors the kernel on the CPU-hidden head).
+        probs = torch.softmax(gating_output.float(), dim=-1)
+        weights, indices = probs.topk(topk, dim=-1)
+        indices = indices.to(torch.int32)
+        if renormalize:
+            denom = weights.sum(dim=-1, keepdim=True)
+            weights = weights / torch.where(denom > 0.0, denom, torch.ones_like(denom))
+        if num_token_non_padded is not None:
+            limit = int(num_token_non_padded.item())
+            rows = torch.arange(M, device=gating_output.device)
+            indices = indices.masked_fill((rows >= limit)[:, None], -1)
+        return weights.contiguous(), indices.contiguous()
+
     weights = torch.empty((M, topk), dtype=torch.float32, device=gating_output.device)
     indices = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
 

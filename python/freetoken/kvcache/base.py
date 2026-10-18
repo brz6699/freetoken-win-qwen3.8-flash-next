@@ -97,12 +97,20 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", **targets,
+        extra_fixed_bytes: int = 0, extra_note: str = "", arena_bytes: int | None = None,
+        **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
         sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
+
+        ``arena_bytes`` is the shared cache arena's actual size: the tighter, PHYSICAL
+        bound (see the arena check below) that the ceiling-based budget check alone does
+        not enforce. The engine passes it for both rebuild and slide paths. The pool's
+        OWN fixed tiers (from kv_cost) carve the arena alongside the pages, so they join
+        ``need`` in the check; sibling pools (GDN state, MTP bank) allocate OUTSIDE the
+        arena and do not.
 
         The base names no family-specific target: the engine forwards the whole request
         bag through ``**targets``, overrides declare the keys they consume (DSV4:
@@ -124,10 +132,34 @@ class BaseKVCachePool(ABC):
             fixed_cache_size + extra_fixed_bytes,
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
-        if need > budget:
+        # Tolerate a few MiB of accounting drift between the budget derivation (memory_ratio
+        # math) and need (which may double-count sibling-pool fixed bytes vs baseline_free):
+        # both sides are exact bytes, but the display rounds to GiB and showed "needs 14.40 GiB
+        # > budget 14.40 GiB" -- an equality reject that pinned KV in a shrunk state. The
+        # teardown path (gc + empty_cache before alloc) covers this slack in practice.
+        tol = max(32 << 20, budget // 512)
+        if need > budget + tol:
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
                 f"needs {mem_GB(need)} > budget {mem_GB(budget)}; old cache kept, still serving"
+            )
+        if arena_bytes and need + fixed_cache_size > arena_bytes:
+            # The physical bound. The budget ceiling is VRAM accounting; the arena is the
+            # one flat block both pools carve (KV left-anchored, MoE banks right-anchored),
+            # allocated ONCE at the cold-start footprint and never grown -- the free VRAM
+            # between the footprint and the ceiling is graph-capture/activation headroom,
+            # not cache space. A target past it makes the two carves alias each other
+            # (observed: MoE banks overlapping -> corrupted expert rows -> garbled output,
+            # because _alloc_slot_cache clamps its right anchor at 0 instead of failing).
+            # The pool's fixed index tiers carve the arena with the pages, so they join
+            # the target's need; the cold geometry is accepted exactly (its footprint +
+            # fixed tiers IS the arena). Reject before teardown so the old cache keeps
+            # serving; no tolerance here -- the arena has no borrowable slack.
+            raise CacheRebuildRejected(
+                f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
+                f"needs {mem_GB(need + fixed_cache_size)} but the shared cache arena is "
+                f"{mem_GB(arena_bytes)} (allocated once at cold start, never grown); "
+                "old cache kept, still serving"
             )
 
     @abstractmethod
@@ -184,6 +216,15 @@ class BaseCacheHandle(ABC):
 
     @abstractmethod
     def get_matched_indices(self) -> torch.Tensor: ...
+
+    def commit_floor(self) -> int:
+        """Reclaim free-floor: the prefix length below which the request owns no KV pages to
+        return to the pool. Default (every tree handle) borrows the tree's pages for
+        [0, cached_len) and owns none of that span -> floor = cached_len. A RAM-tier restore
+        handle overrides this to 0: it allocated its OWN fresh pages for the whole [0,
+        cached_len) restore span, so the tree-covered part of that span is a request DUPLICATE
+        that must be freed, not a tree reuse to keep."""
+        return self.cached_len
 
 
 class SizeInfo(NamedTuple):

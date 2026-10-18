@@ -52,6 +52,9 @@ class EngineConfig:
     # safe point (engine/budget_slide.py). Disable to freeze the startup split.
     budget_slide: bool = True
     moe_cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits only its routed experts into the slot
+    # cache (GPU decode only), like decode; 0 streams whole layers.
+    moe_prefill_demand_tokens: int = 0
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
@@ -73,10 +76,24 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # MTP speculative decoding (--mtp-draft-len): the checkpoint's native 1-layer head drafts
+    # this many tokens on the GPU per decode step; the full model verifies them in one extend
+    # forward and keeps the greedy-longest prefix. Setting the length IS the switch (None =
+    # off); single greedy requests only.
+    mtp_draft_len: int | None = None
+    # MTP draft+verify compute device (--mtp-device): "gpu" runs the whole MTP path on the GPU;
+    # "cpu" hides the head draft + verify compute on the CPU behind the GPU main-model forward.
+    mtp_device: str = "gpu"
+    # Storage dtype of the MTP head's routed-expert bank (--mtp-expert-quant):
+    # "none" bf16 | "fp8" e4m3 + per-tensor scale | "q4_0" nibble-packed groups of 32.
+    mtp_expert_quant: str = "none"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
-    memory_ratio: float = 0.9
+    # None = Algorithm 2 (declared sizes drive the budget: --num-tokens/--num-pages first,
+    # then --moe-cache-size, with full VRAM as the ceiling). A float = Algorithm 1: ratio x
+    # measured baseline minus weights is the budget envelope. Priority: ratio > KV > MoE.
+    memory_ratio: float | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -106,6 +123,12 @@ class EngineConfig:
     # index keys stay bf16. QSA models (Qwen3.8-Flash-Next) only -- enforced by the engine.
     # Every per-byte budget formula must price kv_dtype/kv_cache_dtype, never dtype.
     kv_cache_dtype: str = "bf16"
+
+
+    @property
+    def enable_mtp(self) -> bool:
+        """Derived from --mtp-draft-len: naming a draft length is what turns MTP on."""
+        return self.mtp_draft_len is not None
 
     @cached_property
     def kv_dtype(self) -> torch.dtype:
@@ -156,7 +179,13 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return replace(parse_config(hf_config), quant=quant)
+
+        return replace(
+            parse_config(hf_config),
+            quant=quant,
+            enable_mtp=self.enable_mtp,
+            mtp_draft_len=self.mtp_draft_len,
+        )
 
     @property
     def max_seq_len(self) -> int:

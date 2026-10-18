@@ -25,7 +25,8 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, fit_linear_pool_slots,
+    state_pool_bytes,
 )
 from freetoken.mm.config import ENCODER_SECTIONS
 
@@ -64,11 +65,20 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
-    """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
-    what the resident model consumed. Kept as a pure function so the composition with the
-    pool families' ``solve_num_pages`` stays CPU-testable."""
-    return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+def _startup_kv_budget(
+    memory_ratio: float | None, init_free_memory: int, new_free_memory: int
+) -> int:
+    """Bytes available to the KV pool at startup.
+
+    Explicit ``memory_ratio``: ratio-scaled pre-load free memory minus what the resident model
+    consumed. With ``memory_ratio=None`` the ceiling falls back to DEFAULT_MEMORY_RATIO so the
+    (1-ratio) remainder stays available as CUDA-graph/activation headroom. Kept as a pure
+    function so the composition with the pool families' ``solve_num_pages`` stays CPU-testable.
+    """
+    from freetoken.engine.cache_budget import effective_ratio
+
+    ratio = effective_ratio(memory_ratio)
+    return int(ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -292,6 +302,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Committed token ids for an MTP step, one list per request (anchor + accepted drafts +
+    # bonus). None on the plain single-token path, so every existing 3-value unpack of this
+    # tuple keeps working where it reads by index/attribute. scheduler._process_last_data
+    # indexes the outer list by request position when this is set.
+    mtp_tokens: "list[list[int]] | None" = None
 
 
 class Engine:
@@ -408,6 +423,10 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+
+        # GPU-resident MTP expert bank (loaded in load_host_tables above): a fixed cost the
+        # pools must be sized around, priced into every budget like the state pool is.
+        available_memory -= self._mtp_gpu_bank_bytes()
         self._ensure_cache_arena(config)
         if self.moe_offload_cache is not None:
             # Shared arena: the KV side may only take the bytes the MoE banks did not.
@@ -426,14 +445,64 @@ class Engine:
             arena=self._cache_arena,
         )
 
+        # ======================= MTP speculative head wiring (--mtp) =======================
+        # Private dense-GQA KV for the 1-layer head, indexed by the SAME physical locs the
+        # page table hands out (plus draft_len+1 scratch rows past num_tokens for the draft
+        # chain of one step). Gated on --mtp so a plain serve pays nothing.
+        self._mtp_scratch_base = 0
+        if getattr(config, "enable_mtp", False):
+            head = getattr(self.model, "mtp", None)
+            if head is not None:
+                mc = config.model_config
+                extra = max(1, int(getattr(config, "mtp_draft_len", 2))) + 1
+                # CPU-hidden path (--mtp-device cpu): the head's own weights, its rope cache and
+                # its private KV pool all live on the CPU so the whole draft block is one coherent
+                # CPU compute region; only the shared embed_tokens/lm_head (big, reused by the main
+                # model) stay on the GPU and are bridged at the head.forward boundary. gpu path:
+                # everything on self.device, identical to before.
+                mdev = (
+                    self.device
+                    if str(getattr(config, "mtp_device", "gpu") or "gpu").lower() != "cpu"
+                    else torch.device("cpu")
+                )
+                head.to(mdev)
+                self._mtp_pool = torch.zeros(
+                    2,
+                    num_tokens + extra,
+                    mc.num_kv_heads,
+                    mc.head_dim,
+                    device=mdev,
+                    dtype=self.dtype,
+                )
+                head.self_attn.attach_pool(self._mtp_pool[0], self._mtp_pool[1])
+                head.attach_embed(self.model.model.embed_tokens)
+                self.model.model._mtp_head = head
+                self._mtp_scratch_base = num_tokens
+
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
+            # The GDN pool is a sibling of the KV family: when the KV half is pinned by
+            # --num-tokens/--num-pages and/or the MoE bank is large, the startup-default slot
+            # count can no longer fit the free VRAM that survives them -- the original code
+            # just called torch.zeros on it and OOMed. Clamp the slot count to what actually
+            # fits here (shrinking only the cross-request snapshot cache, never the admission
+            # floor); a clear MemoryError fires if even the floor is too big.
+            default_slots = _linear_pool_num_slots(config)
+            free_now = self._sync_get_memory()[0]
+            num_gdn_slots = fit_linear_pool_slots(config, free_now)
+            if num_gdn_slots < default_slots:
+                logger.info_rank0(
+                    f"GDN state pool: {default_slots} -> {num_gdn_slots} slots "
+                    f"(~{state_pool_bytes(config, num_gdn_slots) / 1e9:.2f} GiB to fit "
+                    f"{free_now / 1e9:.2f} GiB free; snapshot cache trimmed)"
+                )
+
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
-                num_slots=_linear_pool_num_slots(config),
+                num_slots=num_gdn_slots,
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
@@ -536,15 +605,17 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
-            model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
-            ),
-            device=self.device,
+
+        weights = load_weight(
+            config.model_path,
+            self.device,
+            include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
         )
+        if not config.enable_mtp:
+            # the MTP head is only constructed with --mtp, so drop its keys for the strict
+            # load (otherwise the 21 mtp.* dense tensors would be "unexpected keys")
+            weights = ((k, v) for k, v in weights if not k.startswith("mtp."))
+        return _materialize_loaded_weight_state_dict(model_state, weights, device=self.device)
 
     def _resolve_auto_moe_cache_size(
         self, config: EngineConfig, banks, method, reserve_pages: int | None = None
@@ -562,7 +633,7 @@ class Engine:
         from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += state_pool_bytes(config) + self._mtp_gpu_bank_bytes()  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
@@ -576,20 +647,29 @@ class Engine:
             kernel_slots = min(kernel_slots, total_experts)
         marlin_slots = MARLIN_MAX_CACHE_SIZE if banks.quant_format == "nvfp4_marlin" else None
         max_slots = min(kernel_slots, marlin_slots) if kernel_slots is not None and marlin_slots is not None else (kernel_slots or marlin_slots)
+
+        per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        self._arena_per_expert_bytes = per_expert_bytes
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
             kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             max_slots=max_slots,
+
         )
+
+    def _mtp_gpu_bank_bytes(self) -> int:
+        """Expert bytes the MTP bank holds on-device (--mtp only); 0 on every other path."""
+        head = getattr(self.model, "mtp", None)
+        return getattr(head.bank, "gpu_bytes", 0) if head is not None else 0
 
     def _ensure_cache_arena(self, config: EngineConfig) -> None:
         """One flat byte block for the two sliding caches: KV from the LEFT end, MoE bank
@@ -601,16 +681,42 @@ class Engine:
         checks all enforce, so any validated (moe, pages) geometry fits by construction."""
         if getattr(self, "_cache_arena", None) is not None:
             return
-        from freetoken.engine.cache_budget import net_cache_budget_bytes
+        from freetoken.engine.cache_budget import net_cache_budget_bytes, required_bytes
 
-        _, fixed_cache_size, _, _ = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)
-        budget = max(
+        cache_per_page, pool_fixed, _, _ = self._pool_cls.kv_cost(config)
+        # Sibling pools (GDN state, MTP bank) allocate their OWN tensors -- they do not
+        # carve the arena -- but they consume the same post-weights VRAM, so they enter
+        # the CEILING accounting; only the pool's fixed index tiers carve the arena.
+        fixed_cache_size = pool_fixed + state_pool_bytes(config) + self._mtp_gpu_bank_bytes()
+        ceiling = max(
             0,
             net_cache_budget_bytes(
                 config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
             ),
         )
+        # Arena = the byte footprint of the resolved kv+moe geometry, capped by the ceiling so an
+        # over-declaration still fits physical VRAM. Everything the pools do NOT need is left as
+        # free VRAM, which is exactly what CUDA-graph capture and activations then consume: the
+        # capture is self-sizing -- GraphRunner measures free-after-init before capture and shrinks
+        # its bs set to fit -- so the graph headroom tracks real demand instead of a guessed ratio.
+        # A fixed-ratio reservation over-/under-shot that (observed: bs=[1,2,4,8] capture takes
+        # ~3.3 GiB, far off a flat per-bs estimate). Falls back to the ceiling when sizes were not
+        # both resolved (pure auto sizing reads free memory later).
+        per_expert = getattr(self, "_arena_per_expert_bytes", 0)
+        pages = config.num_page_override
+        budget = ceiling
+        if per_expert and pages:
+            # + the pool's fixed index tiers (ring + cmp scratch): the KV carve is
+            # pages x cache_per_page AND those fixed bytes, so the boundary the two
+            # carves meet at is exact -- without them the KV tail aliases the lowest
+            # MoE bank rows by the fixed amount. Sibling GDN/MTP bytes stay OUT of the
+            # footprint: they are separate allocations, and sizing the arena for them
+            # would pre-allocate VRAM the pools never carve.
+            footprint = (
+                required_bytes(config.moe_cache_size, pages, per_expert, cache_per_page)
+                + pool_fixed
+            )
+            budget = min(footprint, ceiling) if footprint > 0 else ceiling
         # Round to 16 bytes: the fused-copy descriptor requires every bank cache's
         # data_ptr to be 16-aligned, and the right-anchored packing derives each bank's
         # offset from the arena END -- a multiple-of-16 length keeps that anchor aligned.
@@ -631,7 +737,7 @@ class Engine:
         from freetoken.utils import div_ceil
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)
+        fixed_cache_size += state_pool_bytes(config) + self._mtp_gpu_bank_bytes()
         budget = net_cache_budget_bytes(
             config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
         )
@@ -639,6 +745,7 @@ class Engine:
         num_experts = mc.num_experts
         total_experts = mc.num_moe_layers * num_experts
         max_slots = MARLIN_MAX_CACHE_SIZE if banks.quant_format == "nvfp4_marlin" else total_experts
+        self._arena_per_expert_bytes = expert_bytes_per_slot(banks.sources)
         kv_floor = max(config.kv_reserve_tokens, min_reserve)
         if method is not None:
             # the expert kernel's int32 slot cap also binds a DECLARED size: an over-cap
@@ -805,6 +912,8 @@ class Engine:
                 cache_size=config.moe_cache_size,
                 device=self.device,
                 cache_policy=config.moe_cache_policy,
+
+                prefill_demand_tokens=config.moe_prefill_demand_tokens,
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
@@ -943,6 +1052,15 @@ class Engine:
         )
         return target_moe, per_expert_bytes
 
+    def _arena_bytes(self) -> int | None:
+        """The shared cache arena's actual size in bytes -- the PHYSICAL envelope of the
+        two sliding pools (KV left-anchored, MoE right-anchored), fixed at cold start.
+        None only before the arena exists (init) or on the no-arena legacy path; both
+        rebuild paths run post-init, so a live engine always has one when the pools are
+        arena-backed."""
+        arena = getattr(self, "_cache_arena", None)
+        return int(arena.numel()) if arena is not None else None
+
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
         # the model's per-access pool property all keep pointing at THIS pool, which frees its old
@@ -1056,6 +1174,7 @@ class Engine:
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
+            arena_bytes=self._arena_bytes(),
         )
 
         torch.cuda.synchronize(self.device)
@@ -1107,8 +1226,13 @@ class Engine:
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
-        #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+        #    the backend). Return the resized pools' freed blocks to the driver BEFORE
+        #    GraphRunner measures free memory, exactly as the slide path does: otherwise the
+        #    old pools stay reserved as partially-used segments and the recaptured graphs
+        #    under-size their headsroom (or the post-rebuild forward OOMs) even though the
+        #    bytes are logically free.
         gc.collect()
+        torch.cuda.empty_cache()
         free_min = self._sync_get_memory()[0]
         self.graph_runner = GraphRunner(
             stream=self.stream,
@@ -1208,6 +1332,7 @@ class Engine:
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
+            arena_bytes=self._arena_bytes(),
         )
 
         torch.cuda.synchronize(self.device)
@@ -1259,6 +1384,7 @@ class Engine:
         torch.cuda.empty_cache()
         logger.info_rank0("cache slide applied (preserve-residency rebuild)")
 
+
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
         for item in self.mm_processor.dummy_items(self.dtype, self.device):
@@ -1292,12 +1418,15 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+    def forward_batch(
+        self, batch: Batch, args: BatchSamplingArgs, eager_only: bool = False
+    ) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+
+            if not eager_only and self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -1315,6 +1444,24 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    @torch.inference_mode()
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """Eager forward returning the raw logits (no sampling, no bookkeeping): the MTP
+        verify / rollback re-runs consume the rows directly."""
+        assert torch.cuda.current_stream() == self.stream
+        with self.ctx.forward_batch(batch):
+            return self.model.forward()
+
+    def mtp_forward(
+        self, batch: Batch, residual: torch.Tensor, input_ids: torch.Tensor
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """One draft step of the MTP head: (pre-mixer residual, next tokens) ->
+        ``(draft_logits, multi_hidden)`` on the head's private KV pool. Scoped under the draft
+        batch so the head's leaf ``lm_head`` (which asserts an active ctx batch) sees it."""
+        m = self.model
+        with self.ctx.forward_batch(batch):
+            return m.mtp.forward(batch, residual, input_ids, m.model.embed_tokens, m.lm_head)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1597,6 +1744,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",

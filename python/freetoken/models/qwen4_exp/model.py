@@ -102,6 +102,9 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        # MTP head reference set by the engine when --mtp is on (underscore: plain back-reference,
+        # never in the state dict; None keeps the --mtp-off forward exactly as before).
+        self._mtp_head = None
 
     @property
     def ple_layers(self) -> List[PLELayer]:
@@ -124,7 +127,17 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        # Stash the pre-mixer residual [T, hc*hidden]: the MTP head's residual input for
+        # self-speculation (only read when --mtp is on; underscore -> never in the state dict).
+        self._last_residual = hidden
+        ctx_out = self.hyper_connection_mixer.mix(hidden)[0]
+        if self._mtp_head is not None:
+            # MTP context KV: the head's attention context for position t is the fused row
+            # (E(x_{t+1}), H_t), where H_t is this forward's PRE-top-mixer multi stream
+            # (see Qwen4ExpMTP.write_ctx_kv). Gated on the engine-set reference so a
+            # --mtp-off serve pays nothing.
+            self._mtp_head.write_ctx_kv(batch, hidden)
+        return ctx_out
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -139,13 +152,43 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        # MTP speculative head: built only when --mtp is on, so an --mtp-off serve pays
+        # nothing for it (the engine's weight loader drops the mtp.* keys in that case).
+        self.mtp = None
+        if getattr(config, "enable_mtp", False):
+            from .mtp import MtpExpertBank, Qwen4ExpMTP
+
+            self.mtp = Qwen4ExpMTP(
+                config,
+                MtpExpertBank(
+                    config.num_experts,
+                    config.moe_intermediate_size,
+                    config.hidden_size,
+                    torch.bfloat16,
+                ),
+            )
         super().__init__()
+
+    def _load_mtp_bank(self, engine_config) -> int:
+        """Load the MTP routed-expert bank (GPU-resident when VRAM allows, else pinned host
+        RAM); returns the pinned host bytes to reserve. No-op when the head was never built."""
+        head = getattr(self, "mtp", None)
+        if head is None or getattr(engine_config, "use_dummy_weight", False):
+            return 0
+        from .weight import load_mtp_experts
+
+        mtp_device = (
+            torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+        )
+        quant = str(getattr(engine_config, "mtp_expert_quant", "none") or "none").lower()
+        return load_mtp_experts(engine_config.model_path, head.bank, device=mtp_device, quant=quant)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
+        pinned_bytes = self._load_mtp_bank(engine_config)
         ple_layers = self.model.ple_layers
         if not ple_layers:
-            return 0
+            return pinned_bytes
         from .ple import PinnedUVATable, ZeroTable, derive_ngram_hash_constants
 
         if getattr(engine_config, "use_dummy_weight", False):
@@ -165,7 +208,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
-            return 0
+            return pinned_bytes
 
         if engine_config.ple_backend == "disk":
             from freetoken.utils import download_hf_weight
@@ -196,7 +239,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 ple.ple_embedding.attach_table(disk_table)
             # engine enters this around every dispatch; the graph itself never waits on the disk
             self.forward_host_ctx = disk_table.forward_host_ctx
-            return 0
+            return pinned_bytes
 
         from .weight import load_ple_table
 
@@ -206,7 +249,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             ple.ple_embedding.attach_table(
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
-        return table.bank.nbytes
+        return pinned_bytes + table.bank.nbytes
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

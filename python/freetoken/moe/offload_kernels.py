@@ -24,7 +24,15 @@ _HYBRID_FETCH_BY_RECENCY = (
 _HYBRID_RECENCY_WINDOW = max(1, int(os.getenv("FREETOKEN_HYBRID_WINDOW", "64")))
 
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+# lru_ensure dedups its query in a [K, K] register block: flat in cost up to 128 ids, spilling past
+# that and failing to compile past 1024, so a wider admission goes to it in queries this wide.
+ENSURE_QUERY_WIDTH = 128
+# The widest decode step admitted in one call: up to 256 ids the spill costs less than the distinct experts'
+# queries and their own launches, and past it far more (RTX 3090 Ti, CUDA-graph replay).
+ENSURE_ONE_CALL_WIDTH = 256
+
+
+def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -43,7 +51,7 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        stats=cache.lru_stats[layer_id] if cache.collect_stats and record_stats else None,
         id_base=layer_id * cache.num_experts,
     )
 
@@ -176,12 +184,24 @@ def _ensure_experts_hybrid_cpu(
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
     num_fetch = min(len(elig), int(max_fetch))
+
+    # Mirror the GPU zero-split promotion: a zero cap with eligible misses and an empty slot
+    # promotes one recurring miss so the working set keeps warming (see the kernel comment).
+    promotion_slot = -1
+    if frac_q16 > 0 and num_fetch == 0 and elig:
+        for s in range(cache.cache_size):
+            if int(cache.id_of_slot[s].item()) < 0:
+                promotion_slot = s
+                break
+        if promotion_slot >= 0:
+            num_fetch = 1
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
     for idx in range(num_fetch):
         expert = elig[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+
+        victim = promotion_slot if promotion_slot >= 0 else min(range(cache.cache_size), key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -381,6 +401,18 @@ def _ensure_experts_hybrid_kernel(
     cutoff = tl.maximum(0, step - WINDOW)
     elig = is_missing & (rec >= cutoff)
     num_fetch = tl.minimum(num_fetch, tl.sum(elig.to(tl.int32)))
+
+
+    # Even a zero bandwidth-split cap must not leave recurring misses on the CPU while empty
+    # slots sit idle: promote the highest-recency eligible miss into the first empty slot so a
+    # stable working set can keep warming the cache. Only fires when the cap already drove the
+    # fetch count to exactly zero with eligible misses and a free slot present.
+    promotion_slot = tl.full((), -1, tl.int32)
+    if (fetch_frac_q16 > 0) & (num_fetch == 0) & (tl.sum(elig.to(tl.int32)) > 0):
+        off_c0 = tl.arange(0, BLOCK_C)
+        owners = tl.load(id_of_slot_ptr + off_c0, mask=off_c0 < cache_size, other=-1)
+        promotion_slot = tl.min(tl.where(owners < 0, off_c0, cache_size))
+        num_fetch = (promotion_slot < cache_size).to(tl.int32)
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
 
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
@@ -406,7 +438,7 @@ def _ensure_experts_hybrid_kernel(
             owner_active = owner_active | (oid == base + ei)
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
-            victim = tl.argmin(u, axis=0).to(tl.int32)
+            victim = tl.where(promotion_slot >= 0, promotion_slot, tl.argmin(u, axis=0)).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)

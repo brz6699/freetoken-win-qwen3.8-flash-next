@@ -62,6 +62,9 @@ def shared_gate_sigmoid(hidden_states: torch.Tensor, gate_weight: torch.Tensor) 
     assert hidden_states.stride(1) == 1, "shared gate requires unit inner stride"
     assert gate_weight.shape == (hidden_dim,) and gate_weight.is_contiguous()
 
+    if not hidden_states.is_cuda:
+        return torch.sigmoid(hidden_states.float() @ gate_weight.float()).to(torch.float32)
+
     gate = torch.empty(num_tokens, dtype=torch.float32, device=hidden_states.device)
     _gate_sigmoid_kernel[(num_tokens,)](
         hidden_states,
@@ -115,6 +118,10 @@ def shared_gate_mul_add(
     assert shared.shape == routed.shape
     assert routed.stride(1) == 1 and shared.stride(1) == 1
     assert gate.shape == (num_tokens,)
+
+    if not routed.is_cuda:
+        # Match the kernel: fp32 accumulate, cast back to the output dtype.
+        return (routed.float() + gate[:, None].float() * shared.float()).to(routed.dtype)
 
     out = torch.empty_like(routed)
     block_size = min(triton.next_power_of_2(hidden_dim), 2048)

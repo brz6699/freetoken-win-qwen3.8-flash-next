@@ -204,23 +204,22 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def _index_rope_cache(self) -> torch.Tensor:
         """cos/sin table of the indexer rope: same rotary_dim and frequencies as the main
-        attention, ``head_size`` 128 instead of 256, so it is a separate get_rope instance.
+        attention with ``head_size`` 128 instead of 256, so the attention's own table.
 
         The table itself (not RotaryEmbedding.forward) because the indexer's norm+rope is one
         fused kernel and the compressed keys rope at their group's position, not the query's."""
         if self._index_cos_sin is None:
-            from freetoken.layers.rotary import get_rope
+            from freetoken.layers.rotary import rope_cos_sin_table
 
             rotary = self.rotary_config
             with torch.device(self.device):
-                rope = get_rope(
-                    head_dim=self.index_head_dim,
-                    rotary_dim=rotary.rotary_dim,
-                    max_position=rotary.max_position,
-                    base=rotary.base,
-                    rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
+                self._index_cos_sin = rope_cos_sin_table(
+                    self.index_head_dim,
+                    rotary.rotary_dim,
+                    rotary.max_position,
+                    rotary.base,
+                    tuple(rotary.scaling.items()) if rotary.scaling else None,
                 )
-            self._index_cos_sin = rope._cos_sin_cache.to(self.device)
         return self._index_cos_sin
 
     def _index_rope_rows(self, positions: torch.Tensor) -> torch.Tensor:
@@ -367,6 +366,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
             if rope_positions.dim() == 1:
                 rope_positions = rope_positions.unsqueeze(0).expand(3, -1)
             rope_positions = rope_positions.to(torch.int32)
+            # Padded/dummy rows carry out_loc pointing at the reserved dummy-page slot; clamp to
+            # the rope table's last row so index_copy_/index_select stay in bounds (padded rows are
+            # sinks -- their stored triple is never attended by a live token). clamp_ needs no
+            # source tensor, so it is safe inside CUDA-graph capture (torch.minimum against a
+            # host scalar would force a CPU->CUDA copy).
+            out_loc.clamp_(max=self.kvcache.rope_positions.shape[0] - 1)
             self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
             # groups are ratio-aligned within a page, so the group start is the slot rounded down
             first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()

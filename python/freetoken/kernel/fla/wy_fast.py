@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.fla.index import prepare_chunk_indices
+from freetoken.kernel.fla.prefill_scratch import prefill_scratch
 
 
 # @triton.autotune(
@@ -126,8 +127,11 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
-    w = k.new_empty(B, T, H, K)
+    # GDN prefill transients carved from the pinned slab pool (prefill_scratch.py) so the
+    # caching allocator never frees/re-fragments them between prefill steps; both are
+    # kernel-written accumulators (every element overwritten by recompute_w_u_fwd_kernel).
+    u = prefill_scratch(v.shape, "gdn_u", v)
+    w = prefill_scratch((B, T, H, K), "gdn_w", k)
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
         v=v,

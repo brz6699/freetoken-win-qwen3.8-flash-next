@@ -10,6 +10,7 @@ import triton.language as tl
 
 from freetoken.kernel.fla.index import prepare_chunk_indices
 from freetoken.kernel.fla.op import exp, safe_exp
+from freetoken.kernel.fla.prefill_scratch import prefill_scratch
 from freetoken.kernel.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -123,6 +124,14 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+# The GDN prefill output `o` is carved from the pinned slab pool (prefill_scratch.py) instead
+# of a per-call `torch.zeros_like(v)`. That transient cudaMalloc OOMs under Windows'
+# non-expandable caching allocator once the pool fragments (a cold ~8K prefill needs ~96 MiB
+# contiguous that the allocator can't find at that instant). Pinning it in a grow-only slab
+# keeps its contiguous run resident. The kernel overwrites EVERY element of o each call, so
+# the shared slab needs no re-zero (see prefill_scratch.py for the full rationale).
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -143,11 +152,24 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    o = prefill_scratch(v.shape, "gdn_o", v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    # Pre-Volta: (BK128, BV64, w4) leaves the kernel at ~1% of the fp32 FMA peak -- the
+    # operand tiles (q/k/h, 16 KiB each) plus the two-stage pipeline overshoot the 48 KiB
+    # block budget and triton degrades to local-memory spilling, and 4 warps sit on the
+    # wrong side of an occupancy cliff for this shape. (BK64, BV64, w8) fits and runs
+    # 7.4x faster (35.1 -> 4.7 ms per 1536-token chunk, 16Kg/32H heads, GP102), with
+    # bit-identical outputs: BK only splits the K accumulation loop and BV the
+    # independent V columns.
+    from freetoken.utils.arch import is_arch_supported
+
+    if is_arch_supported(7, 0):
+        bk, bv, nwarps = 128, 64, 4
+    else:
+        bk, bv, nwarps = 64, 64, 8
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -164,11 +186,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=bk,
+        BV=bv,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
+        num_warps=nwarps,
         num_stages=2,
     )
     return o

@@ -16,19 +16,16 @@ _MAX_IMAGE_BYTES = 32 << 20
 
 
 def collect_image_refs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pop the media refs out of rendered messages in prompt order; the bare {"type": "image"} parts stay for the chat template.
-
-    Image and video both render a vision placeholder, so they share one ordered ref list. Each ref carries its ``media`` kind (image | video) so the processor knows whether to sample frames or take a single still."""
+    """Pop the image refs out of rendered messages in prompt order; the bare {"type": "image"} parts stay for the chat template."""
     refs: list[dict[str, Any]] = []
     for m in messages:
         content = m.get("content")
         if not isinstance(content, list):
             continue
         for part in content:
-            if isinstance(part, dict) and part.get("type") in ("image", "video"):
+            if isinstance(part, dict) and part.get("type") == "image":
                 ref = part.pop("freetoken_ref", None)
                 if ref:
-                    ref.setdefault("media", part.get("type", "image"))
                     refs.append(ref)
     return refs
 

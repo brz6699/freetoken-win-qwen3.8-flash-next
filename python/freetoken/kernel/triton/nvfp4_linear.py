@@ -876,12 +876,34 @@ def _gemm(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     return _gemm_scratch(a, packed_i32, scale, gscale, out_dtype, transposed)
 
 
+_LUT_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+
+def _dequant_nvfp4_torch(packed_i32, scale, gscale, dtype):
+    """Pure-torch NVFP4 dequant for the CPU-hidden head: unpack the little-endian e2m1
+    nibbles (8 per int32 word, LSB-first), map through the e2m1 magnitude LUT, apply the
+    fp8-e4m3 per-block scale and the fp16 per-row global scale. Returns ``[N, K]``."""
+    n, kw = packed_i32.shape
+    p = packed_i32.contiguous()
+    shifts = torch.arange(8, device=p.device, dtype=torch.int32) * 4
+    nib = ((p[:, :, None] >> shifts) & 0xF).reshape(n, kw * 8)  # k = kw*8 + j
+    lut = torch.tensor(_LUT_E2M1, device=p.device, dtype=torch.float32)
+    vals = lut[(nib & 7).long()]
+    vals = torch.where(nib >= 8, -vals, vals)
+    blk = scale.to(torch.float32).repeat_interleave(16, dim=1)  # [N, K]
+    vals = vals * blk * gscale.to(torch.float32)[:, None]
+    return vals.to(dtype)
+
+
 def _linear_impl(
     x: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     gscale: torch.Tensor, bias: torch.Tensor | None, out_dtype: torch.dtype,
     transposed: bool,
 ) -> torch.Tensor:
     """Shared dispatch on a logical ``[N, K//8]`` int32 weight view (either storage order)."""
+    if not x.is_cuda:
+        w = _dequant_nvfp4_torch(packed_i32, scale, gscale, x.dtype)
+        return torch.nn.functional.linear(x, w, bias)
     *lead, K = x.shape
     N = packed_i32.shape[0]
     if x.numel() // K == 1:

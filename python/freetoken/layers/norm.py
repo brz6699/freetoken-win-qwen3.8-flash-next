@@ -10,20 +10,27 @@ class RMSNorm(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         from freetoken.kernel.backend import periph_flashinfer_ok
 
-        if periph_flashinfer_ok():
-            from flashinfer import rmsnorm
-        else:
-            from freetoken.kernel.triton.norm import rmsnorm
+        from freetoken.kernel.triton.norm import rmsnorm
 
         self.eps = eps
         self.weight = torch.empty(size)
+        # Triton wrapper handles both CUDA and CPU; flashinfer is faster on CUDA but
+        # rejects CPU tensors, so keep the Triton binding as the CPU fallback even when
+        # flashinfer backs the GPU path (the CPU-hidden MTP head).
+        self.rmsnorm_cpu = rmsnorm
         self.rmsnorm = rmsnorm
+        if periph_flashinfer_ok():
+            from flashinfer import rmsnorm
+
+            self.rmsnorm = rmsnorm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.rmsnorm(x, self.weight, self.eps)
+        fn = self.rmsnorm if x.is_cuda else self.rmsnorm_cpu
+        return fn(x, self.weight, self.eps)
 
     def forward_inplace(self, x: torch.Tensor) -> None:
-        self.rmsnorm(x, self.weight, self.eps, out=x)
+        fn = self.rmsnorm if x.is_cuda else self.rmsnorm_cpu
+        fn(x, self.weight, self.eps, out=x)
 
 
 class GemmaRMSNorm(BaseOP):
@@ -35,17 +42,20 @@ class GemmaRMSNorm(BaseOP):
 
     def __init__(self, size: int, eps: float, with_scale: bool = True) -> None:
         from freetoken.kernel.backend import is_sgl_kernel_installed
-
-        if is_sgl_kernel_installed():
-            from sgl_kernel import fused_add_rmsnorm, rmsnorm
-        else:
-            from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
+        from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
 
         self.eps = eps
         self.size = size
         self.with_scale = with_scale
+        self.rmsnorm_cpu = rmsnorm
+        self.fused_add_rmsnorm_cpu = fused_add_rmsnorm
         self.rmsnorm = rmsnorm
         self.fused_add_rmsnorm = fused_add_rmsnorm
+        if is_sgl_kernel_installed():
+            from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+            self.rmsnorm = rmsnorm
+            self.fused_add_rmsnorm = fused_add_rmsnorm
         if with_scale:
             self.weight = torch.empty(size)
         else:
@@ -59,10 +69,11 @@ class GemmaRMSNorm(BaseOP):
         return self._ones_weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fn = self.rmsnorm if x.is_cuda else self.rmsnorm_cpu
         if x.dim() == 2:
-            return self.rmsnorm(x, self._kernel_weight(x), self.eps)
+            return fn(x, self._kernel_weight(x), self.eps)
         original_shape = x.shape
-        out = self.rmsnorm(
+        out = fn(
             x.contiguous().reshape(-1, original_shape[-1]),
             self._kernel_weight(x),
             self.eps,
@@ -72,7 +83,8 @@ class GemmaRMSNorm(BaseOP):
     def forward_add_residual(
         self, x: torch.Tensor, residual: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.fused_add_rmsnorm(x, residual, self._kernel_weight(x), self.eps)
+        fn = self.fused_add_rmsnorm if x.is_cuda else self.fused_add_rmsnorm_cpu
+        fn(x, residual, self._kernel_weight(x), self.eps)
         return x, residual
 
 
@@ -94,15 +106,17 @@ class GemmaPlusOneRMSNorm(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         from freetoken.kernel.backend import periph_flashinfer_ok
 
-        if periph_flashinfer_ok():
-            from flashinfer.norm import gemma_rmsnorm
-        else:
-            from freetoken.kernel.triton.norm import gemma_rmsnorm
+        from freetoken.kernel.triton.norm import gemma_rmsnorm
 
         self.eps = eps
         self.size = size
         self.weight = torch.empty(size)
+        self.gemma_rmsnorm_cpu = gemma_rmsnorm
         self.gemma_rmsnorm = gemma_rmsnorm
+        if periph_flashinfer_ok():
+            from flashinfer.norm import gemma_rmsnorm
+
+            self.gemma_rmsnorm = gemma_rmsnorm
 
     def _flat(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
@@ -111,11 +125,13 @@ class GemmaPlusOneRMSNorm(BaseOP):
         return x.view(-1, self.size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.gemma_rmsnorm(self._flat(x), self.weight, self.eps).view(x.shape)
+        fn = self.gemma_rmsnorm if x.is_cuda else self.gemma_rmsnorm_cpu
+        return fn(self._flat(x), self.weight, self.eps).view(x.shape)
 
     def forward_inplace(self, x: torch.Tensor) -> None:
+        fn = self.gemma_rmsnorm if x.is_cuda else self.gemma_rmsnorm_cpu
         flat = self._flat(x)
-        self.gemma_rmsnorm(flat, self.weight, self.eps, out=flat)
+        fn(flat, self.weight, self.eps, out=flat)
 
 
 class GemmaPlusOneRMSNormFused(BaseOP):
@@ -126,25 +142,35 @@ class GemmaPlusOneRMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         from freetoken.kernel.backend import periph_flashinfer_ok
 
-        if periph_flashinfer_ok():
-            from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
-        else:
-            from freetoken.kernel.triton.norm import (
-                gemma_fused_add_rmsnorm,
-                gemma_rmsnorm,
-            )
+        from freetoken.kernel.triton.norm import (
+            gemma_fused_add_rmsnorm,
+            gemma_rmsnorm,
+        )
 
         self.eps = eps
         self.weight = torch.empty(size)
+        self.gemma_rmsnorm_cpu = gemma_rmsnorm
+        self.gemma_fused_add_rmsnorm_cpu = gemma_fused_add_rmsnorm
         self.gemma_rmsnorm = gemma_rmsnorm
         self.gemma_fused_add_rmsnorm = gemma_fused_add_rmsnorm
+        if periph_flashinfer_ok():
+            from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+
+            self.gemma_rmsnorm = gemma_rmsnorm
+            self.gemma_fused_add_rmsnorm = gemma_fused_add_rmsnorm
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            return self.gemma_rmsnorm(x, self.weight, self.eps), x
-        self.gemma_fused_add_rmsnorm(x, residual, self.weight, self.eps)
+            fn = self.gemma_rmsnorm if x.is_cuda else self.gemma_rmsnorm_cpu
+            return fn(x, self.weight, self.eps), x
+        fn = (
+            self.gemma_fused_add_rmsnorm
+            if x.is_cuda
+            else self.gemma_fused_add_rmsnorm_cpu
+        )
+        fn(x, residual, self.weight, self.eps)
         return x, residual
 
 
@@ -152,22 +178,32 @@ class RMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         from freetoken.kernel.backend import periph_flashinfer_ok
 
-        if periph_flashinfer_ok():
-            from flashinfer import fused_add_rmsnorm, rmsnorm
-        else:
-            from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
+        from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
 
         self.eps = eps
         self.weight = torch.empty(size)
+        self.rmsnorm_cpu = rmsnorm
+        self.fused_add_rmsnorm_cpu = fused_add_rmsnorm
         self.rmsnorm = rmsnorm
         self.fused_add_rmsnorm = fused_add_rmsnorm
+        if periph_flashinfer_ok():
+            from flashinfer import fused_add_rmsnorm, rmsnorm
+
+            self.rmsnorm = rmsnorm
+            self.fused_add_rmsnorm = fused_add_rmsnorm
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            return self.rmsnorm(x, self.weight, self.eps), x
-        self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
+            fn = self.rmsnorm if x.is_cuda else self.rmsnorm_cpu
+            return fn(x, self.weight, self.eps), x
+        fn = (
+            self.fused_add_rmsnorm
+            if x.is_cuda
+            else self.fused_add_rmsnorm_cpu
+        )
+        fn(x, residual, self.weight, self.eps)
         return x, residual
 
 
