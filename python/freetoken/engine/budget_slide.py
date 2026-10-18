@@ -16,6 +16,25 @@ QSA hybrid, plain-MoE (GLM-class) and dense no-cache-model shapes all take the
 same arithmetic. Models without an offload cache keep the dense branch: KV-only
 resize with the MoE term inert. Pure arithmetic -- unit-testable without a
 device, mirroring cache_budget.py's no-GPU style.
+
+Envelope contract, learned from the garbled-output incident (targets sized against
+the loose VRAM ceiling aliased the right-anchored MoE banks onto the KV carves):
+EVERY layer -- this proposal, the pre-teardown validate_rebuild, the MoE half-check --
+enforces the same inequality, byte-exact, in this order of authority:
+    moe*per_expert_bytes + pages*cache_per_page + kv_fixed_bytes <= arena_bytes
+The arena is the cold-start footprint (allocated once, never grown); VRAM between it
+and the memory_ratio ceiling is graph-capture/activation headroom, NOT cache space,
+so a budget-ceiling pass does not imply an arena fit. ``kv_fixed_bytes`` counts ONLY
+the KV pool's own fixed tiers (they carve the arena alongside the pages); sibling
+pools (GDN state, MTP bank) allocate OUTSIDE the arena and must not be added here.
+Equality at the boundary is the accepted cold geometry (zero tolerance: the arena has
+no borrowable slack, unlike the ceiling check's few-MiB accounting tolerance).
+Clamping happens HERE, before any teardown, so an over-sized target never reaches the
+rebuild path -- a rejected-after-free rebuild loses the whole prefix tree, a
+pre-clamped proposal never does. Startup's double slide (idle shrink to a tier, then
+forced grow-before-reject when queued demand crosses it) is this contract working,
+not thrashing: both moves land on tier boundaries and the equal-target gate then
+quiets the slider.
 """
 
 from __future__ import annotations
