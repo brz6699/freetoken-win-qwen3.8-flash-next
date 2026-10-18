@@ -5,6 +5,7 @@ Raises plain ValueError on bad input; the server layer maps it to its wire error
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import TYPE_CHECKING, Any
 
@@ -78,34 +79,48 @@ def _load_local_media(url: str, config: ServerArgs) -> bytes:
 
 
 async def fetch_image_bytes(refs: list[dict[str, Any]], config: ServerArgs) -> list[bytes]:
-    """Resolve collected image refs (URLs / base64) to raw bytes, in order."""
-    out: list[bytes] = []
-    for ref in refs:
+    """Resolve collected image refs (URLs / base64) to raw bytes, in order.
+
+    HTTP refs are fetched concurrently over one shared client (order of results is
+    preserved); every other kind resolves inline."""
+    out: list[bytes] = [b""] * len(refs)
+    http_slots: list[tuple[int, str]] = []
+    for i, ref in enumerate(refs):
         data = ref.get("data") or ""
         try:
             if ref.get("kind") == "b64":
-                out.append(base64.b64decode(data))
+                out[i] = base64.b64decode(data)
             elif data.startswith("data:"):
-                out.append(base64.b64decode(data.split(",", 1)[1]))
+                out[i] = base64.b64decode(data.split(",", 1)[1])
             elif data.startswith(("http://", "https://")):
-                import httpx
-
                 _check_media_domain(data, config)
-                # redirect targets are not re-checked against the allowlist
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    resp = await client.get(data)
-                    resp.raise_for_status()
-                    if len(resp.content) > _MAX_IMAGE_BYTES:
-                        raise ValueError(f"image exceeds {_MAX_IMAGE_BYTES} bytes")
-                    out.append(resp.content)
+                http_slots.append((i, data))
             elif data.startswith("file://"):
-                out.append(_load_local_media(data, config))
+                out[i] = _load_local_media(data, config)
             else:
                 raise ValueError(
                     "unsupported image source (expect http(s)/file url or base64)"
                 )
         except Exception as exc:  # noqa: BLE001 -- input-driven, client-classifiable
             raise ValueError(f"could not load image: {exc}") from exc
+    if http_slots:
+        import httpx
+
+        # redirect targets are not re-checked against the allowlist
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            results = await asyncio.gather(
+                *(client.get(url) for _slot, url in http_slots), return_exceptions=True
+            )
+            for (i, _url), res in zip(http_slots, results):
+                try:
+                    if isinstance(res, Exception):
+                        raise res
+                    res.raise_for_status()
+                    if len(res.content) > _MAX_IMAGE_BYTES:
+                        raise ValueError(f"image exceeds {_MAX_IMAGE_BYTES} bytes")
+                    out[i] = res.content
+                except Exception as exc:  # noqa: BLE001 -- input-driven, client-classifiable
+                    raise ValueError(f"could not load image: {exc}") from exc
     return out
 
 

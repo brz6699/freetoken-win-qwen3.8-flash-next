@@ -772,7 +772,7 @@ def run_benchbw(
                 "model": {"name": wl.name, "hidden": wl.hidden, "inter": wl.inter,
                           "experts": wl.experts, "top_k": wl.top_k},
                 "kernels": kernels,
-                "recommended_moe_backend": {f: kernels[f]["recommended"] for f in fmts},
+                "recommended_moe_strategy": {f: kernels[f]["recommended"] for f in fmts},
             }
     finally:
         exec_log.setLevel(prev_level)

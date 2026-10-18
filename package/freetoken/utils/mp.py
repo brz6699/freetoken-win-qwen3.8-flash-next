@@ -25,6 +25,24 @@ def _normalize_addr(addr: str) -> str:
     return addr
 
 
+def _setup_socket(socket, addr: str, create: bool) -> None:
+    """bind-or-connect with a reused loopback port. The bind side sets SO_REUSEADDR so a quick
+    relaunch (the prior worker's listener still in TIME_WAIT on Windows) re-binds the same derived
+    port instead of failing with EADDRINUSE; the connect side just connects."""
+    if create:
+        for opt in (getattr(zmq, "REUSEADDR", None), 6):
+            if opt is None:
+                continue
+            try:
+                socket.setsockopt(opt, 1)
+                break
+            except Exception:
+                continue
+        socket.bind(_normalize_addr(addr))
+    else:
+        socket.connect(_normalize_addr(addr))
+
+
 class ZmqPushQueue(Generic[T]):
     def __init__(
         self,
@@ -34,7 +52,7 @@ class ZmqPushQueue(Generic[T]):
     ):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUSH)
-        self.socket.bind(_normalize_addr(addr)) if create else self.socket.connect(_normalize_addr(addr))
+        _setup_socket(self.socket, addr, create)
         self.encoder = encoder
 
     def put(self, obj: T):
@@ -55,7 +73,7 @@ class ZmqAsyncPushQueue(Generic[T]):
     ):
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.PUSH)
-        self.socket.bind(_normalize_addr(addr)) if create else self.socket.connect(_normalize_addr(addr))
+        _setup_socket(self.socket, addr, create)
         self.encoder = encoder
 
     async def put(self, obj: T):
@@ -76,7 +94,7 @@ class ZmqPullQueue(Generic[T]):
     ):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PULL)
-        self.socket.bind(_normalize_addr(addr)) if create else self.socket.connect(_normalize_addr(addr))
+        _setup_socket(self.socket, addr, create)
         self.decoder = decoder
 
     def get(self) -> T:
@@ -106,7 +124,7 @@ class ZmqAsyncPullQueue(Generic[T]):
     ):
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.PULL)
-        self.socket.bind(_normalize_addr(addr)) if create else self.socket.connect(_normalize_addr(addr))
+        _setup_socket(self.socket, addr, create)
         self.decoder = decoder
 
     async def get(self) -> T:
@@ -127,7 +145,7 @@ class ZmqPubQueue(Generic[T]):
     ):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.bind(_normalize_addr(addr)) if create else self.socket.connect(_normalize_addr(addr))
+        _setup_socket(self.socket, addr, create)
         self.encoder = encoder
 
     def put_raw(self, raw: bytes):
@@ -151,7 +169,7 @@ class ZmqSubQueue(Generic[T]):
     ):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
-        self.socket.bind(_normalize_addr(addr)) if create else self.socket.connect(_normalize_addr(addr))
+        _setup_socket(self.socket, addr, create)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.decoder = decoder
 

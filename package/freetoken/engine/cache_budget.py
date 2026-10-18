@@ -13,6 +13,18 @@ from freetoken.utils import div_ceil
 if TYPE_CHECKING:
     import torch
 
+# Physical-ceiling fraction used when --memory-ratio is omitted. With no ratio declared the
+# ceiling is simply "everything still free after weights" (ratio 1.0). The arena takes only the
+# kv+moe footprint, so the CUDA-graph / activation headroom is whatever VRAM the arena leaves
+# unused -- consumed and self-sized by the live capture rather than a guessed fraction. The ratio
+# only matters when explicitly given, where its (1-ratio) remainder is the headroom by definition.
+DEFAULT_MEMORY_RATIO = 1.0
+
+
+def effective_ratio(memory_ratio: float | None) -> float:
+    """Resolve a possibly-None memory_ratio into the concrete ceiling fraction to apply."""
+    return DEFAULT_MEMORY_RATIO if memory_ratio is None else float(memory_ratio)
+
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
@@ -29,13 +41,20 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
 
 
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float | None, baseline_free: int, weights_bytes: int, fixed_cache_size: int
 ) -> int:
-    """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
-    baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
-    is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
-    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    """Net GPU bytes available for the MoE + KV pools.
+
+    With an explicit ``memory_ratio``, the budget is ``ratio x baseline`` minus weights and
+    fixed (non-paged) cache; the ``(1-ratio)`` remainder is the CUDA-graph/activation
+    headroom. With ``memory_ratio=None`` (the default), sizing follows Algorithm 2: declared
+    KV + MoE sizes are authoritative, so the ceiling is the full post-weights free VRAM
+    (equivalent to ratio=1.0 here) and the fit step clamps each pool to its declared size
+    inside that ceiling. Single source of truth for startup auto-sizing and the runtime
+    rebuild fit check.
+    """
+    ratio = effective_ratio(memory_ratio)
+    return int(ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
 def required_bytes(
@@ -131,3 +150,57 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
+
+
+def fit_declared_cache_sizes(
+    *,
+    declared_moe: int,
+    declared_pages: int | None,
+    budget_bytes: int,
+    per_expert_bytes: int,
+    cache_per_page: int,
+    kv_reserve_pages: int,
+    num_experts: int,
+    total_experts: int,
+    max_slots: int,
+    prefill_overlap: bool,
+) -> tuple[int, int]:
+    """Clamp DECLARED cache sizes into the MEASURED byte budget.
+
+    KV-FIRST policy (the intended sliding behavior): the KV pool is provisioned to the
+    declared context length (--num-tokens -> declared_pages) FIRST so max_seq_len reaches
+    it at boot; the MoE expert-slot cache then fills whatever bytes remain, down to the
+    kernel floor of a FULL expert layer (``num_experts`` slots, or 2x with prefill
+    overlap: the offload GEMM hard-requires >= num_experts resident slots to run, so that
+    is the lowest MoE can drop -- far below what the declared KV needs, so reserving the
+    KV first still leaves ample room). The MoE side is the elastic one: the runtime budget
+    slide grows it back when context is short and hands bytes back when context grows.
+    This is the opposite of the old fill-MoE-first policy, which reserved only a tiny KV
+    floor and left KV at the remainder -- capping max_seq_len far below --num-tokens and
+    dropping long prompts once the idle slide shrank KV further. Envelope-conserving:
+    ``moe * per_expert + pages * cache_per_page <= budget_bytes``."""
+    assert per_expert_bytes > 0 and cache_per_page > 0
+
+    hi = min(total_experts, max_slots)
+    # MoE floor = one full layer's experts (num_experts, or 2x with prefill overlap): the
+    # offload MoE kernel (OffloadMoeCache.validate_rebuild) hard-requires >= num_experts
+    # resident slots to run a GEMM, so that is the lowest MoE can safely drop. It is far
+    # below what the declared KV needs, so reserving the KV below leaves ample room.
+    floor = min(hi, max(num_experts, 2 * num_experts if prefill_overlap else num_experts))
+    # The KV pool is sized to the declared context length (never below the model's own
+    # KV reserve); that reservation takes priority so max_seq_len reaches --num-tokens.
+    kv_pages = max(declared_pages or 0, kv_reserve_pages)
+    kv_bytes = kv_pages * cache_per_page
+    if budget_bytes < kv_bytes + floor * per_expert_bytes:
+        raise ValueError(
+            f"cache budget too small: declared KV ({kv_pages} pages = {kv_bytes} B) "
+            f"+ {floor} MoE slots does not fit; budget {budget_bytes} B "
+            "(lower --num-tokens or free VRAM)"
+        )
+    # MoE fills the remainder above the KV reservation, down to the kernel floor, capped
+    # at the declared request and the model's slot ceiling.
+    afford_moe = (budget_bytes - kv_bytes) // per_expert_bytes
+    moe = max(floor, min(declared_moe, hi, afford_moe))
+    # pages = the full declared KV reservation (KV-first); the runtime slide then trades
+    # MoE<->KV within this same envelope so max_seq_len can reach the declared length.
+    return moe, kv_pages

@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     t = time.perf_counter()
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
-        moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
+        moe_strategy=ns.moe_strategy, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
     )
     dt = time.perf_counter() - t
     c = index["counts"]

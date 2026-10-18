@@ -7,35 +7,18 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
-from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.distributed import DistributedInfo
+from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
-
-logger = init_logger(__name__)
-
-
-class _DeprecatedAlias(argparse.Action):
-    """An old flag: warns at parse time, converts the value if asked, stores it."""
-
-    def __init__(self, *args, new_flag: str, convert=None, **kwargs):
-        self.new_flag, self.convert = new_flag, convert
-        super().__init__(*args, **kwargs)
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        logger.warning("%s is deprecated; use %s", option_string, self.new_flag)
-        setattr(namespace, self.dest, self.convert(values) if self.convert else values)
-
-
-def _nvfp4_entry(value: str) -> str:
-    """The --quant-backend entry an old --nvfp4-backend value stands for; auto stands for none."""
-    if value == "auto":
-        return ""
-    return "moe.nvfp4=" + {"flashinfer": "b12x"}.get(value, value)
 
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
+    # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
+    allowed_media_domains: str = ""
+    # Directory file:// image refs may be read from; empty rejects local files.
+    allowed_local_media_path: str = ""
     server_host: str = "127.0.0.1"
     server_port: int = 1919
     num_tokenizer: int = 0
@@ -59,10 +42,6 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
-    # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
-    allowed_media_domains: str = ""
-    # Directory file:// image refs may be read from; empty rejects local files.
-    allowed_local_media_path: str = ""
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
@@ -104,16 +83,6 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
-def _json_object(text: str) -> dict:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from None
-    if not isinstance(value, dict):
-        raise argparse.ArgumentTypeError("expected a JSON object")
-    return value
-
-
 def parse_args(
     args: List[str],
     run_shell: bool = False,
@@ -130,16 +99,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
-    from freetoken.moe import MOE_STRATEGIES
-
-    def _parse_quant_backend(value: str) -> str:
-        from freetoken.layers.quantization import QuantBackend
-
-        try:
-            QuantBackend.parse(value)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(str(exc)) from None
-        return value
+    from freetoken.moe import SUPPORTED_MOE_STRATEGIES
 
     def _parse_moe_cache_rate(value: str) -> float:
         try:
@@ -158,6 +118,24 @@ def parse_args(
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
+
+    def _json_object(text: str) -> dict:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from None
+        if not isinstance(value, dict):
+            raise argparse.ArgumentTypeError("expected a JSON object")
+        return value
+
+    def _parse_quant_backend(value: str) -> str:
+        from freetoken.layers.quantization import QuantBackend
+
+        try:
+            QuantBackend.parse(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+        return value
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
@@ -273,19 +251,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--kv-cache-dtype",
-        type=str,
-        default=ServerArgs.kv_cache_dtype,
-        choices=["bf16", "fp8_e4m3", "turbo4"],
-        help=(
-            "Paged KV pool storage dtype. 'fp8_e4m3' halves the KV pool (write-side "
-            "saturating quantization, attention compute stays bf16). 'turbo4' halves it "
-            "again (TurboQuant 4-bit: nibble-packed codebook indices + per-token dequant "
-            "scale, rotspace Hadamard rotation). QSA (Qwen3.8-Flash-Next) and MLA-latent "
-            "(GLM-5.3) pool families only. Indexer keys always stay bf16."
-        ),
-    )
-    parser.add_argument(
         "--hf-overrides",
         type=_json_object,
         default=None,
@@ -294,6 +259,20 @@ def parse_args(
         "--hf-overrides: a nested config section is updated key by key, any other value is "
         "replaced whole. A YaRN rope_parameters override extends the servable context to "
         "original_max_position_embeddings * factor.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["bf16", "fp8_e4m3", "turbo4"],
+        help=(
+            "Paged KV pool storage dtype. 'fp8_e4m3' halves the KV pool (write-side "
+            "saturating quantization, attention compute stays bf16). 'turbo4' halves it "
+            "again (TurboQuant 4-bit: nibble-packed codebook indices + per-token dequant "
+            "scale, rotspace Hadamard rotation). QSA models (Qwen3.8-Flash-Next) only. "
+            "Indexer keys always stay bf16."
+        ),
     )
 
     parser.add_argument(
@@ -339,10 +318,12 @@ def parse_args(
     parser.add_argument(
         "--memory-ratio",
         type=float,
-        default=ServerArgs.memory_ratio,
+        default=None,
         help=(
             "Fraction of total GPU free memory the engine may use for weights + MoE "
-            "cache + KV cache combined; the remainder is reserved runtime headroom."
+            "cache + KV cache combined; the remainder is reserved runtime headroom. "
+            "When omitted, sizing is driven by --num-tokens / --num-pages and "
+            "--moe-cache-size directly (these declared sizes are authoritative)."
         ),
     )
 
@@ -467,72 +448,90 @@ def parse_args(
     parser.add_argument(
         "--text-model-only",
         action="store_true",
-        default=False,
-        help="Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to "
-        "the KV/expert pools) and every multimodal input is rejected. Same as --mm-disable with "
-        "every encoder kind.",
+        help=(
+            "Build no encoder towers: accept text input only, skip vision/audio weights "
+            "and give their memory to the KV / expert caches."
+        ),
     )
+
     parser.add_argument(
         "--mm-disable",
         nargs="+",
         choices=list(ENCODER_KINDS),
-        default=[],
-        metavar="{vision,audio}",
-        help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
+        metavar="KIND",
+        help=(
+            "Encoder kinds whose tower is not built; inputs of that kind are rejected. "
+            f"Kinds: {', '.join(ENCODER_KINDS)}. Repeatable."
+        ),
     )
 
     parser.add_argument(
         "--image-min-tokens",
+        dest="image_min_tokens",
         type=_positive_int,
-        default=MultimodalConfig.image_min_tokens,
-        help="Fewest tokens an image may take: the image processor scales smaller images up to it, "
-        "in the family's own units. Default: the processor's own limit.",
+        default=None,
+        help="Lower bound of the per-image token budget (the image processor upscales to hit it).",
     )
+
     parser.add_argument(
         "--image-max-tokens",
+        dest="image_max_tokens",
         type=_positive_int,
-        default=MultimodalConfig.image_max_tokens,
-        help="Most tokens an image may take: the image processor scales larger images down to it, "
-        "in the family's own units (Qwen VL: one token per 32x32 pixels). Default: the processor's own limit.",
+        default=None,
+        help="Upper bound of the per-image token budget (caps ViT + prefill cost per image).",
     )
+
     parser.add_argument(
         "--mm-processor-kwargs",
+        dest="mm_processor_kwargs",
         type=_json_object,
         default=None,
         metavar="JSON",
-        help="JSON object of extra keyword arguments for the checkpoint's image processor call, "
-        "for family-specific knobs; applied after the token budget.",
+        help=(
+            "Extra JSON kwargs passed to the checkpoint's image processor call, after the "
+            "token budget (e.g. '{\"max_pixels\": 1048576}')."
+        ),
     )
 
     parser.add_argument(
         "--mm-embed-cache-device",
+        dest="mm_embed_cache_device",
         choices=["cpu", "cuda"],
-        default=MultimodalConfig.embed_cache_device,
-        help="Storage for encoded image embeddings between prefill chunks.",
+        default="cpu",
+        help=(
+            "Where encoded image embeddings wait between prefill chunks: 'cpu' pinned host "
+            "memory (default), 'cuda' device memory."
+        ),
     )
 
     parser.add_argument(
         "--mm-encoder-weights",
+        dest="mm_encoder_weights",
         choices=["gpu", "host"],
-        default=MultimodalConfig.encoder_weights,
-        help="Encoder tower block weights: pinned host banks streamed two blocks at a time behind the "
-        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU.",
+        default="host",
+        help=(
+            "Vision-tower block weights: 'host' streams them pinned two blocks ahead of the "
+            "compute (default), 'gpu' keeps the whole tower resident."
+        ),
     )
 
     parser.add_argument(
         "--allowed-media-domains",
+        dest="allowed_media_domains",
         type=str,
         default=ServerArgs.allowed_media_domains,
-        help="Comma-separated hostname allowlist for client-supplied image URLs. "
-        "Empty (default) allows any domain.",
+        help=(
+            "Comma-separated hostname allowlist for client-supplied image URLs; "
+            "empty (default) admits any domain."
+        ),
     )
 
     parser.add_argument(
         "--allowed-local-media-path",
+        dest="allowed_local_media_path",
         type=str,
         default=ServerArgs.allowed_local_media_path,
-        help="Directory that file:// image refs may be read from. "
-        "Unset (default) rejects local files.",
+        help="Directory file:// image refs may be read from; empty (default) rejects local files.",
     )
 
     parser.add_argument(
@@ -562,7 +561,7 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--served-model-name",
+        "--served-model-name", "--alias",
         type=str,
         default=ServerArgs.served_model_name,
         help="Model id returned by /v1/models. Defaults to the basename of --model.",
@@ -610,7 +609,7 @@ def parse_args(
     parser.add_argument(
         "--moe-strategy",
         default=ServerArgs.moe_strategy,
-        choices=["auto", *MOE_STRATEGIES],
+        choices=["auto"] + SUPPORTED_MOE_STRATEGIES.supported_names(),
         help=(
             "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
             "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
@@ -621,11 +620,51 @@ def parse_args(
     parser.add_argument(
         "--moe-backend",
         dest="moe_strategy",
-        action=_DeprecatedAlias,
-        new_flag="--moe-strategy",
         default=argparse.SUPPRESS,
-        choices=["auto", *MOE_STRATEGIES],
+        choices=["auto"] + SUPPORTED_MOE_STRATEGIES.supported_names(),
         help="[Deprecated] Use --moe-strategy.",
+    )
+
+    parser.add_argument(
+        "--mtp-draft-len",
+        dest="mtp_draft_len",
+        type=_positive_int,
+        default=argparse.SUPPRESS,
+        help=(
+            "Drafts per MTP speculative-decoding step; naming a length turns MTP on, omitting "
+            "it keeps the plain decode path. The checkpoint's native 1-layer head drafts this "
+            "many tokens and the full model verifies them in one forward. Applies to single "
+            "greedy requests; everything else keeps the plain path. Longer chains raise "
+            "per-step accepted length but pay more verify bytes per step; verify batching "
+            "usually wins while acceptance stays high."
+        ),
+    )
+
+    parser.add_argument(
+        "--mtp-device",
+        dest="mtp_device",
+        default=argparse.SUPPRESS,
+        choices=["gpu", "cpu"],
+        help=(
+            "Where MTP draft+verify compute runs. 'gpu' runs the whole speculative path on the "
+            "GPU; 'cpu' hides the head draft and verify compute on the CPU behind the GPU "
+            "main-model forward (current-hardware trade-off: CPU compute overlaps the GPU "
+            "instead of contending for PCIe on a pure-GPU path). Default: gpu."
+        ),
+    )
+
+    parser.add_argument(
+        "--mtp-expert-quant",
+        dest="mtp_expert_quant",
+        default=argparse.SUPPRESS,
+        choices=["none", "fp8", "q4_0"],
+        help=(
+            "Storage dtype for the MTP head's stacked routed-expert bank. 'none' keeps the "
+            "checkpoint bf16 (~4.7 GiB GPU-resident); 'fp8' stores e4m3 with one scale per "
+            "tensor (~2.4 GiB); 'q4_0' groups of 32 with a bf16 scale per group (~1.3 GiB). "
+            "Draft quality is only used for speculative acceptance, so a coarser bank mostly "
+            "costs acceptance rate, not output quality. Default: none."
+        ),
     )
 
     parser.add_argument(
@@ -644,19 +683,36 @@ def parse_args(
         default=ServerArgs.ple_backend,
         choices=["pinned", "disk"],
         help=(
-            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
-            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+            "Where a PLE n-gram table lives. 'disk' reads rows straight from the checkpoint "
+            "files; 'pinned' (the default on Windows) preloads the whole table into "
+            "page-locked host RAM."
         ),
     )
 
     parser.add_argument(
         "--nvfp4-backend",
-        action=_DeprecatedAlias,
-        new_flag="--quant-backend moe.nvfp4=<marlin|b12x|triton>",
-        convert=_nvfp4_entry,
-        default=argparse.SUPPRESS,
+        default=ServerArgs.nvfp4_backend,
         choices=["auto", "marlin", "flashinfer", "triton"],
-        help="[Deprecated] Use --quant-backend moe.nvfp4=<marlin|b12x|triton> ('flashinfer' is b12x).",
+        help=(
+            "NVFP4 routed-expert GEMM backend (default: triton, the portable inline-dequant "
+            "kernel). auto picks by GPU (marlin on sm80-99 + vLLM; flashinfer b12x on sm120+ "
+            "& CUDA>=13; else triton). Force one to override; it fails loudly if it cannot run."
+        ),
+
+    )
+
+    parser.add_argument(
+        "--periph-kernels",
+        default="auto",
+        choices=["auto", "triton", "flashinfer"],
+        help=(
+            "Backend for the peripheral kernels (activation silu_and_mul / rope / norm / "
+            "sampling). 'auto' (default) uses flashinfer when installed; 'triton' forces the "
+            "triton kernels; 'flashinfer' forces flashinfer. On MSVC-only Windows boxes the "
+            "flashinfer peripheral kernels cannot JIT-build (they link with `c++ -lcudart`, "
+            "which needs g++), so pass 'triton' there. The b12x fused-MoE kernel is a separate "
+            "CuTe-DSL path and is NOT affected by this switch."
+        ),
     )
 
     parser.add_argument(
@@ -702,6 +758,43 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--budget-slide",
+        action="store_true",
+        dest="budget_slide",
+        default=argparse.SUPPRESS,
+        help=(
+            "Enable the runtime KV/MoE budget slider: at idle safe points, rebalance "
+            "bytes between the KV page pool and the MoE expert-slot cache toward the "
+            "measured KV occupancy. Also the explicit spelling of the default."
+        ),
+    )
+
+    parser.add_argument(
+        "--disable-budget-slide",
+        action="store_false",
+        dest="budget_slide",
+        default=ServerArgs.budget_slide,
+        help=(
+            "Freeze the startup KV/MoE cache split: instead of rebalancing bytes "
+            "between the KV page pool and the MoE expert-slot cache at idle, keep "
+            "both at their startup sizes for the whole lifetime."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-tiers",
+        dest="kv_tiers",
+        type=str,
+        default=argparse.SUPPRESS,
+        help=(
+            "KV budget-slide ladder: an integer N makes N evenly spaced tiers "
+            "(k/N; N=4 -> 25/50/75/100, N=16 -> 6.25/12.5/.../100). Alternatively "
+            "pass a comma-separated percentage list like '25,50,75,100'. A single "
+            "'100' disables the ladder (the slider follows demand continuously)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
@@ -713,7 +806,7 @@ def parse_args(
         type=int,
         default=ServerArgs.moe_cpu_threads,
         help=(
-            "Number of CPU worker threads for --moe-strategy cpu decode experts. "
+            "Number of CPU worker threads for --moe-backend cpu decode experts. "
             "0 = auto (physical cores)."
         ),
     )
@@ -723,15 +816,13 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_cpu_layers,
         help=(
-            "With --moe-strategy offload/hybrid: which MoE layers compute on the "
+            "With --moe-backend offload/hybrid: which MoE layers compute on the "
             "CPU executor instead of the GPU offload/PCIe path (where CUDA pinning "
             "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
-            "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for Windows/WSL "
-            "only, where CUDA pinned memory is capped: it locks just enough head+tail layers "
-            "for the banks over the pin budget. Any value, 'auto' included, commits to CPU "
-            "decode before the model is built, so the expert format must have a CPU executor "
-            "path (bf16, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
-            "GPU; a boot whose banks exceed a known pin budget stops and asks for this flag."
+            "layers evenly strided), or a fraction ('0.5'). Unset = automatic where "
+            "CUDA pinning is quota-capped, e.g. WSL (locks just enough head+tail "
+            "layers when the banks exceed the pin budget, none otherwise); '0' "
+            "forces all layers on GPU."
         ),
     )
 
@@ -740,11 +831,22 @@ def parse_args(
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,
         help=(
-            "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
+            "For --moe-backend hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
             "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-prefill-demand-tokens",
+        type=int,
+        default=ServerArgs.moe_prefill_demand_tokens,
+        help=(
+            "A prefill chunk of at most this many tokens loads only the experts it routes to, "
+            "through the expert cache as decode does, instead of every expert of each layer. "
+            "0 streams whole layers for every chunk."
         ),
     )
 
@@ -824,23 +926,33 @@ def parse_args(
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
-    # the old flag stands in for one --quant-backend entry; next to the real flag it is a usage error
-    entry = kwargs.pop("nvfp4_backend", None)
-    if entry is not None:
-        if kwargs["quant_backend"] is not None:
-            parser.error("--nvfp4-backend cannot be combined with --quant-backend; write --quant-backend moe.nvfp4=... instead")
-        if entry:
-            kwargs["quant_backend"] = entry
+
+    # Route the peripheral kernels (activation/rope/norm/sampling) via the flag instead of a
+    # manual FREETOKEN_FLASHINFER_PERIPH env var. periph_flashinfer_ok() (kernel/backend.py)
+    # reads that var; set it here, in the parent, before launch_server spawns the engine
+    # workers (spawn inherits this process's env), so the gate is visible to the engine.
+    # 'auto' leaves the env untouched (flashinfer-if-installed default).
+    periph_kernels = kwargs.pop("periph_kernels", "auto")
+    if periph_kernels == "triton":
+        os.environ["FREETOKEN_FLASHINFER_PERIPH"] = "0"
+    elif periph_kernels == "flashinfer":
+        os.environ["FREETOKEN_FLASHINFER_PERIPH"] = "1"
+
+    # Translate --kv-tiers into the tier ladder consumed by budget_slide._tier_ratios():
+    # an integer N expands to N evenly spaced percentages (k/N), anything else is taken
+    # as the percentage list verbatim. Set here (parent process, pre-spawn) so engine
+    # workers inherit it through the env.
+    kv_tiers = kwargs.pop("kv_tiers", None)
+    if kv_tiers:
+        specs = str(kv_tiers).strip()
+        if specs.isdigit():
+            n = int(specs)
+            os.environ["FREETOKEN_KV_TIERS"] = ",".join(f"{100.0 * k / n:g}" for k in range(1, n + 1))
+        else:
+            os.environ["FREETOKEN_KV_TIERS"] = specs
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
-
-    # a bad media root is a deployment mistake; fail at startup, not per request
-    if kwargs["allowed_local_media_path"]:
-        media_root = os.path.realpath(os.path.expanduser(kwargs["allowed_local_media_path"]))
-        if not os.path.isdir(media_root):
-            parser.error(f"--allowed-local-media-path {media_root} is not a directory")
-        kwargs["allowed_local_media_path"] = media_root
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (
@@ -903,20 +1015,28 @@ def parse_args(
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
-    disabled = set(ENCODER_KINDS) if kwargs.pop("text_model_only") else set()
-    disabled.update(kwargs.pop("mm_disable"))
-    image_min_tokens, image_max_tokens = kwargs.pop("image_min_tokens"), kwargs.pop("image_max_tokens")
-    if image_min_tokens is not None and image_max_tokens is not None and image_min_tokens > image_max_tokens:
-        parser.error(f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}")
+    # assemble the multimodal config from its flat CLI flags; --text-model-only is the bulk
+    # spelling of --mm-disable (disable every encoder kind)
+    mm_disable = kwargs.pop("mm_disable", None)
+    if kwargs.pop("text_model_only", False):
+        disabled = list(ENCODER_KINDS)
+    else:
+        disabled = list(mm_disable or [])
+    image_min = kwargs.pop("image_min_tokens")
+    image_max = kwargs.pop("image_max_tokens")
+    if image_min is not None and image_max is not None and image_min > image_max:
+        parser.error("--image-min-tokens must not exceed --image-max-tokens")
     kwargs["mm"] = MultimodalConfig(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),
         encoder_weights=kwargs.pop("mm_encoder_weights"),
-        image_min_tokens=image_min_tokens,
-        image_max_tokens=image_max_tokens,
+        image_min_tokens=image_min,
+        image_max_tokens=image_max,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},
     )
     kwargs["hf_overrides"] = kwargs["hf_overrides"] or {}
+
     result = ServerArgs(**kwargs)
+    logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

@@ -25,6 +25,15 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# Row-count threshold at which the fused multi-copy switches from the narrow grid
+# (blocks_per_bank=4, ~=the ~4096-thread PCIe knee) to the wider grid (=8). It is a
+# hardware-side constant -- the row count where the narrow grid stops saturating the
+# link -- deliberately NOT tied to num_experts, so the same batch shape yields the same
+# grid across MoE widths (Qwen-class wide vs GLM-class narrower). Below it a small decode
+# batch is covered by the narrow grid with less launch overhead; at/above it more rows are
+# in flight and the wider grid keeps the PCIe link fed.
+_COPY_WIDE_MIN_ROWS = 32
+
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -107,6 +116,9 @@ class OffloadMoeCache:
     cache_size: int
     device: torch.device
     cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
+    # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
+    prefill_demand_tokens: int = 0
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -144,13 +156,22 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # One flat GPU byte block shared with the KV pool: KV fills from the LEFT, the MoE
+    # slot caches carve from the RIGHT (see _alloc_slot_cache). None = plain allocations.
+    arena: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
+        if self.prefill_demand_tokens and self.decode_target != "gpu":
+            raise ValueError(
+                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
+            )
         if self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
+        # Right-anchored carve cursor into the shared arena (bytes still free on its left).
+        self._arena_cursor: int | None = self.arena.numel() if self.arena is not None else None
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
@@ -249,6 +270,15 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # Route-persistence trackers (also gated by collect_decode_freq): recall of THIS step's
+        # selected experts using the previous step's selection as the candidate set, i.e. how much
+        # an "adjacent step reuses last step's routing" prefetch would cover. All device-side.
+        self._persist_prev = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.bool, device=self.device
+        )
+        self._persist_hits = torch.zeros(self.num_layers, dtype=torch.float32, device=self.device)
+        self._persist_cur = torch.zeros(self.num_layers, dtype=torch.float32, device=self.device)
+        self._persist_steps = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -354,15 +384,42 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.zeros(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
-                device=self.device,
+            self.bank_caches[name] = self._alloc_slot_cache(
+                (self.cache_size, *head.shape[1:]), head.dtype
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def _alloc_slot_cache(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """One bank's GPU slot cache: a right-anchored slice of the shared arena (the KV
+        pool owns the left end), so the two sliding caches meet at the boundary and the
+        byte envelope is conserved by construction. Starts stay 16-byte aligned -- the
+        fused-copy descriptor requires it -- by rounding each carve down from the arena
+        END. Without an arena this is a plain zero-filled allocation."""
+        arena = self.arena
+        if arena is None:
+            return torch.zeros(shape, dtype=dtype, device=self.device)
+        nbytes = int(math.prod(shape)) * torch.empty(0, dtype=dtype).element_size()
+        cursor = int(arena.numel()) if self._arena_cursor is None else self._arena_cursor
+        if cursor - nbytes < 0:
+            # The MoE banks would not all fit in the arena: clamping start to 0 would let
+            # this bank and the earlier ones alias the same bytes (observed: down/down_scale
+            # clobbering gate_up rows -> garbled MoE output). Fail loudly instead; the
+            # pre-teardown fit checks (validate_rebuild + engine arena check) are the ones
+            # that should have rejected this target.
+            raise RuntimeError(
+                f"MoE slot cache overflow: bank carve needs {nbytes} B at arena offset "
+                f"{cursor}..{cursor - nbytes}, arena is {int(arena.numel())} B -- the "
+                f"(moe, kv) target exceeds the shared cache arena; rebuild/slide targets "
+                "must be validated against arena bytes before teardown"
+            )
+        start = max(0, (cursor - nbytes) // 16 * 16)
+        buf = arena[start : start + nbytes].view(dtype).reshape(shape)
+        buf.zero_()
+        self._arena_cursor = start
+        return buf
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -461,6 +518,29 @@ class OffloadMoeCache:
                 f"{MARLIN_MAX_CACHE_SIZE} (vLLM moe_align_block_size caps padded experts at "
                 "1024); reduce moe_cache_size or force --quant-backend moe.nvfp4=triton"
             )
+        # Shared-arena capacity: the bank slot-caches are carved right-anchored from a
+        # ONE-TIME flat block sized to the COLD-START (moe, kv) footprint, which is never
+        # grown. A target whose MoE half alone exceeds the arena would clamp the right
+        # anchor to 0 and alias the banks onto each other (observed: down/down_scale
+        # clobbering gate_up rows -> systematically corrupted experts -> garbled output).
+        # The engine's pre-teardown check adds the KV half of the same invariant; this
+        # half protects every path that calls validate_rebuild directly.
+        arena = self.arena
+        # bank_sources is attached by the engine AFTER construction (set_bank_sources), so at
+        # the __post_init__ call the attribute does not exist yet -- skip the half-check then.
+        bank_sources = getattr(self, "bank_sources", None)
+        if arena is not None and bank_sources:
+            from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+            need = cache_size * expert_bytes_per_slot(bank_sources)
+            have = int(arena.numel())
+            if need > have:
+                raise ValueError(
+                    f"moe_cache_size={cache_size} needs {need} B ({need/2**30:.3f} GiB) for the "
+                    f"expert slot cache alone, but the shared cache arena is {have} B "
+                    f"({have/2**30:.3f} GiB), sized at cold start and never grown; "
+                    "old cache kept, still serving"
+                )
 
     def rebuild(self, cache_size: int) -> None:
         """Resize the GPU slot cache + bookkeeping to ``cache_size`` IN PLACE.
@@ -482,9 +562,10 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
-        # 2. Drop old GPU tensors (free-before-alloc).
+        # 2. Drop old GPU tensors (free-before-alloc); the arena carves from scratch.
         self.banks = []
         self.bank_caches = {}
+        self._arena_cursor = self.arena.numel() if self.arena is not None else None
         self.cache_size = cache_size
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -492,8 +573,8 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.zeros(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
+            self.bank_caches[name] = self._alloc_slot_cache(
+                (cache_size, *head.shape[1:]), head.dtype
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
@@ -527,6 +608,113 @@ class OffloadMoeCache:
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
             logger.warning(
                 f"Disabling MoE prefill overlap on rebuild: cache_size {cache_size} "
+                f"< 2*num_experts {2 * self.num_experts}."
+            )
+            self.prefill_overlap = False
+        if self.prefill_overlap:
+            self._init_prefill_overlap_buffers()
+
+    def rebuild_slide(self, cache_size: int) -> None:
+        """Resize the GPU slot cache WHILE KEEPING resident expert rows (budget-slide path).
+
+        Same validation and bookkeeping lifecycle as rebuild(); the difference is the
+        slot map is rebuilt around SURVIVORS instead of a cold start: occupied slots
+        ranked by last-use step are kept (most recent first, up to cache_size), their
+        rows staged per bank, the old bank views dropped, the resized bank carved at
+        its right-anchored arena position, and the staged rows scattered back into
+        compacted slots 0..n-1. Maps, usage and recency carry over so post-slide
+        requests hit the rows they already paid for; stat counters reset like rebuild.
+        """
+        assert self.bank_sources, "set_bank_sources must run before rebuild_slide"
+        self.validate_rebuild(cache_size)
+        # Same prefill-overlap teardown as rebuild(): buffer views alias the old caches.
+        self.prefill_bank_buffers = []
+        self.prefill_copy_stream = None
+        self.prefill_begin_event = None
+        self.prefill_ready_events = []
+        self.prefill_release_events = []
+        self._prefill_buffer_layer = [None, None]
+        self._prefill_buffer_released = [True, True]
+        self._prefill_buffer_has_release_event = [False, False]
+        # Survivor selection on the host (small int tables; runs at the idle safe point):
+        # occupied slots ranked by last-use step, newest kept.
+        ids = self.id_of_slot.detach().cpu().tolist()
+        used = self.usage.detach().cpu().tolist()
+        occupied = sorted((i for i, e in enumerate(ids) if e >= 0),
+                          key=lambda i: used[i], reverse=True)
+        keep = occupied[:cache_size]
+        n_keep = len(keep)
+        # Per-bank rotate: stage survivors -> drop the old view -> carve the resized
+        # bank (arena carving is pure offset arithmetic from the anchored end; without
+        # an arena this is a plain allocation). Only one staging tensor is alive at a
+        # time, and this runs at the scheduler idle safe point.
+        old_caches = dict(self.bank_caches)
+        self.bank_caches = {}
+        self.banks = []
+        self.cache_size = cache_size
+        # Reset the carve cursor like rebuild() does: the old views are released by the
+        # rotate below, so the resized banks re-carve from the anchored end at the same
+        # positions instead of stacking one bank-set lower on every slide.
+        self._arena_cursor = self.arena.numel() if self.arena is not None else None
+        # Row-by-row survivor rotate: plain copy_ keeps the transient at one row and
+        # stays on the fp8-capable dispatch path (index_copy/index_select have no CUDA
+        # kernel for Float8_e4m3fn). Reads walk OLD slots ascending; on a grow the
+        # end-anchor puts each destination below its still-unread successors, and each
+        # row is read before its own write, so no row sees its source overwritten.
+        for name in self.bank_schema:
+            head = self.bank_sources[name][0]
+            old_c = old_caches[name]
+            new_c = self._alloc_slot_cache((cache_size, *head.shape[1:]), head.dtype)
+            for j, old_slot in enumerate(keep):
+                # clone() detaches the row into fresh storage: old/new views share the
+                # arena and end-anchor overlap, which copy_ rejects on shared ranges.
+                new_c[j].copy_(old_c[old_slot].clone())
+            old_caches[name] = None
+            self.bank_caches[name] = new_c
+        del old_caches
+        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        # Hand the chunk blocks back at this idle safe point instead of leaving them
+        # cached while the KV side resizes and graphs re-capture.
+        torch.cuda.empty_cache()
+        self._build_copy_plan()
+        # Re-thread the maps around the survivors: new slot j carries the expert that
+        # lived in old slot keep[j], with its usage stamp. slot_for_id is indexed by the
+        # flat id (layer * num_experts + expert), so one flat index_put covers it.
+        new_ids = [-1] * cache_size
+        new_used = [0] * cache_size
+        for j, old_slot in enumerate(keep):
+            new_ids[j] = ids[old_slot]
+            new_used[j] = used[old_slot]
+        self.id_of_slot = torch.tensor(new_ids, dtype=torch.int32, device=self.device)
+        self.usage = torch.tensor(new_used, dtype=torch.int64, device=self.device)
+        self.slot_for_id.fill_(-1)
+        if n_keep:
+            eids = torch.as_tensor(new_ids[:n_keep], dtype=torch.int64, device=self.device)
+            slots = torch.arange(n_keep, dtype=torch.int32, device=self.device)
+            self.slot_for_id.view(-1).index_put_((eids,), slots)
+        plan_slots = max(self.num_experts, cache_size)
+        self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # step / expert_recency / active_mask KEEP their values: the residency clock and
+        # the per-expert recency survive the slide -- that is the point of keeping rows.
+        self.num_indices.zero_()
+        self.num_missing_full.zero_()
+        self.stat_missing.zero_()
+        self.stat_active.zero_()
+        self.stat_calls.zero_()
+        self.stat_fetched.zero_()
+        self.stat_missing_layer.zero_()
+        self.lru_stats.zero_()
+        self.stat_active_layer.zero_()
+        self.stat_fetched_layer.zero_()
+        self.stat_steps_layer.zero_()
+        self.decode_freq.zero_()
+        self.prefill_hit_rows = 0
+        self.prefill_total_rows = 0
+        self._hit_d2d_fallback_logged = False
+        if self.prefill_overlap and cache_size < 2 * self.num_experts:
+            logger.warning(
+                f"Disabling MoE prefill overlap on slide: cache_size {cache_size} "
                 f"< 2*num_experts {2 * self.num_experts}."
             )
             self.prefill_overlap = False
@@ -840,19 +1028,93 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        from freetoken.moe.offload_kernels import ensure_experts
+    def load_experts(self, layer_id: int, topk_ids: torch.Tensor, *, record_stats: bool = True) -> torch.Tensor:
+        """Make the experts ``topk_ids`` routes to resident, copying in the missing ones, and return
+        ``topk_ids`` as slot ids. A step of at most ``ENSURE_ONE_CALL_WIDTH`` routes is one
+        admission that rewrites ``topk_ids`` in place. A wider one goes to the slot cache as its
+        distinct experts, ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the
+        next query evicts: LRU evicts an earlier query's slots last, and a layer never routes to
+        more experts than the cache holds. The statistics count either step once.
 
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        ``record_stats=False`` skips the routing histogram / lru_stats bookkeeping while still
+        running the LRU + copy machinery. Used for verify-phase admissions, which carry a batched
+        K+1-window routing distribution rather than steady-state decode; counting them biases the
+        recurrence-window promotion toward verify-specific experts."""
+        from freetoken.moe.offload_kernels import ENSURE_ONE_CALL_WIDTH, ENSURE_QUERY_WIDTH, ensure_experts
+
+        if topk_ids.numel() <= ENSURE_ONE_CALL_WIDTH:
+            self.ensure_experts(layer_id, topk_ids, record_stats=record_stats)
+            self.copy_missing()
+            return topk_ids
+        if record_stats:
+            self._count_routing(layer_id, topk_ids)
+        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
+        # the routed experts in ascending order, then the first of them again, which the admission
+        # dedups; a step's routes reach at most as many experts as there are routes
+        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
+        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
+        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        missed = torch.zeros((), dtype=torch.int64, device=self.device)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        for piece in query.split(ENSURE_QUERY_WIDTH):
+            ensure_experts(self, layer_id, piece, record_stats=False)
+            missed += self.num_indices[0]
+            self.copy_missing()
+        if record_stats and self.collect_stats:
+            stats = self.lru_stats[layer_id]
+            stats[Stat.ACTIVE] += routed.sum()
+            stats[Stat.MISS] += missed
+            stats[Stat.CALLS] += 1
+        return self.slot_for_id[layer_id][topk_ids.long()]
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def loads_prefill_on_demand(self, num_tokens: int) -> bool:
+        return 0 < num_tokens <= self.prefill_demand_tokens
+
+    def load_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make a demand prefill chunk's routed experts resident, copying in the missing ones,
+        and return ``topk_ids`` as slot ids. The chunk's distinct experts go to the slot cache
+        ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the next query
+        evicts: LRU evicts an earlier query's slots last, and a layer never routes to more
+        experts than the cache holds. The admissions stay out of the decode statistics."""
+        from freetoken.moe.offload_kernels import ENSURE_QUERY_WIDTH, ensure_experts
+
+        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
+        # the routed experts in ascending order, then the first of them again, which the admission
+        # dedups; a chunk's routes reach at most as many experts as there are routes
+        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
+        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
+        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        for piece in query.split(ENSURE_QUERY_WIDTH):
+            ensure_experts(self, layer_id, piece, record_stats=False)
+            self.copy_missing()
+        return self.slot_for_id[layer_id][topk_ids.long()]
+
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
+        from freetoken.moe.offload_kernels import ensure_experts
+
+        # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to slot ids in
+        # place), so snapshot the routing histogram before that happens. Skipped when the caller
+        # is a verify-phase batch -- see ``load_experts``.
+        if record_stats:
+            self._count_routing(layer_id, expert_ids)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        ensure_experts(self, layer_id, expert_ids, record_stats=record_stats)
+
+    def _count_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        if self.collect_decode_freq:
+            ids = expert_ids.reshape(-1).long()
+            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            self._observe_route_persist(layer_id, ids)
+
+    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -861,17 +1123,39 @@ class OffloadMoeCache:
         left non-resident and ``expert_ids`` is rewritten to their cache slot (hit or
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
-        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
+        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe.
+
+        ``record_stats=False`` skips the decode_freq / route-persist histogram while still
+        running the capped-fetch LRU + copy path; see :meth:`load_experts`."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
-        if self.collect_decode_freq:
+        if record_stats and self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            self._observe_route_persist(layer_id, ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
+
+
+    def prefetch_decode_layer(self, layer_id: int, hint_ids: torch.Tensor, *, record_stats: bool = True) -> None:
+        """Warm next-decode-layer's cache while current GPU compute runs (bs>=4 double buffer).
+
+        Same shape as ``ensure_experts_hybrid`` + ``copy_missing`` on the current layer's
+        stream, but wrapped so the caller can fire-and-forget between layers: the heuristic
+        hint is THIS layer's routing (adjacent MoE layers tend to agree for the same token
+        batch), so most of next layer's real misses are already in flight when it runs its
+        own ensure_experts_hybrid. Anything the heuristic missed is fetched on-time then --
+        correctness never depends on the hint being right. Requires a hybrid decode_target
+        (the CPU/hybrid path is the only one with per-step fetch pressure worth overlapping).
+        """
+        if self.decode_target != "hybrid":
+            return
+
+        self.ensure_experts_hybrid(layer_id, hint_ids, record_stats=record_stats)
+        self.copy_missing(hint_ids.numel())
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
@@ -976,6 +1260,20 @@ class OffloadMoeCache:
             })
         return {"per_layer": per_layer}
 
+    def _observe_route_persist(self, layer_id: int, ids: torch.Tensor) -> None:
+        """Track how well THIS step's routed-expert set is covered by the PREVIOUS step's set.
+
+        recall = |curr ∩ prev| / |curr|. A high recall means an "adjacent-step reuse" prefetch
+        (no trained predictor needed) already covers most of the next fetch; a low recall says a
+        real route predictor is worth building. All device-side, no host sync."""
+        prev = self._persist_prev[layer_id]
+        curr = torch.zeros_like(prev)
+        curr.scatter_(0, ids, True)
+        self._persist_hits[layer_id] += (curr & prev).sum().to(torch.float32)
+        self._persist_cur[layer_id] += curr.sum().to(torch.float32)
+        prev.copy_(curr)
+        self._persist_steps += 1
+
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
@@ -999,6 +1297,12 @@ class OffloadMoeCache:
         p = freq / total.clamp(min=1).unsqueeze(1)
         ent = -(p * p.clamp(min=1e-12).log()).sum(dim=1)[valid]
         norm_ent = (ent / torch.log(torch.tensor(float(self.num_experts)))).mean().item()
+        # Route-persistence recall: fraction of each step's selected experts already selected the
+        # previous step. Mean over layers with traffic. Near 1.0 => adjacent-step reuse prefetch is
+        # enough; low => a real predictor (MoE-SpeQ-style) is worth building.
+        pc = self._persist_cur[valid]
+        recall = (self._persist_hits[valid] / pc.clamp(min=1)).mean().item()
+        mean_cur = pc.mean().item()
         return {
             "slots_per_layer": slots_per_layer,
             "working_set_mean": ws[valid].mean().item(),
@@ -1006,9 +1310,12 @@ class OffloadMoeCache:
             "experts_for_90pct": cover90.mean().item(),
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
+            "route_recall_prev_step": recall,
+            "route_selected_mean_per_step": mean_cur,
+            "route_steps": self._persist_steps,
         }
 
-    def copy_missing(self) -> None:
+    def copy_missing(self, num_rows: int | None = None) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
@@ -1027,6 +1334,20 @@ class OffloadMoeCache:
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
+            # bs-sized transport routing: the fused multi-copy is PCIe-bound, so the
+            # grid only has to keep the link fed -- blocks_per_bank*num_threads near the
+            # ~4096-thread/bank knee is enough. The choice is keyed to the number of rows
+            # actually in flight this step (``num_rows``: bs*top_k for a routed decode step,
+            # the full expert count for a whole-layer materialize), NOT to the model's expert
+            # count -- so a wide MoE (Qwen-class, hundreds of experts) and a narrower one
+            # (GLM-class) get the same grid from the same batch shape. A small decode batch
+            # (few distinct missing rows) is served by the narrow grid (blocks_per_bank=4,
+            # ~=the knee) and avoids extra-launch overhead; once more rows are in flight the
+            # wider grid keeps the link fed. ``num_rows`` is host-known per graph capture, so
+            # the choice is graph-safe with no host sync.
+            blocks_per_bank = 8
+            if num_rows is not None and num_rows < _COPY_WIDE_MIN_ROWS:
+                blocks_per_bank = 4
             # One launch copies the missing rows for every bank (instead of one launch per
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
@@ -1038,6 +1359,7 @@ class OffloadMoeCache:
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                blocks_per_bank=blocks_per_bank,
             )
             return
 

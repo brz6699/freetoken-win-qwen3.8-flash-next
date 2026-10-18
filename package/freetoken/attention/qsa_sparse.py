@@ -366,6 +366,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
             if rope_positions.dim() == 1:
                 rope_positions = rope_positions.unsqueeze(0).expand(3, -1)
             rope_positions = rope_positions.to(torch.int32)
+            # Padded/dummy rows carry out_loc pointing at the reserved dummy-page slot; clamp to
+            # the rope table's last row so index_copy_/index_select stay in bounds (padded rows are
+            # sinks -- their stored triple is never attended by a live token). clamp_ needs no
+            # source tensor, so it is safe inside CUDA-graph capture (torch.minimum against a
+            # host scalar would force a CPU->CUDA copy).
+            out_loc.clamp_(max=self.kvcache.rope_positions.shape[0] - 1)
             self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
             # groups are ratio-aligned within a page, so the group start is the slot rounded down
             first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()

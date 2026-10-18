@@ -15,8 +15,24 @@ _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
 
+# Recurrence-window admission: a missing expert earns a cache slot only if it was active
+# within the last ``WINDOW`` decode steps (expert_recency >= step - WINDOW). Experts seen for
+# the first time (recency sentinel -1) or after a gap longer than WINDOW stay non-resident and
+# compute on the CPU this step; their recency still bumps, so recurring within WINDOW next step
+# qualifies them. This stops one-shot experts from evicting long-lived residents. Short enough
+# to reject one-shots, long enough to keep genuinely recurring routing. Env-overridable.
+_HYBRID_RECENCY_WINDOW = max(1, int(os.getenv("FREETOKEN_HYBRID_WINDOW", "64")))
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+
+# lru_ensure dedups its query in a [K, K] register block: flat in cost up to 128 ids, spilling past
+# that and failing to compile past 1024, so a wider admission goes to it in queries this wide.
+ENSURE_QUERY_WIDTH = 128
+# The widest decode step admitted in one call: up to 256 ids the spill costs less than the distinct experts'
+# queries and their own launches, and past it far more (RTX 3090 Ti, CUDA-graph replay).
+ENSURE_ONE_CALL_WIDTH = 256
+
+
+def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -35,7 +51,7 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        stats=cache.lru_stats[layer_id] if cache.collect_stats and record_stats else None,
         id_base=layer_id * cache.num_experts,
     )
 
@@ -121,6 +137,7 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        WINDOW=_HYBRID_RECENCY_WINDOW,
         num_warps=num_warps,
     )
 
@@ -150,24 +167,41 @@ def _ensure_experts_hybrid_cpu(
             cache.usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
+    cache.num_missing_full.fill_(len(missing))
+    rec = cache.expert_recency[layer_id].tolist()
+    # Recurrence-window gate: keep only misses whose expert was active within the last WINDOW
+    # steps. Brand-new (sentinel -1) and stale misses are left non-resident (CPU compute) so a
+    # one-shot expert cannot evict a long-lived resident; cutoff >= 0 keeps the sentinel out too.
+    cutoff = max(0, step - _HYBRID_RECENCY_WINDOW)
+    elig = [e for e in missing if rec[e] >= cutoff]
     if _HYBRID_FETCH_BY_RECENCY:
-        rec = cache.expert_recency[layer_id].tolist()
-        missing.sort(key=lambda e: (-rec[e], e))
+        elig.sort(key=lambda e: (-rec[e], e))
     else:
-        missing.sort()
+        elig.sort()
     if frac_q16 > 0:
         m, q = len(missing), 1 << 16
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
-    num_fetch = min(len(missing), int(max_fetch))
-    cache.num_missing_full.fill_(len(missing))
+    num_fetch = min(len(elig), int(max_fetch))
+
+    # Mirror the GPU zero-split promotion: a zero cap with eligible misses and an empty slot
+    # promotes one recurring miss so the working set keeps warming (see the kernel comment).
+    promotion_slot = -1
+    if frac_q16 > 0 and num_fetch == 0 and elig:
+        for s in range(cache.cache_size):
+            if int(cache.id_of_slot[s].item()) < 0:
+                promotion_slot = s
+                break
+        if promotion_slot >= 0:
+            num_fetch = 1
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
     for idx in range(num_fetch):
-        expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+        expert = elig[idx]
+
+        victim = promotion_slot if promotion_slot >= 0 else min(range(cache.cache_size), key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -178,9 +212,10 @@ def _ensure_experts_hybrid_cpu(
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = expert  # layer-local row
 
-    if _HYBRID_FETCH_BY_RECENCY:
-        for expert in seen:
-            cache.expert_recency[layer_id, expert] = step
+    # Bump every active expert's recency to this step (both fetch policies need it now: the
+    # recurrence-window gate reads expert_recency even under lowest_id ordering).
+    for expert in seen:
+        cache.expert_recency[layer_id, expert] = step
 
     # Overflow misses keep slot_for_id == -1, so the rewrite below yields -1 for them.
     flat = expert_ids.view(-1)
@@ -309,6 +344,7 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -354,20 +390,41 @@ def _ensure_experts_hybrid_kernel(
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
+    # Recurrence-window gate: only misses whose expert was active within the last WINDOW
+    # steps earn a slot. Brand-new (sentinel -1) and stale misses compute on the CPU this step
+    # instead of evicting a long-lived resident; cutoff >= 0 keeps the sentinel out too. Their
+    # recency still bumps below, so recurring within WINDOW next step qualifies them.
+    rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
+    cutoff = tl.maximum(0, step - WINDOW)
+    elig = is_missing & (rec >= cutoff)
+    num_fetch = tl.minimum(num_fetch, tl.sum(elig.to(tl.int32)))
+
+
+    # Even a zero bandwidth-split cap must not leave recurring misses on the CPU while empty
+    # slots sit idle: promote the highest-recency eligible miss into the first empty slot so a
+    # stable working set can keep warming the cache. Only fires when the cap already drove the
+    # fetch count to exactly zero with eligible misses and a free slot present.
+    promotion_slot = tl.full((), -1, tl.int32)
+    if (fetch_frac_q16 > 0) & (num_fetch == 0) & (tl.sum(elig.to(tl.int32)) > 0):
+        off_c0 = tl.arange(0, BLOCK_C)
+        owners = tl.load(id_of_slot_ptr + off_c0, mask=off_c0 < cache_size, other=-1)
+        promotion_slot = tl.min(tl.where(owners < 0, off_c0, cache_size))
+        num_fetch = (promotion_slot < cache_size).to(tl.int32)
+    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
+
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
     # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
-    # spans only [0, num_experts), so it can only break exact-recency ties).
+    # spans only [0, num_experts), so it can only break exact-recency ties). Ineligible
+    # misses take the floor sentinel so argmax only ever picks a window-recurring miss.
     if BY_RECENCY:
-        rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
-            is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+            elig, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
         ).to(tl.int64)
     else:
-        missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
+        missing_rank = tl.cumsum(elig.to(tl.int32)) - 1
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     if num_fetch > 0:
@@ -381,7 +438,7 @@ def _ensure_experts_hybrid_kernel(
             owner_active = owner_active | (oid == base + ei)
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
-            victim = tl.argmin(u, axis=0).to(tl.int32)
+            victim = tl.where(promotion_slot >= 0, promotion_slot, tl.argmin(u, axis=0)).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
@@ -389,7 +446,7 @@ def _ensure_experts_hybrid_kernel(
                 e = tl.argmax(score, axis=0).to(tl.int32)
                 score = tl.where(off_e == e, -1152921504606846976, score)
             else:
-                e = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
+                e = tl.sum(tl.where((missing_rank == i) & elig, off_e, 0))
             tl.store(id_of_slot_ptr + victim, base + e)
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
@@ -403,11 +460,11 @@ def _ensure_experts_hybrid_kernel(
         s = tl.load(slot_for_id_ptr + base + e)
         tl.store(expert_ids_ptr + i, s)
 
-    # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
-    # computed on the CPU now ranks high if it recurs, so it gets fetched next time.
-    if BY_RECENCY:
-        step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
-        tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
+    # Bump every active expert's recency to this step. Both fetch policies read expert_recency
+    # now (the recurrence-window gate uses it even under lowest_id ordering), so an overflow
+    # miss computed on the CPU ranks correctly next step: recurring within WINDOW qualifies it.
+    step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
+    tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
 
 
 @triton.jit(do_not_specialize=["buffer_base"])

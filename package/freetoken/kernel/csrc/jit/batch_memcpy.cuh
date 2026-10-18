@@ -24,6 +24,10 @@ struct BatchMemcpy {
         using namespace host;
         auto N = SymbolicSize{"batch length"};
         auto ptr_dtype = SymbolicDType{};
+        // pre-set options on the shared symbol: the explicit-template
+        // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the
+        // same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+        ptr_dtype.set_options<int64_t>();
         TensorMatcher({N})
             .with_dtype(ptr_dtype)
             .with_device<kDLCPU>()

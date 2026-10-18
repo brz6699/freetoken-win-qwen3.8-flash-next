@@ -76,7 +76,9 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config, num_pages: int, device: torch.device, dtype: torch.dtype, arena: torch.Tensor | None = None
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
@@ -125,6 +127,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             else None
         ),
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        arena=arena,
     )
 
 
@@ -138,6 +141,7 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     kv_dtype: torch.dtype | None = None,
     kv_quant: str | None = None,
+    arena: torch.Tensor | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -150,35 +154,41 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            arena=arena,
         )
 
     from .mha_pool import MHAKVCache
 
-    # Hybrid linear-attention models only store paged KV for their non-linear
-    # layers; the linear layers keep a separate recurrent state (LinearStatePool).
-    # The linear group emits no paged spec, so the remaining paged spec(s) drive
-    # the dispatch below; the paged pool backs JUST those layers via a global-id
-    # -> dense-slot remap (layer_ids) so the (majority) linear layers cost no
-    # slabs.
+    # Hybrid linear-attention models (e.g. Qwen3.5 GatedDeltaNet) only store paged KV
+    # for their full-attention layers; the linear layers keep a separate recurrent
+    # state. Back just those layers and remap their global ids to dense storage slots
+    # so we don't over-allocate slabs for the (majority) linear layers.
     layer_ids: tuple[int, ...] | None = None
-    kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    num_kv_heads = model_config.num_kv_heads
+    head_dim = model_config.head_dim
     if model_config.has_linear_attention:
-        assert len(kv_specs) == 1, (
-            f"hybrid-linear models support one paged-KV group, got "
-            f"{[s.name for s in kv_specs]}"
-        )
-        layer_ids = kv_specs[0].layer_ids
+        specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+        assert len(specs) == 1, f"expected one paged-KV group, got {[s.name for s in specs]}"
+        spec = specs[0]
+        layer_ids = spec.layer_ids
+        num_kv_heads = spec.num_kv_heads
+        head_dim = spec.head_dim
 
-    # Latent-KV MLA / GQA block-sparse models declare their geometry on the single
-    # paged spec; the same spec fields drive the KV cost model, so the factory and
-    # the budget can never disagree.
+    # Latent-KV MLA models declare it on their single full-attention group: they get
+    # the latent pool (one slab, V aliases K), plus the DSA index-key slab when the
+    # spec carries indexer dims. The same spec fields drive the KV cost model, so the
+    # factory and the budget can never disagree.
+    kv_specs = model_config.kv_cache_group_specs()
+
+    # GQA block-sparse (MiniMax-M3): one full-attention group carrying the index dims
+    # with mla=False -> the MHA pool plus the index-key slab. The same spec fields
+    # drive the KV cost model, so the factory and the budget can never disagree.
     from freetoken.attention import AttnType as _AttnType
 
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
         from .bsa_pool import BSAKVCache
 
         spec = kv_specs[0]
-        assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -201,6 +211,10 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        # spec decode keeps the last (1 + K) pre-RoPE index keys pending per request
+        # (vLLM sizing): the ring widens by the draft depth so a straddling group still
+        # finds its members. With MTP off this is the plain index_ratio sizing.
+        num_spec = (model_config.mtp_draft_len or 0) + 1 if model_config.enable_mtp else 0
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -213,10 +227,12 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_spec),
             layer_ids=spec.layer_ids,
             kv_dtype=kv_dtype,
             kv_quant=kv_quant,
             mrope=model_config.model_is_mrope,
+            arena=arena,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -262,16 +278,16 @@ def create_kvcache_pool(
             kv_quant=kv_quant,
         )
 
-    spec = kv_specs[0] if len(kv_specs) == 1 else None
     return MHAKVCache(
-        num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
+        num_kv_heads=num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
         num_layers=model_config.num_layers,
-        head_dim=spec.head_dim if spec is not None else model_config.head_dim,
+        head_dim=head_dim,
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        arena=arena,
     )
 
 

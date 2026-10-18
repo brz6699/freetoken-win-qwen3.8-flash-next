@@ -25,6 +25,13 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# Batch-size floor for the decode-step prefetch (see OffloadMoELayer._decode_hybrid):
+# below it a single token's PCIe fetch is shorter than the two extra launches the
+# prefetch adds per MoE layer, so the overlap stops paying. 4 is the measured knee on
+# this kernel stack; the env knob lets a bench sweep locate the knee on other stacks
+# (wide/narrow MoE widths, different PCIe generations) without a code change.
+_DECODE_PREFETCH_MIN_BS = max(1, int(os.getenv("FREETOKEN_DECODE_PREFETCH_MIN_BS", "4")))
+
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -195,7 +202,9 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # moe_force_decode: an MTP verify extend is a short prefill-phase batch whose experts
+        # should be moved on demand (decode path), not streamed whole like a prefill.
+        if ctx.batch.is_prefill and not getattr(ctx.batch, "moe_force_decode", False):
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -218,7 +227,7 @@ class OffloadMoELayer(MoELayer):
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not getattr(ctx.batch, "moe_force_decode", False):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
@@ -276,19 +285,22 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        # Verify-phase batches carry a batched K+1-window routing distribution rather than steady-state
+        # decode; their admissions should update the LRU but not the routing histogram / lru_stats.
+        record_stats = not getattr(get_global_ctx().batch, "moe_force_decode", False)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, record_stats=record_stats)
+        slots = cache.load_experts(self.layer_id, topk_ids, record_stats=record_stats)
         return self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
-            topk_ids,
+            slots,
             views=cache.bank_views(),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
@@ -301,6 +313,8 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        record_stats: bool = True,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
@@ -310,12 +324,14 @@ class OffloadMoELayer(MoELayer):
         routing split is device-side elementwise and the CPU submit/sync are host nodes.
         Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
         routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
-        """
+
+        ``record_stats`` gates the routing histogram + hybrid stats updates while leaving the
+        capped-fetch LRU + CPU overflow path intact. See :meth:`_decode_routed`."""
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids, record_stats=record_stats)  # -> slot (hit/fetched) or -1
+        if record_stats and cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
@@ -328,17 +344,34 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
-        cache.copy_missing()
+        cache.copy_missing(topk_ids.numel())
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
+        # Snapshot this layer's views/alphas BEFORE the prefetch so the prefetch's own
+        # ensure_experts_hybrid (which rewrites id_of_slot for next_layer) cannot perturb
+        # the alpha-index gather that alphas_for_slots performs against live slot state.
+        views = cache.bank_views()
+        alphas = cache.alphas_for_slots(self.layer_id)
+        # Double-buffered decode prefetch (bs>=4 only): issue next-layer's PCIe fetch before
+        # this layer's GEMM so PCIe transfers overlap GPU compute on the same stream. The
+        # heuristic hint is THIS layer's routing (adjacent MoE layers agree for the same
+        # token batch), so next-layer's own ensure_experts_hybrid mostly finds hits. Misses
+        # the heuristic missed are fetched on-time then -- correctness never depends on the
+        # hint being right. bs=1 stays on the existing single-buffer path: one token's PCIe
+        # fetch is short enough that the extra launch overhead outweighs the overlap gain.
+        bs_hint = int(hidden_states.shape[0])
+        next_layer = self.layer_id + 1
+        if bs_hint >= _DECODE_PREFETCH_MIN_BS and next_layer < int(cache.num_layers):
+
+            cache.prefetch_decode_layer(next_layer, raw.clone(), record_stats=record_stats)
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=views,
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=alphas,
             is_prefill=False,
         )
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
@@ -356,6 +389,20 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        # Short chunk: load only the routed experts through the slot cache as decode does and
+        # run the same grouped GEMM over the slots, instead of streaming every expert of the layer.
+        if cache.loads_prefill_on_demand(hidden_states.shape[0]):
+            slots = cache.load_prefill_experts(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                slots,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -371,7 +418,7 @@ class OffloadMoELayer(MoELayer):
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
-        cache.copy_missing()
+        cache.copy_missing(self.num_experts)
         return self._expert_gemm(
             cache,
             hidden_states,

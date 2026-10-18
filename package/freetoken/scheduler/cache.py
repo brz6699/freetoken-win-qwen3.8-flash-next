@@ -58,7 +58,8 @@ class _TierHandle(BaseCacheHandle):
         return self.kv_indices
 
     def commit_floor(self) -> int:
-        # restore_mm scattered this prefix into the request's OWN fresh pages; free from 0.
+        # The whole [0, cached_len) restore span is this request's OWN fresh pages, so on every
+        # reclaim pass all of it is freeable (the tree-covered part is a duplicate, not reuse).
         return 0
 
 
@@ -74,7 +75,7 @@ class _PlainTierHandle(RadixCacheHandle):
         return self.kv_indices
 
     def commit_floor(self) -> int:
-        # same as _TierHandle: the request owns the whole restored span (free from 0).
+        # Same as _TierHandle: the restore span is the request's own fresh pages.
         return 0
 
 
@@ -248,16 +249,23 @@ class CacheManager:
                 and align_down(prompt_len, self.page_size) == prompt_len
             ):
                 b, state_src = prompt_len, req.linear_slot_idx
+            elif req.last_committed_boundary is not None:
+                # Chunked prefill: every crossed x64 boundary was committed to the tree and its
+                # seqlen consumed, and the prompt end is almost never page-aligned, so neither
+                # branch above fires. The deepest committed boundary is still a valid reuse
+                # point: its GDN state is exact and its KV rows [0, L) are alive (the committed
+                # node is an ancestor of the request's locked handle until the unlock below).
+                # Park at L -- a few tokens short of the prompt end beats no tier entry at all.
+                cb, state_src = req.last_committed_boundary
+                if 0 < cb <= prompt_len and align_down(cb, self.page_size) == cb:
+                    b = cb
+                else:
+                    return
             else:
                 return
         else:
             b, state_src = align_down(prompt_len, self.page_size), None
         if b <= 0:
-            return
-        # Skip entries that cannot fit the tier cap: parking one just evicts the
-        # resident entry on store and re-parks it every turn (pure churn).
-        per_token, _fixed = pool.unit_bytes()
-        if per_token * b > self._mm_tier_cap:
             return
         slots = self.page_table[req.table_idx, :b]
         rows = pool.snapshot_rows(slots)
@@ -280,47 +288,74 @@ class CacheManager:
         self._mm_tier[digest] = (hashes, ids, rows, gdn, b, nbytes)
         self._mm_tier_bytes += nbytes
         while self._mm_tier_bytes > self._mm_tier_cap and len(self._mm_tier) > 1:
-            _, old = self._mm_tier.popitem(last=False)
+            # Drop TEXT entries first: they re-park at every turn end, so an evicted bucket only
+            # costs one recompute until the next finish. mm item-hash entries key on the media
+            # content itself (shared across sessions, re-derivable only by a full re-fetch), so
+            # they keep their slot while any text entry can still be evicted.
+            drop = next((d for d, ent in self._mm_tier.items() if ent[1] is not None), None)
+            if drop is None:
+                drop = next(iter(self._mm_tier))
+            old = self._mm_tier.pop(drop)
             self._mm_tier_bytes -= old[-1]
 
     def restore_mm(self, req: PendingReq, mr: MatchResult) -> MatchResult:
-        """RAM -> VRAM half of the mm tier: on an identical-content hit whose boundary beats
-        the tree match, allocate fresh pages, scatter the parked rows back, and hand back a
-        handle for the restored prefix. The GDN state rides on as host tensors
+        """RAM -> VRAM half of the tier: on a hit whose boundary beats the tree match, allocate
+        fresh pages, scatter the parked rows back, and hand back a handle for the restored
+        prefix. mm requests match on exact content hashes; text requests match their stored
+        boundary window against the prompt head (MRU-first prefix scan -- a finished turn's
+        boundary is the next turn's prefix, so growing agent histories keep hitting).
+        The GDN state rides on as host tensors
         (``MatchResult.gdn_host``), written into the request's live slot by the scheduler before
         the first forward. SWA-paged models keep the plain tree path (their window tier rides
         the swa pool's own mapping)."""
         pool = self.kv_pool
         if pool is None or not self._mm_tier:
             return mr
-        hashes = self._tier_hashes(req)
-        digest = self._tier_digest(hashes)
-        entry = self._mm_tier.get(digest)
-        if entry is None:
-            return mr
-        ehashes, ids, rows, gdn, b, _bytes = entry
-        if ehashes != hashes:
-            return mr
         m = mr.cuda_handle
-        if ids is not None:
-            # The bucket only hashed the first-cap ids, so trim to the true common prefix before
-            # reusing rows that were computed under the stored ids (mm trusts its item hashes).
-            pid = req.input_ids
-            pm = pid.tolist() if hasattr(pid, "tolist") else pid
-            lim = min(b, len(ids), len(pm))
-            common = lim
-            for i in range(lim):
-                if ids[i] != int(pm[i]):
-                    common = i
-                    break
-            b = align_down(common, self.page_size)
+        rows = None
+        gdn = None
+        digest: int | None = None
+        if getattr(req, "mm_items", None):
+            hashes = self._tier_hashes(req)
+            digest = self._tier_digest(hashes)
+            entry = self._mm_tier.get(digest)
+            if entry is None:
+                return mr
+            ehashes, _ids, rows, gdn, b, _bytes = entry
+            if ehashes != hashes:
+                return mr
+        else:
+            # Text: agent turns APPEND to a shared history, so the parked boundary of turn N is a
+            # PREFIX of turn N+1's prompt -- an exact-window bucket lookup misses every growth
+            # turn. Scan MRU-first for the newest entry whose stored boundary ids match this
+            # prompt's head; the newest match is usually also the longest one.
+            pm = req.input_ids
+            pm = pm.tolist() if hasattr(pm, "tolist") else pm
+            b = m.cached_len
+            for _d, (_eh, eids, rws, g, _bb, _nb) in reversed(tuple(self._mm_tier.items())):
+                if eids is None:
+                    continue
+                bb = len(eids)
+                if bb <= b or bb > len(pm) or list(pm[:bb]) != list(eids):
+                    continue
+                rows, gdn, b, digest = rws, g, bb, _d
+            if digest is None:
+                return mr
         if b <= m.cached_len or b > req.input_len or self._mm_bound(req, b) != b:
             return mr
         if self.is_swa:  # window tier not carried: keep the tree match (no pages to leak)
             return mr
-        allocated = self._allocate(div_ceil(b, self.page_size))
+        needed_pages = div_ceil(b, self.page_size)
+        if needed_pages > self.num_pages:
+            # The pool shrank below this parked entry since it was written (budget slide):
+            # eviction alone can never fit it, so skip the tier instead of churning the prefix
+            # cache toward a guaranteed shortfall. Plain tree match + recompute stays correct,
+            # and admission's grow-before-reject re-grows KV under real demand.
+            return mr
+        allocated = self._allocate(needed_pages)
         slots = self._page_to_token(allocated)[:b]
         pool.restore_rows(slots, rows)
+        assert digest is not None
         self._mm_tier.move_to_end(digest)
         handle_cls = _TierHandle if self.is_hybrid else _PlainTierHandle
         handle = handle_cls(b, m.node, slots)
@@ -517,6 +552,9 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
+        # Reclaim floor: tree handles keep [0, cached_len) as tree reuse; a tier-restore handle
+        # owns that whole span itself (commit_floor 0) so its tree-covered part frees too.
+        floor = old_handle.commit_floor()
         insert_ids = req.input_ids[: req.cached_len]
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         # unlock until all operations on handle is done
@@ -524,7 +562,6 @@ class CacheManager:
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
         # reuse) also returns the swa slots backing every full slot it frees; the out-of-window
         # ones were already freed by the decode driver (free_swa is idempotent over the sentinel).
-        floor = old_handle.commit_floor()
         if self.swa_paged:
             self._free_swa(page_indices[floor : cached_len])
         self._free(page_indices[floor : cached_len])
@@ -536,14 +573,14 @@ class CacheManager:
             self._free(tail)
         else:  # keep the tail part, update the handle
             # Re-point the deduped span at the tree's canonical pages: the request's own pages
-            # for [old_handle.cached_len, cached_len) went back on the free list above, but the
-            # attention backends read this row every step and the next allocation hands those
-            # pages to someone else. [0, old_handle.cached_len) needs no rewrite -- it has been
-            # locked since admission, so the row already equals canonical there.
-            if cached_len > old_handle.cached_len:
+            # for [floor, cached_len) went back on the free list above, but the attention
+            # backends read this row every step and the next allocation hands those pages to
+            # someone else. [0, floor) needs no rewrite -- it has been locked since admission,
+            # so the row already equals canonical there.
+            if cached_len > floor:
                 canonical = new_handle.get_matched_indices()
-                self.page_table[req.table_idx, old_handle.cached_len : cached_len].copy_(
-                    canonical[old_handle.cached_len : cached_len])
+                self.page_table[req.table_idx, floor : cached_len].copy_(
+                    canonical[floor : cached_len])
             req.cache_handle = new_handle
             self.lock(new_handle)
 
@@ -557,6 +594,9 @@ class CacheManager:
 
         pool = self.linear_state_pool
         old_handle = req.cache_handle
+        # Reclaim floor: tree handles keep [0, cached_len) as tree reuse; a tier-restore handle
+        # owns that whole span itself (commit_floor 0) so its tree-covered part frees too.
+        floor = old_handle.commit_floor()
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         if finished:
@@ -570,7 +610,7 @@ class CacheManager:
             # is this request's dup to free. The frozen slot is consumed either way (taken by
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
-            free_upto = old_handle.commit_floor()
+            free_upto = floor
             L = req.mamba_last_track_seqlen
             if (
                 L is not None
@@ -619,7 +659,12 @@ class CacheManager:
         frozen = req.mamba_ping_pong[frozen_idx]
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
-        floor = old_handle.commit_floor()
+        # Remember the deepest committed snapshot for the finish path's tier store: `frozen`
+        # holds the GDN state at L in both branches (tree node slot when the tree took it,
+        # request ping-pong slot on dedup). No later prefill track write targets it (the next
+        # one targets the OTHER ping-pong slot) and decode runs no track, so the pair is a
+        # stable (boundary, state-slot) reference until _tier_store at finish.
+        req.last_committed_boundary = (L, frozen)
         self.unlock(old_handle)
         self._free(page_indices[floor : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
@@ -792,10 +837,13 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
-        # The parked rows name the OLD page table's slots; rebuild recycles those pages, so drop
-        # the tier with them (else a later restore scatters into reassigned pages).
-        self._mm_tier.clear()
-        self._mm_tier_bytes = 0
+        # Tier entries are CONTENT blobs (packed rows + host GDN state) keyed on ids/hashes, and
+        # restore always scatters into freshly allocated pages -- so they survive a geometry
+        # change. KEEP them across the slide (this is the prefill-recovery path). An entry whose
+        # boundary no longer fits the pool cannot restore yet, but its next matching request has
+        # input_len >= boundary too, so admission's grow-before-reject re-grows KV first and the
+        # restore then fits -- no eager prune, no eager re-grow.
+        pass
 
     @contextmanager
     def lazy_free_region(self):

@@ -3,12 +3,15 @@
 When flashinfer / sgl_kernel are installed the call-sites use their fused CUDA
 ops; otherwise they fall back to the pure-Triton kernels in
 ``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
-importable (no import side effects), and the result is cached.
+importable (no import side effects), and the result is cached. The
+flashinfer-backed peripheral ops can additionally be pinned back to triton
+with FREETOKEN_FLASHINFER_PERIPH=0 (see :func:`periph_flashinfer_ok`).
 """
 from __future__ import annotations
 
 import functools
 import importlib.util
+import os
 
 import torch
 
@@ -26,6 +29,18 @@ def _importable(name: str) -> bool:
 @functools.cache
 def is_flashinfer_installed() -> bool:
     return _importable("flashinfer")
+
+
+@functools.cache
+def periph_flashinfer_ok() -> bool:
+    """Gate for the peripheral flashinfer call-sites (activation / rope / norm /
+    sampling). Defaults to ``is_flashinfer_installed()``; set
+    FREETOKEN_FLASHINFER_PERIPH=0 to force the triton kernels for those ops. The
+    b12x fused-MoE kernel gate (B12xNvfp4MoEKernel) deliberately keeps reading
+    ``is_flashinfer_installed()`` so this switch never disables it."""
+    if os.environ.get("FREETOKEN_FLASHINFER_PERIPH", "1") == "0":
+        return False
+    return is_flashinfer_installed()
 
 
 @functools.cache

@@ -284,20 +284,6 @@ def _weight_allow_patterns(repo_id: str) -> list[str]:
     return shards or ["*.safetensors"]
 
 
-def _weight_allow_patterns(repo_id: str) -> list[str]:
-    try:
-        index = hf_hub_download(repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm)
-        with open(index, encoding="utf-8") as f:
-            shards = sorted(set(json.load(f)["weight_map"].values()))
-    except Exception as e:
-        logger.warning(
-            "no usable %s for %s (%s); falling back to *.safetensors",
-            SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
-        )
-        return ["*.safetensors"]
-    return shards or ["*.safetensors"]
-
-
 def download_hf_weight(model_path: str) -> str:
     if os.path.isdir(model_path):
         return model_path

@@ -302,6 +302,10 @@ inline auto get_sync_flag_ptr(
     host::SymbolicDevice& device
 ) -> int32_t* {
     auto flag_dtype = host::SymbolicDType{};
+    // pre-set options on the shared symbol: the explicit-template
+    // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the same
+    // chain fails to compile under nvcc (CUDA 13.1) + MSVC
+    flag_dtype.set_options<int32_t>();
     host::TensorMatcher({1})
         .with_dtype(flag_dtype)
         .with_device<kDLCUDA, kDLROCM>(device)
@@ -376,6 +380,11 @@ struct FastIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto device = SymbolicDevice{};
         auto num_indices_dtype = SymbolicDType{};
+        // pre-set options on the shared symbols: the explicit-template
+        // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the
+        // same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+        indices_dtype.set_options<int32_t, int64_t>();
+        num_indices_dtype.set_options<int64_t>();
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
@@ -563,6 +572,12 @@ struct MultiIndexCopyKernel {
         auto ptr_dtype = SymbolicDType{};
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
+        // pre-set options on the shared symbols: the explicit-template
+        // .with_dtype<Ts...>(sym) combined with .with_device<...>() in the
+        // same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+        ptr_dtype.set_options<int64_t>();
+        indices_dtype.set_options<int32_t, int64_t>();
+        num_indices_dtype.set_options<int64_t>();
 
         TensorMatcher({B}).with_dtype(ptr_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);

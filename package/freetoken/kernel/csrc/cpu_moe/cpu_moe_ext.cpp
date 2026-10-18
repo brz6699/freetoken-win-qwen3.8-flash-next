@@ -40,11 +40,28 @@
 #define CPU_MOE_HAS_AFFINITY 0
 #endif
 
-#if defined(__x86_64__) || defined(__i386__)
+// _M_X64/_M_IX86: MSVC never defines the GCC-style __x86_64__/__i386__ macros,
+// which previously left the whole Windows/MSVC build on CPU_MOE_X86=0 -- every
+// SIMD kernel preprocessed out, executor pinned to scalar regardless of CPUID.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h>  // __cpuidex / _xgetbv (the MSVC feature-probe path below)
+#endif
 #define CPU_MOE_X86 1
 #else
 #define CPU_MOE_X86 0
+#endif
+
+// Per-function ISA enablement. GCC/Clang raise the baseline per function via
+// target(); MSVC has no such attribute, but it compiles explicit intrinsics
+// (immintrin.h/zmmintrin.h declare AVX-512/AVXVNNI unconditionally on x64) at
+// the SSE2 TU baseline, so the emitted VEX/EVEX code pairs fine with runtime
+// dispatch by function pointer.
+#ifdef _MSC_VER
+#define CPU_MOE_TARGET(...)
+#else
+#define CPU_MOE_TARGET(...) __attribute__((target(__VA_ARGS__)))
 #endif
 
 namespace {
@@ -109,7 +126,7 @@ float dot_scalar(const bf16_t* w, const bf16_t* x, int n) {
 constexpr int PF_AHEAD = 512;
 
 #if CPU_MOE_X86
-__attribute__((target("avx512f")))
+CPU_MOE_TARGET("avx512f")
 float dot_avx512f(const bf16_t* w, const bf16_t* x, int n) {
   // 4 independent accumulators -> more in-flight loads (memory-level parallelism),
   // which is what lifts a bandwidth-bound GEMV toward peak.
@@ -141,7 +158,7 @@ float dot_avx512f(const bf16_t* w, const bf16_t* x, int n) {
 
 #if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
 #define CPU_MOE_HAS_AVX512BF16 1
-__attribute__((target("avx512bf16,avx512f")))
+CPU_MOE_TARGET("avx512bf16,avx512f")
 static inline __m512bh load_bh(const bf16_t* p) {
   __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(p));
   __m512bh out;
@@ -149,7 +166,7 @@ static inline __m512bh load_bh(const bf16_t* p) {
   return out;
 }
 
-__attribute__((target("avx512bf16,avx512f")))
+CPU_MOE_TARGET("avx512bf16,avx512f")
 float dot_avx512bf16(const bf16_t* w, const bf16_t* x, int n) {
   // 4 accumulators (128 bf16/iter) for memory-level parallelism + a prefetch nudge.
   __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
@@ -175,7 +192,7 @@ float dot_avx512bf16(const bf16_t* w, const bf16_t* x, int n) {
 // Covers Intel 12-14th gen / Arrow Lake (AVX-512 fused off) and AMD Zen<4. The
 // bf16->fp32 widen is a zero-extend + <<16; with 4 independent accumulators the
 // GEMV is memory-bandwidth bound, same as the AVX-512 path (just half the width).
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 inline float hsum256(__m256 v) {
   __m128 lo = _mm256_castps256_ps128(v);
   lo = _mm_add_ps(lo, _mm256_extractf128_ps(v, 1));
@@ -184,7 +201,7 @@ inline float hsum256(__m256 v) {
   return _mm_cvtss_f32(lo);
 }
 
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 float dot_avx2(const bf16_t* w, const bf16_t* x, int n) {
   __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
   __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
@@ -319,7 +336,7 @@ using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t
 // only 8-wide, so instead of a 16-entry LUT we use the e2m1 sign/magnitude symmetry:
 // value = (code&8 ? - : +) * mag8[code&7], mag8 = e2m1[0..7]. The sign is bit 3 of
 // the code shifted into the fp32 sign bit (bit 31). Bit-identical to the e2m1 LUT.
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 inline __m256 e2m1_decode8(__m256i codes, __m256 mag8) {
   __m256 mag = _mm256_permutevar8x32_ps(mag8, _mm256_and_si256(codes, _mm256_set1_epi32(7)));
   __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(codes, _mm256_set1_epi32(8)), 28);
@@ -329,7 +346,7 @@ inline __m256 e2m1_decode8(__m256i codes, __m256 mag8) {
 // Two 16-K blocks (16 packed bytes) per iter: lo nibbles -> even-K, hi -> odd-K,
 // gathered via two vpermps. The per-16 e4m3 scale differs across the two blocks, so
 // it is applied per lane (low 8 lanes = block b, high 8 = block b+1).
-__attribute__((target("avx512f")))
+CPU_MOE_TARGET("avx512f")
 inline __m512 nvfp4_blk2(const uint8_t* pk, const float* xeb, const float* xob, __m512 lut,
                          __m512i loma, float s0, float s1) {
   __m512i wi = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pk)));
@@ -341,7 +358,7 @@ inline __m512 nvfp4_blk2(const uint8_t* pk, const float* xeb, const float* xob, 
   return _mm512_mul_ps(prod, scv);
 }
 
-__attribute__((target("avx512f")))
+CPU_MOE_TARGET("avx512f")
 float dot_nvfp4_avx512(const uint8_t* packed, const uint8_t* scale, float global,
                        const float* xe, const float* xo, int K, const float* e2m1,
                        const float* e4m3) {
@@ -374,7 +391,7 @@ float dot_nvfp4_avx512(const uint8_t* packed, const uint8_t* scale, float global
 }
 
 // AVX2: one 16-K block (8 packed bytes) per call, 8 even + 8 odd lanes.
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 inline __m256 nvfp4_blk_avx2(const uint8_t* pk, const float* xeb, const float* xob,
                              __m256 mag8, float sc) {
   __m256i wi = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(pk)));
@@ -384,7 +401,7 @@ inline __m256 nvfp4_blk_avx2(const uint8_t* pk, const float* xeb, const float* x
   return _mm256_mul_ps(prod, _mm256_set1_ps(sc));
 }
 
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 float dot_nvfp4_avx2(const uint8_t* packed, const uint8_t* scale, float global,
                      const float* xe, const float* xo, int K, const float* e2m1,
                      const float* e4m3) {
@@ -407,7 +424,7 @@ float dot_nvfp4_avx2(const uint8_t* packed, const uint8_t* scale, float global,
 // AVX-VNNI W4A8: decode 8 packed bytes (16 nibbles) of one 16-block to int8 [lo(8),hi(8)]
 // via PSHUFB against the e2m1*2 LUT (replaces the 2 vpermps fp32 expands -- ~4x less
 // port-5 traffic). lo=even-K weights, hi=odd-K, matching the [even(8),odd(8)] act layout.
-__attribute__((target("avx2,avxvnni,fma")))
+CPU_MOE_TARGET("avx2,avxvnni,fma")
 inline __m128i nvfp4_decode_block_i8(const uint8_t* pk, __m128i lut) {
   __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pk));   // 8 bytes
   __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
@@ -419,7 +436,7 @@ inline __m128i nvfp4_decode_block_i8(const uint8_t* pk, __m128i lut) {
 // so u8*s8 needs no offset/correction term. Per-block scale (e4m3 * act-scale) folded in fp32
 // (lanes 0-3 -> block b, 4-7 -> block b+1). Bit-faithful weight; only the int8 activation quant
 // (W4A8) differs from the bf16 reference.
-__attribute__((target("avx2,avxvnni,fma")))
+CPU_MOE_TARGET("avx2,avxvnni,fma")
 float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float global,
                         const int8_t* asi8, int K, const float* e4m3, const float* asb) {
   const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2));
@@ -479,7 +496,7 @@ static int nvfp4_pf_blocks() {
 // One 4-block group (64 int8) -> scaled fp32 partial (16 lanes). Isolated as a helper so
 // the caller can run several independent chains into separate accumulators (the decode ->
 // dpbusd -> scale chain is long, so a single accumulator leaves the core latency-bound).
-__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+CPU_MOE_TARGET("avx512f,avx512bw,avx512vnni,avx2")
 static inline __m512 nvfp4_i8_grp4(const uint8_t* packed, const uint8_t* scale,
                                    const int8_t* asi8, const float* e4m3, const float* asb,
                                    int b, __m512i lut, __m512i idx, __m512i mask0F,
@@ -509,7 +526,7 @@ static inline __m512 nvfp4_i8_grp4(const uint8_t* packed, const uint8_t* scale,
   return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+CPU_MOE_TARGET("avx512f,avx512bw,avx512vnni,avx2")
 float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float global,
                               const int8_t* asi8, int K, const float* e4m3, const float* asb) {
   const __m512i lut = _mm512_broadcast_i32x4(
@@ -676,14 +693,60 @@ enum IsaTier { ISA_SCALAR = 0, ISA_AVX2 = 1, ISA_AVX512 = 2, ISA_AVX512BF16 = 3 
 // Best tier the CPU+build supports, optionally capped DOWN by
 // FREETOKEN_CPU_MOE_ISA={scalar,avx2,avx512,avx512bf16} (A/B testing on a machine
 // that supports more). FREETOKEN_CPU_MOE_SCALAR=1 forces scalar (legacy alias).
+
+// Feature probe. GCC/Clang have __builtin_cpu_supports; MSVC does not (its stub
+// resolves false for everything, which silently pinned the whole executor to the
+// scalar dot on Windows builds -- the AVX-512 kernels compiled fine but were
+// never selected). Dispatch via __cpuidex + XGETBV instead, mirroring the
+// builtins' semantics including the OS-enabled XSTATE checks.
+#ifdef _MSC_VER
+inline bool msvc_cpu_supports(const char* f) {
+  int regs[4];
+  if (!std::strcmp(f, "avx2") || !std::strcmp(f, "fma") || !std::strcmp(f, "avxvnni")) {
+    __cpuidex(regs, 7, 0);
+    if (!std::strcmp(f, "avx2") && !(regs[1] >> 5 & 1)) return false;      // EBX bit 5
+    if (!std::strcmp(f, "avxvnni") && !(regs[2] >> 11 & 1)) return false;  // ECX bit 11
+    if (!std::strcmp(f, "fma")) {
+      __cpuidex(regs, 1, 0);
+      if (!(regs[2] >> 12 & 1)) return false;
+    }
+    // VEX-encoded: need OSXSAVE + XCR0[XMM|YMM]
+    __cpuidex(regs, 1, 0);
+    if (!(regs[2] >> 27 & 1)) return false;
+    return (_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0x6) == 0x6;
+  }
+  if (!std::strcmp(f, "avx512f") || !std::strcmp(f, "avx512bf16") ||
+      !std::strcmp(f, "avx512vnni")) {
+    if (!std::strcmp(f, "avx512f")) {
+      __cpuidex(regs, 7, 0);
+      if (!(regs[1] >> 16 & 1)) return false;  // leaf 7 EBX bit 16
+    } else if (!std::strcmp(f, "avx512bf16")) {
+      __cpuidex(regs, 7, 1);                   // AVX512-BF16: subleaf 1, EAX bit 22
+      if (!(regs[0] >> 22 & 1)) return false;
+    } else {
+      __cpuidex(regs, 7, 0);
+      if (!(regs[2] >> 11 & 1)) return false;  // AVX512-VNNI: leaf 7 ECX bit 11
+    }
+    __cpuidex(regs, 1, 0);
+    if (!(regs[2] >> 27 & 1)) return false;    // OSXSAVE
+    // opmask | ZMM_Hi256 | Hi16_ZMM on top of XMM|YMM
+    return (_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0xE6) == 0xE6;
+  }
+  return false;
+}
+#define CPU_MOE_CPU_SUPPORTS(f) msvc_cpu_supports(f)
+#else
+#define CPU_MOE_CPU_SUPPORTS(f) __builtin_cpu_supports(f)
+#endif
+
 inline IsaTier pick_isa() {
 #if CPU_MOE_X86
   if (getenv("FREETOKEN_CPU_MOE_SCALAR")) return ISA_SCALAR;
   IsaTier best = ISA_SCALAR;
-  if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) best = ISA_AVX2;
-  if (best >= ISA_AVX2 && __builtin_cpu_supports("avx512f")) best = ISA_AVX512;
+  if (CPU_MOE_CPU_SUPPORTS("avx2") && CPU_MOE_CPU_SUPPORTS("fma")) best = ISA_AVX2;
+  if (best >= ISA_AVX2 && CPU_MOE_CPU_SUPPORTS("avx512f")) best = ISA_AVX512;
 #ifdef CPU_MOE_HAS_AVX512BF16
-  if (best >= ISA_AVX512 && __builtin_cpu_supports("avx512bf16")) best = ISA_AVX512BF16;
+  if (best >= ISA_AVX512 && CPU_MOE_CPU_SUPPORTS("avx512bf16")) best = ISA_AVX512BF16;
 #endif
   if (const char* f = getenv("FREETOKEN_CPU_MOE_ISA")) {
     IsaTier want = best;
@@ -728,7 +791,7 @@ inline bool cpu_has_avxvnni() {
 #if CPU_MOE_X86
   const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
   if (no && no[0] && no[0] != '0') return false;  // ignore unset/empty/"0"
-  return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("avxvnni");
+  return CPU_MOE_CPU_SUPPORTS("avx2") && CPU_MOE_CPU_SUPPORTS("avxvnni");
 #else
   return false;
 #endif
@@ -745,7 +808,7 @@ inline bool cpu_has_avx512vnni() {
   if (no && no[0] && no[0] != '0') return false;
   const char* no_vnni = getenv("FREETOKEN_CPU_MOE_NO_VNNI");
   if (no_vnni && no_vnni[0] && no_vnni[0] != '0') return false;
-  return __builtin_cpu_supports("avx512vnni");
+  return CPU_MOE_CPU_SUPPORTS("avx512vnni");
 #else
   return false;
 #endif
@@ -801,7 +864,7 @@ float dot_dsfp4_scalar(const uint8_t* packed, const uint8_t* scale, const float*
 #if CPU_MOE_X86
 // One 32-block: 16 bytes -> 16 low + 16 high nibble values via two vpermps, times
 // the pre-split even/odd fp32 activations, folded by the per-32 e8m0 scale.
-__attribute__((target("avx512f")))
+CPU_MOE_TARGET("avx512f")
 inline __m512 dsfp4_blk(const uint8_t* pk, const float* xeb, const float* xob, __m512 lut,
                         __m512i loma, float sc) {
   __m512i wi = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pk)));
@@ -811,7 +874,7 @@ inline __m512 dsfp4_blk(const uint8_t* pk, const float* xeb, const float* xob, _
   return _mm512_mul_ps(prod, _mm512_set1_ps(sc));
 }
 
-__attribute__((target("avx512f")))
+CPU_MOE_TARGET("avx512f")
 float dot_dsfp4_avx512(const uint8_t* packed, const uint8_t* scale, const float* xe,
                        const float* xo, int K, const float* e2m1, const float* e8m0) {
   const __m512 lut = _mm512_loadu_ps(e2m1);
@@ -832,7 +895,7 @@ float dot_dsfp4_avx512(const uint8_t* packed, const uint8_t* scale, const float*
 }
 
 // AVX2: a 32-K block is 16 bytes -> two 8-lane halves (8 even + 8 odd each).
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 inline __m256 dsfp4_half_avx2(const uint8_t* pk, const float* xeb, const float* xob, __m256 mag8) {
   __m256i wi = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(pk)));
   __m256 vlo = e2m1_decode8(_mm256_and_si256(wi, _mm256_set1_epi32(0xF)), mag8);
@@ -840,7 +903,7 @@ inline __m256 dsfp4_half_avx2(const uint8_t* pk, const float* xeb, const float* 
   return _mm256_fmadd_ps(vlo, _mm256_loadu_ps(xeb), _mm256_mul_ps(vhi, _mm256_loadu_ps(xob)));
 }
 
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 float dot_dsfp4_avx2(const uint8_t* packed, const uint8_t* scale, const float* xe,
                      const float* xo, int K, const float* e2m1, const float* e8m0) {
   const __m256 mag8 = _mm256_loadu_ps(e2m1);
@@ -893,7 +956,7 @@ void mxfp4_gemv_scalar(float* out, const uint8_t* blk, const uint8_t* scl, const
 }
 
 #if CPU_MOE_X86
-__attribute__((target("avx512f")))
+CPU_MOE_TARGET("avx512f")
 void mxfp4_gemv_avx512(float* out, const uint8_t* blk, const uint8_t* scl, const bf16_t* x,
                        int Kpairs, int N2, int ncol, const float* e2m1, const float* e8m0) {
   (void)e8m0;  // e8m0[c]=2^(c-127) computed via bit construction (no gather)
@@ -953,7 +1016,7 @@ void mxfp4_gemv_avx512(float* out, const uint8_t* blk, const uint8_t* scl, const
   }
 }
 
-__attribute__((target("avx2,fma")))
+CPU_MOE_TARGET("avx2,fma")
 void mxfp4_gemv_avx2(float* out, const uint8_t* blk, const uint8_t* scl, const bf16_t* x,
                      int Kpairs, int N2, int ncol, const float* e2m1, const float* e8m0) {
   (void)e8m0;  // e8m0[s]=2^(s-127) built via s<<23 (no gather)
@@ -1141,14 +1204,14 @@ float q4_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, i
 
 #if CPU_MOE_X86
 // fp16 block scale -> fp32 via HW F16C (single value in lane 0).
-__attribute__((target("f16c")))
+CPU_MOE_TARGET("f16c")
 static inline float q4_scale(uint16_t h) {
   return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
 }
 
 // Unpack one Q4_0 block's 16 bytes -> 32 int8 weights in [-8,7] (elems 0..15 = low
 // nibbles, 16..31 = high nibbles). ``eight`` = _mm256_set1_epi8(8).
-__attribute__((target("avx2")))
+CPU_MOE_TARGET("avx2")
 static inline __m256i q4_unpack32(const uint8_t* blk, __m128i mask, __m256i eight) {
   const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
   const __m128i lo = _mm_and_si128(qb, mask);
@@ -1160,7 +1223,7 @@ static inline __m256i q4_unpack32(const uint8_t* blk, __m128i mask, __m256i eigh
 // VPMADDWD (sign trick), scaled by wd*xd. |aw*sa| pair sums <= 8*127*2 < 32767 -> no
 // int16 saturation. This is the fast path on AVX2 CPUs without AVX-VNNI (and the
 // avx512-tier fallback, since the block dot is 256-bit either way).
-__attribute__((target("avx2,fma,f16c")))
+CPU_MOE_TARGET("avx2,fma,f16c")
 float q4_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
   const __m128i mask = _mm_set1_epi8(0x0F);
   const __m256i eight = _mm256_set1_epi8(8);
@@ -1183,7 +1246,7 @@ float q4_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int
 }
 
 // AVX-VNNI W4A8: one VPDPBUSD per block (the fast path on modern CPUs).
-__attribute__((target("avx2,avxvnni,fma,f16c")))
+CPU_MOE_TARGET("avx2,avxvnni,fma,f16c")
 float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
   const __m128i mask = _mm_set1_epi8(0x0F);
   const __m256i eight = _mm256_set1_epi8(8);

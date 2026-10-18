@@ -264,6 +264,7 @@ class DiskRowTable:
         if capturing and self._wait_sync:
             from freetoken.kernel.row_store import wait_reset
 
+
             wait_reset(stream, self._flag)
         pinned, dev = (
             (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned[self._eager_slot], self._eager_dev)

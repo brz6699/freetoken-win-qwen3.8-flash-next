@@ -17,6 +17,7 @@ experts into a GPU slot cache. Rules every kernel here follows:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -374,15 +375,42 @@ def _b12x_unusable_reason(cc: tuple[int, int]) -> str | None:
     return None
 
 
+def _b12x_swizzle_sf_pure(sf2d: torch.Tensor) -> torch.Tensor:
+    """Row-major -> flashinfer ``SWIZZLED_128x4`` block-scale interleave, in pure PyTorch.
+
+    Exact port of flashinfer's C++ ``computeSFIndex(SWIZZLED_128x4)`` +
+    ``blockScaleInterleaveHost`` (``tensorrt_llm/thop/fp4Op.cpp``) -- the same permutation the
+    GPU ``block_scale_interleave_sm100`` kernel applies. A zero-padded view of ``[rows, cols]``
+    is reshaped to the 128x4 tile grid ``[rg, r1, r0, cg, c0]`` and permuted to the destination
+    order ``[rg, cg, r0, r1, c0]`` (a pure view + one contiguous copy, no JIT).
+
+    Used instead of the flashinfer JIT module: that module's ``build.ninja`` hardcodes a
+    ``c++ -shared -lcudart`` host path that cannot be produced on an MSVC-only host (nvcc needs
+    cl.exe, so the GCC and MSVC object ABIs can't be linked together).
+    """
+    rows, cols = sf2d.shape
+    rp = (rows + 127) // 128 * 128
+    cp = (cols + 3) // 4 * 4
+    padded = sf2d
+    if rows != rp or cols != cp:
+        padded = torch.nn.functional.pad(sf2d, (0, cp - cols, 0, rp - rows), value=0)
+    return (
+        padded.view(rp // 128, 4, 32, cp // 4, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .reshape(-1)
+    )
+
+
 def _b12x_swizzle_block_scales(scale: torch.Tensor) -> torch.Tensor:
     """Row-major per-16 fp8 block scales ``[n, N, K//16]`` -> flashinfer's expert-leading
     *swizzled* storage, which is what :func:`prepare_w4a16_packed_weights` expects on input
     (it unswizzles internally). The 128x4 interleave is per-expert; ``N`` is a multiple of
-    128 and ``K//16`` a multiple of 4 for the supported models, so the shape is preserved."""
-    from flashinfer import nvfp4_block_scale_interleave
-
+    128 and ``K//16`` a multiple of 4 for the supported models, so the shape is preserved.
+    Computed in pure PyTorch (:func:`_b12x_swizzle_sf_pure`) rather than the flashinfer JIT
+    module, which cannot build on an MSVC-only host."""
     pieces = [
-        nvfp4_block_scale_interleave(scale[e].view(torch.uint8).contiguous())
+        _b12x_swizzle_sf_pure(scale[e].view(torch.uint8).contiguous())
         for e in range(scale.shape[0])
     ]
     return torch.stack(pieces, dim=0).view(torch.float8_e4m3fn)
@@ -391,6 +419,20 @@ def _b12x_swizzle_block_scales(scale: torch.Tensor) -> torch.Tensor:
 # Per-device scratch (sized sms*4+2) that run_w4a16_moe reads off the prepared object;
 # tiny and shape-independent, so one per device is reused across all layers/decodes.
 _B12X_WORKSPACE: dict[torch.device, torch.Tensor] = {}
+
+
+def _b12x_prefill_transient() -> bool:
+    """Whether the prefill MoE uses a fresh per-call workspace that is freed after the layer
+    instead of the persistent module-cached one (flashinfer's ``_get_cached_workspace``).
+
+    The persistent one is sized to routed_rows = chunk*top_k and pinned for the whole process
+    (~0.5 GiB at an 8192 chunk), which is the extra VRAM that tips this model's first-request
+    PLE OOM under b12x (triton's equivalent is allocated per layer and freed). Mirroring
+    triton -- allocate the big prefill buffers for the layer, drop the reference when the layer
+    finishes -- reclaims them for the PLE/attention transient. decode keeps the pinned
+    (CUDA-graph-stable) workspace, so its address never moves. Default on; FREETOKEN_B12X_PREFILL_FREE=0
+    reverts to the pinned workspace for A/B."""
+    return os.environ.get("FREETOKEN_B12X_PREFILL_FREE", "1") != "0"
 
 
 @torch.no_grad()
@@ -418,6 +460,9 @@ def b12x_fused_experts(
     topk_ids: torch.Tensor,
     activation: str,
     apply_router_weight_on_input: bool,
+
+    is_prefill: bool = False,
+    limit: float | None = None,
 ) -> torch.Tensor:
     """SM12x W4A16 fused MoE over cache slots (same calling convention as
     :func:`marlin_fused_experts`). Requires sm_120/121 + a CUDA>=13 driver; reached only
@@ -434,13 +479,19 @@ def b12x_fused_experts(
     on first use and flashinfer raises if that happens *during* capture, so the decode
     path must be warmed once eagerly before graph capture (FreeToken already does)."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
-        _launch_sm120_w4a16_moe,
+        _get_cached_workspace,
+        _validate_w4a16_workspace,
+
+        allocate_sm120_moe_workspace,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        run_w4a16_moe,
     )
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
         W4A16PackedWeights,
     )
 
-    assert activation == "silu", "b12x backend supports gated silu only"
+    assert activation in ("silu", "swiglu_clamp"), "b12x backend supports gated silu / clamped silu only"
     assert not apply_router_weight_on_input
     num_experts = gate_up_q.size(0)
     hidden_size = hidden_states.size(-1)
@@ -464,25 +515,76 @@ def b12x_fused_experts(
     out = torch.empty(
         hidden_states.size(0), hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
     )
-    _launch_sm120_w4a16_moe(
-        a=hidden_states,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        w1_weight=gate_up_q,
-        w1_weight_sf=gate_up_s,
-        w1_alpha=gate_up_alpha,
-        w2_weight=down_q,
-        w2_weight_sf=down_s,
-        w2_alpha=down_alpha,
-        num_experts=num_experts,
-        top_k=topk_ids.size(1),
-        num_local_experts=num_experts,
-        scatter_output=out,
+    top_k = topk_ids.size(1)
+    routed_rows = hidden_states.size(0) * top_k
+
+    # decode (is_prefill False) keeps the pinned, CUDA-graph-stable workspace. prefill uses a
+    # FRESH per-call workspace that is freed when this layer's call returns, so the big
+    # routed_rows-sized buffers (~0.5 GiB at an 8192 chunk) don't pin VRAM for the whole
+    # process -- mirrors triton's per-layer ic1/ic2/ic3 and reclaims them for the PLE/attention
+    # transient at layer 2. The decode cache entry is only ever grown by decode calls (tiny
+    # routed_rows), so its address never moves and the captured graph stays valid.
+    if is_prefill and _b12x_prefill_transient():
+        workspace = allocate_sm120_moe_workspace(
+            state_E=num_experts,
+            weight_E=num_experts,
+            k=hidden_size,
+            n=intermediate_size,
+            num_topk=top_k,
+            device=hidden_states.device,
+            routed_rows=routed_rows,
+            quant_mode="w4a16",
+            backend="w4a16",
+            activation="silu",
+        )
+    else:
+        workspace = _get_cached_workspace(
+            backend="w4a16",
+            state_E=num_experts,
+            weight_E=num_experts,
+            routed_rows=routed_rows,
+            k=hidden_size,
+            n=intermediate_size,
+            num_topk=top_k,
+            device=hidden_states.device,
+            quant_mode="w4a16",
+            activation="silu",
+        )
+    _validate_w4a16_workspace(
+        workspace,
+        state_E=num_experts,
+        weight_E=num_experts,
+        routed_rows=routed_rows,
+        k=hidden_size,
+        n=intermediate_size,
+        num_topk=top_k,
+        device=hidden_states.device,
+
         activation="silu",
-        source_format="modelopt",
-        _prepared_weights=prepared,
     )
-    return out
+    # swiglu_clamp (GLM-5.3) == silu on a gate clamped above + up clamped symmetrically,
+    # which the w4a16 epilogue applies from swiglu_limit (alpha/beta stay 1.0/0.0).
+    # _launch_sm120_w4a16_moe does not forward the swiglu params, so the launch is
+    # mirrored here over the same cached workspace instead of going through it.
+    return run_w4a16_moe(
+        hidden_states,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        intermediate_cache13=workspace.intermediate_cache13,
+        intermediate_cache2=workspace.intermediate_cache2,
+        output=out,
+        fc1_c_tmp=workspace.fc1_c_tmp,
+        fc2_c_tmp=workspace.fc2_c_tmp,
+        packed_route_indices=workspace.packed_route_indices,
+        block_expert_ids=workspace.block_expert_ids,
+        packed_route_count=workspace.packed_route_count,
+        expert_offsets=workspace.expert_offsets,
+        expert_map=workspace.expert_map,
+        fast_math=True,
+        swiglu_limit=limit,
+    )
 
 
 class B12xNvfp4MoEKernel(MoEKernel):
@@ -496,7 +598,14 @@ class B12xNvfp4MoEKernel(MoEKernel):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
         if not backend.is_flashinfer_installed():
             return "flashinfer is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        # the w4a16 epilogue expresses GLM's swiglu_clamp (alpha=1.0, beta=0.0, finite
+        # limit) exactly: silu on a gate clamped above, up clamped symmetrically. So the
+        # plain-silu-only floor applies unless the config is that clamp form.
+        clamp_ok = (
+            cfg.activation == "swiglu_clamp" and cfg.alpha == 1.0 and cfg.beta == 0.0
+            and cfg.limit is not None and math.isfinite(float(cfg.limit))
+        )
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=not clamp_ok)
         if reason:
             return reason
         return _b12x_unusable_reason(cc)
@@ -561,7 +670,9 @@ class B12xNvfp4MoEKernel(MoEKernel):
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         t = view.tensors
         assert view.alphas is not None
-        return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input)
+        limit = float(layer.limit) if layer.activation == "swiglu_clamp" and layer.limit is not None else None
+
+        return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, is_prefill=is_prefill, limit=limit)
 
 
 @register_method(QuantKind.NVFP4, LayerKind.MOE)

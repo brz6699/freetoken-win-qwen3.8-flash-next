@@ -69,22 +69,26 @@ struct StoreKernel {
     auto indices_dtype_ = SymbolicDType{};
     auto dtype_ = SymbolicDType{};
     auto device_ = SymbolicDevice{};
+    // set dtype options on the shared symbol up front; the explicit-template
+    // .with_dtype<Ts...>(sym) overload combined with .with_device<...>() in
+    // the same chain fails to compile under nvcc (CUDA 13.1) + MSVC
+    indices_dtype_.set_options<int32_t, int64_t>();
 
     TensorMatcher({-1, D}) //
         .with_strides({X, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype(dtype_)
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({L, D}) //
         .with_strides({Y, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .with_dtype(dtype_)
         .verify(k)
         .verify(v);
     TensorMatcher({L}) //
-        .with_device<kDLCUDA>(device_)
-        .with_dtype(indices_dtype_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
+        .with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
     const auto dtype_size = dtype_bytes(dtype_.unwrap());
@@ -95,6 +99,11 @@ struct StoreKernel {
     const auto length = static_cast<std::size_t>(L.unwrap());
     const auto kv_cache_stride = X.unwrap() * dtype_size;
     const auto kv_input_stride = Y.unwrap() * dtype_size;
+
+    // Empty batches are valid no-ops; do not launch a zero-sized grid.
+    if (length == 0) {
+      return;
+    }
 
     const auto params = StoreKernelParams{
         .k_cache = k_cache.data_ptr(),
@@ -107,8 +116,8 @@ struct StoreKernel {
         .length = length,
     };
 
-    constexpr auto kWarpPerBlock = num_threads / 32;
-    static_assert(num_threads % 32 == 0);
+    constexpr auto kWarpPerBlock = num_threads / device::kWarpThreads;
+    static_assert(num_threads % device::kWarpThreads == 0);
     const auto num_blocks = div_ceil(length, kWarpPerBlock);
     const auto kernel = use_int32
                             ? store_kv_cache<num_threads, max_concurrency,

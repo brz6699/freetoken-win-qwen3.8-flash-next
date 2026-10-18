@@ -167,7 +167,7 @@ def convert_checkpoint(
     out_dir: str,
     *,
     dtype: torch.dtype = torch.bfloat16,
-    moe_backend: str = "offload",
+    moe_strategy: str = "offload",
     quant_backend: str | None = None,
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
@@ -198,9 +198,9 @@ def convert_checkpoint(
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
+                       dtype=dtype, moe_strategy=moe_strategy, quant_backend=quant_backend)
     mc = cfg.model_config
-    offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
+    offload = moe_strategy == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
     method = None
     if offload:
@@ -308,7 +308,7 @@ def convert_checkpoint(
         # quant_format records the actual on-disk bank layout (e.g. nvfp4_marlin vs
         # nvfp4_b12x): the suffix is a runtime backend pick (GPU capability / env), NOT in
         # config, and the stored bytes are physically repacked into it -- so it's kept and
-        # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
+        # read back at load (ftw.load_ftw_banks). dtype/moe_strategy were dropped: each
         # tensor already carries its own dtype, and nothing reads a model-level backend.
         "quant_format": quant_format,
         # The reader takes num_layers from the model config (copied into this

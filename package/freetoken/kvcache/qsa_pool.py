@@ -68,6 +68,7 @@ class QSAKVCache(MHAKVCache):
         kv_dtype: torch.dtype | None = None,
         kv_quant: str | None = None,
         mrope: bool = False,
+        arena: torch.Tensor | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -106,6 +107,7 @@ class QSAKVCache(MHAKVCache):
             layer_ids=layer_ids,
             kv_dtype=kv_dtype,
             kv_quant=kv_quant,
+            arena=arena,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -121,27 +123,33 @@ class QSAKVCache(MHAKVCache):
         # never-written tail rows dotting to a finite 0. Written rows are never cleared again,
         # so the kernel must clamp visible blocks to kvlen // index_ratio.
         self._cmp_scratch_base = num_pages * self._page_size // self._index_ratio
-        self._cmp_k_buffer = torch.zeros(
-            self._num_index_layers,
-            self._cmp_scratch_base + self._num_req_slots,
-            self._index_head_dim,
-            dtype=self._index_dtype,
-            device=self._device,
+        cmp_k = self._arena_alloc(
+            (
+                self._num_index_layers,
+                self._cmp_scratch_base + self._num_req_slots,
+                self._index_head_dim,
+            ),
+            self._index_dtype,
         )
-        self._pending_ring = torch.zeros(
-            self._num_req_slots,
-            self._num_index_layers,
-            self._ring_capacity,
-            self._index_head_dim,
-            dtype=self._index_dtype,
-            device=self._device,
+        cmp_k.zero_()
+        self._cmp_k_buffer = cmp_k
+        ring = self._arena_alloc(
+            (
+                self._num_req_slots,
+                self._num_index_layers,
+                self._ring_capacity,
+                self._index_head_dim,
+            ),
+            self._index_dtype,
         )
+        ring.zero_()
+        self._pending_ring = ring
         # 3-axis rope position of every stored token: a compressed group ropes at its first token, which under mrope is not derivable from the logical position
-        self._rope_positions = (
-            torch.zeros(num_pages * self._page_size, 3, dtype=torch.int32, device=self._device)
-            if self._mrope
-            else None
-        )
+        self._rope_positions = None
+        if self._mrope:
+            rope = self._arena_alloc((num_pages * self._page_size, 3), torch.int32)
+            rope.zero_()
+            self._rope_positions = rope
 
     def rebuild(self, num_pages: int) -> None:
         # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
@@ -177,7 +185,10 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                # ring sizing must match the factory: spec decode widens it by the draft depth
+                mc = config.model_config
+                num_spec = (mc.mtp_draft_len or 0) + 1 if mc.enable_mtp else 0
+                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, num_spec) + 1)
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
         return per_token * config.page_size, fixed, config.page_size, 0
@@ -201,26 +212,16 @@ class QSAKVCache(MHAKVCache):
         # transient (rebuilt per forward, and a page-aligned boundary never splits a group).
         out = super().snapshot_rows(slots)
         rows = slots.to(torch.int64).to(self._device) // self._index_ratio
-        # chunked like the parent: per-slice GPU temps stay small (a one-shot gather
-        # over a long prefix would need a large temp on tight VRAM setups).
-        out["cmp"] = torch.empty(
-            (self._cmp_k_buffer.shape[0], rows.shape[0], self._cmp_k_buffer.shape[2]),
-            device="cpu", dtype=self._cmp_k_buffer.dtype,
-        )
-        for lo in range(0, rows.shape[0], self._SNAPSHOT_CHUNK_TOKENS):
-            sel = rows[lo : lo + self._SNAPSHOT_CHUNK_TOKENS]
-            out["cmp"][:, lo : lo + sel.shape[0]] = self._cmp_k_buffer[:, sel].cpu()
+        # Chunk the cmp gather too. A one-shot ``buffer[:, rows].cpu()`` materializes the whole
+        # compressed-index slab in a transient CUDA buffer before the D2H; under a near-full KV
+        # pool that peak exceeds the headroom. _gather_host caps each chunk's transient buffer.
+        out["cmp"] = self._gather_host(self._cmp_k_buffer, rows)
         return out
 
     def restore_rows(self, slots: torch.Tensor, data: dict[str, torch.Tensor]) -> None:
         super().restore_rows(slots, data)
         rows = slots.to(torch.int64).to(self._device) // self._index_ratio
-        # chunked H2D like the parent (see MhaPool._restore_scatter): keep the GPU temp small.
-        buf = self._cmp_k_buffer
-        chunk = self._SNAPSHOT_CHUNK_TOKENS
-        for lo in range(0, rows.shape[0], chunk):
-            sel = rows[lo : lo + chunk]
-            buf.index_copy_(1, sel, data["cmp"][:, lo : lo + sel.shape[0]].to(self._device))
+        self._scatter_host(self._cmp_k_buffer, rows, data["cmp"])
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

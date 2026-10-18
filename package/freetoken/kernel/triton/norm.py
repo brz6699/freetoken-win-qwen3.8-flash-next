@@ -120,8 +120,26 @@ def _leading(t):
     return t.shape[0], t.shape[1], t.stride(0), t.stride(1)
 
 
+def _torch_norm(input, weight, eps, gemma: bool):
+    import torch
+
+    xf = input.float()
+    w = weight.float()
+    if gemma:
+        w = w + 1.0
+    inv = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return (xf * inv * w).to(input.dtype)
+
+
 def _rmsnorm(input, weight, eps, out, gemma: bool):
     import torch
+
+    if not input.is_cuda:
+        y = _torch_norm(input, weight, eps, gemma)
+        if out is None:
+            return y.reshape(input.shape)
+        out.copy_(y)
+        return out
 
     assert weight.ndim == 1 and input.shape[-1] == weight.shape[0]
     H = input.shape[-1]
@@ -162,6 +180,16 @@ def gemma_rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool =
 
 
 def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
+    if not input.is_cuda:
+        import torch
+
+        # Kernel contract: residual <- x + r (kept unnormalized); input <- rmsnorm(residual).
+        z = input.float() + residual.float()
+        residual.copy_(z.to(residual.dtype))
+        w = weight.float() + (1.0 if gemma else 0.0)
+        inv = torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + eps)
+        input.copy_((z * inv * w).to(input.dtype))
+        return
     assert weight.ndim == 1 and input.shape[-1] == weight.shape[0]
     assert input.shape == residual.shape
     H = input.shape[-1]

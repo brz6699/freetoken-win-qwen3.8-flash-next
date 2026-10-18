@@ -28,9 +28,9 @@ def sample_impl(
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
 ) -> torch.Tensor:
-    from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.kernel.backend import periph_flashinfer_ok
 
-    if is_flashinfer_installed():
+    if periph_flashinfer_ok():
         import flashinfer.sampling as sampling
     else:
         import freetoken.kernel.triton.sampling as sampling

@@ -7,9 +7,9 @@ if TYPE_CHECKING:
 
 
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.kernel.backend import periph_flashinfer_ok
 
-    if is_flashinfer_installed():
+    if periph_flashinfer_ok():
         from flashinfer import silu_and_mul
     else:
         from freetoken.kernel.triton.activation import silu_and_mul
@@ -18,9 +18,9 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.kernel.backend import periph_flashinfer_ok
 
-    if is_flashinfer_installed():
+    if periph_flashinfer_ok():
         from flashinfer import gelu_and_mul
     else:
         from freetoken.kernel.triton.activation import gelu_and_mul
@@ -30,9 +30,9 @@ def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
 def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     """tanh-approximate GELU gate (`gelu_pytorch_tanh`) followed by elementwise mul."""
-    from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.kernel.backend import periph_flashinfer_ok
 
-    if is_flashinfer_installed():
+    if periph_flashinfer_ok():
         from flashinfer import gelu_tanh_and_mul
     else:
         from freetoken.kernel.triton.activation import gelu_tanh_and_mul

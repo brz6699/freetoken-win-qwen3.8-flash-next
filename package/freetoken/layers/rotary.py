@@ -30,9 +30,9 @@ class RotaryEmbedding(StateLessOP):
         # shared with every rope of the same frequencies (rope_cos_sin_table), so never written
         self._cos_sin_cache = cos_sin_cache
 
-        from freetoken.kernel.backend import is_flashinfer_installed
+        from freetoken.kernel.backend import periph_flashinfer_ok
 
-        if is_flashinfer_installed():
+        if periph_flashinfer_ok():
             from flashinfer import apply_rope_with_cos_sin_cache_inplace
         else:
             from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
@@ -61,7 +61,12 @@ def mrope_cos_sin_rows(
 ) -> torch.Tensor:
     """Per-token [cos | sin] rows for [3, n] positions: frequency slot i reads the cache row of axis section_table[i]."""
     half = cos_sin_cache.shape[1] // 2
-    pos = positions[section_table.long(), :].transpose(0, 1).long()  # [n, half]
+    pos = positions[section_table.long(), :].transpose(0, 1)
+    # Group-start rows may hold stale/unwritten triples (a rebuilt pool re-zeroes the
+    # cache, and a straddling group's first slot can sit in a row this forward did not
+    # rewrite), so clamp into the table before the gather; graph-capture-safe like the
+    # out_loc clamp in the QSA planner.
+    pos = pos.clamp_(0, cos_sin_cache.shape[0] - 1).long()  # [n, half]
     idx = torch.arange(half, device=cos_sin_cache.device)
     return torch.cat((cos_sin_cache[pos, idx], cos_sin_cache[pos, half + idx]), dim=1)
 
@@ -134,7 +139,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert self._cos_sin_cache.shape[1] == self.rotary_dim, "mrope reads a rotary_dim-wide table, not a proportional rope's"
         half = self.rotary_dim // 2
         assert sum(mrope_section) == half, (mrope_section, half)
-        self._section_table = build_section_table(tuple(mrope_section), layout)
+        self._section_table = build_section_table(tuple(mrope_section), layout).to(
+            self._cos_sin_cache.device
+        )
         try:
             from freetoken.kernel.triton.rope import apply_mrope_with_cos_sin_cache_inplace
 
@@ -151,8 +158,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.dim() == 2, "mrope models feed [3, n] positions"
         if self._section_table.device != query.device:
             self._section_table = self._section_table.to(query.device)
-        positions = positions.contiguous()
-        if self._kernel is not None:
+        if self._cos_sin_cache.device != query.device:
+            self._cos_sin_cache = self._cos_sin_cache.to(query.device)
+        positions = positions.contiguous().to(query.device)
+        if self._kernel is not None and query.is_cuda:
             self._kernel(
                 positions=positions, query=query, key=key, head_size=self.head_size,
                 cos_sin_cache=self._cos_sin_cache, section_table=self._section_table,
