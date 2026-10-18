@@ -4,7 +4,7 @@ English version: [README.md](README.md).
 
 基于 [FreeToken](https://github.com/FlashML-org/FreeToken)(上游 main `58f4b9e`,packaged `__version__ = "0.1.3"`)的补丁分支,针对 **一张消费级 GPU + 大容量系统内存** 调优——例如 RTX 5090 32 GiB 配 ~254 GiB RAM——通过 OpenAI-/Anthropic-兼容 HTTP API 服务大型 MoE checkpoint。上游 Apache-2.0 LICENSE 保留;详见 [Provenance](#provenance)。
 
-下面这些功能是一个接一个堆起来的——每一条都是在前一条工作上跑起来之后才暴露出来的下一层问题。从左到右读可以看到推理链,只想查参数也可以直接跳到对应小节。
+下面这些功能是一个接一个堆起来的——每一条都是在前一条工作上跑起来之后才暴露出来的下一层问题。从左到右读可以看到推理链,只想查参数也可以直接跳到对应小节。这套 mechanism 同时支持两条 checkpoint track——`Qwen3.8-Flash-Next`(架构 `qwen4_exp`)是 Stage A–C 全程使用的 reference,`GLM-5.3-Flash`(架构 `glm5_next`)作为 parallel track,有自己的启动参数和实测数,见 [GLM-5.3-Flash 启动 track](#glm-53-flash-启动-track)。Stage A–C 与 Tuning notes 的内容除非另有注明,对两条 track 同样适用。
 
 三段叙事:
 
@@ -197,6 +197,48 @@ Flags worth understanding:
 - `--moe-prefill-hit-d2d` — prefill expert hits 走 device-to-device copies。上游已提供。
 - `--cuda-graph-max-bs N` — CUDA-graph ladder cap;bs=1-dominated 设 1,共享 mempool 下 bs=4 burst slot 加 `4`。上游已提供 flag。
 - `--disable-budget-slide` — opt-out of BudgetSlider(§3),freeze KV/MoE pool sizes from startup。Workload single-model fixed-footprint、想让 CUDA-graph captures pin to stable addresses 时用。
+
+## GLM-5.3-Flash 启动 track
+
+上面各节针对参考 checkpoint `Qwen3.8-Flash-Next(-ABLITERATED)-NVFP4`(架构 `qwen4_exp`)写。同一个 `_exp_garble/run_exp.py` launcher + 同一套 exp-package mechanism 也能通过同一个 OpenAI-/Anthropic-compatible HTTP endpoint serve `zai-org/GLM-5.3-Flash`(架构 `Glm5NextForConditionalGeneration` / `glm5_next`)。若干启动参数因架构在 KV-pool family / attention type / MoE sizing 上的差异而走不同值;README 其余部分(BudgetSlider、mm content-key cache、mm RAM tier、b12x Triton backend、cuda-graph ladder、KV hot-window)对两条 track 同样适用。本节只列差异点与 GLM-specific 实测数。
+
+**影响启动参数的架构差异**
+
+| axis | Qwen3.8-Flash-Next(`qwen4_exp`) | GLM-5.3-Flash(`glm5_next`) | 启动参数含义 |
+|---|---|---|---|
+| Linear-attn family | GDN | KDA(GDN-family,fla-compatible scan kernels;`short_conv_kernel_size=4`) | 同 `LinearStatePool`,weight-name mapping 不同 |
+| Full-attn pool | QSA compressed sparse | MLA latent(`kv_lora_rank=512`,NoPE)+ NSA index(`index_topk=2048`) | engine gate `engine/engine.py:311–319` 拒非 QSA 池用 `turbo4` / `fp8_e4m3`——GLM 必须 bf16 KV |
+| Full-attn 层数 | ≈12 | 11 层(idx 3、7、…、43) | — |
+| Linear-attn 层数 | ≈36 | 34 层 | 两者 linear 层都零 per-token KV;1M context 可行 |
+| MoE sizing | 512 experts / top-k=10 / intermediate=640 | 288 experts / top-k=8 + shared=1 / intermediate=2048 | per-token expert bytes ≈4.76 GB vs Qwen ≈1.34 GB → PCIe BW ceiling ≈10.6 tok/s vs ≈34–39 tok/s |
+| On-disk weights | ≈24 GiB NVFP4 | ≈200 GB(~190 GB experts) | cold boot ≈25 min first start;后续 start 复用 mmap |
+| KV bytes / token bf16 | 25,344 B → ≈24.75 GiB @1M | 14,080 B → ≈13.75 GiB @1M | MLA 64× rank compression 已烧进权重,bf16 不需 turbo4 也能塞下 1M |
+| Encoder | Qwen ViT | `glm5_next_vision` hidden=1024 + video | 不同 ViT,独立 port |
+
+**本机实测**(RTX 5090 SM120 PCIe-bound,RAM=253.6 GB DDR5,`Get-CimInstance Win32_ComputerSystem` 确认)
+
+- PCIe Gen5 host→GPU effective BW ≈40–50 GB/s,由 Qwen decode ceiling 反推(1.34 GB/token ÷ BW = observed 34–39 tok/s),GLM 同 launch profile 再二次确认。
+- Decode full-miss ceiling GLM ≈10.6 tok/s(4.76 GB/token ÷ ≈45 GB/s);bs=1 steady-state ≈8–12 tok/s with `--moe-cache-size 512`。bs≥4 scaling predicted ≈×1.3——flat-routing MoE 把 batch gain 压扁,vs Qwen ×1.85。
+- KV pool bf16 bs=1 long-context 装得下:≈13.75 GiB @1M tokens。`--num-tokens 65536` ≈0.86 GiB KV pool,剩 ≈10 GiB contiguous VRAM 给 expert cache(~500 slots ≈ 0.13-layer residency → steady-state hit rate ~1–2%,decode full-miss-dominated)。要更长 context 就 BudgetSlider 在 KV vs expert cache 之间滑,跟 Qwen 同款。
+- Prefill throughput XLONG prompts ≈1.2–1.6k tok/s(由 per-chunk expert-stream BW 线性外推;chunk-size independent——整 expert table 每 chunk 流一遍)。1M cold prefill ≈11–15 min。Predicted,未对 reference oracle 实测。
+- Reasoning-leg `prompt_tokens=238` 在 standard representative prompt 上,跟 Qwen shape 一致。Reasoning-leg token budget ≥512。Multimodal image + video legs 走同一 mm content-key path;ViT weight bytes 不同(~0.6 GiB bf16 vs Qwen ~0.84 GiB),per-request overhead pattern 一致。
+- Cold boot ≈25 min first start:~3 min safetensors mmap + ~22 min NVFP4 expert serial stage 进 pinned arena。后续 restart 复用 page cache;observed ≈8 min。
+
+**Not-yet-measured items**——当作 predicted:bs≥4 scaling ratio、XLONG prefill throughput、bs=8 之外的 concurrency scaling(predicted flat,same BW ceiling 每 lane 线性吃)。
+
+**Serve command——GLM track**
+
+```powershell
+python <launcher>.py `
+  --model-path ./models/GLM-5.3-Flash-NVFP4 `
+  --num-tokens 65536 --moe-cache-size 512 `
+  --kv-cache-dtype bf16 `
+  --quant-backend moe.nvfp4=b12x `
+  --max-running-req 4 `
+  --host 0.0.0.0 --port 8001
+```
+
+为什么这些值跟上面 Qwen profile 不一样:bf16 KV——MLA pool 被 engine gate(`engine/engine.py:311–319`)拒 turbo4/fp8_e4m3;`--num-tokens 65536` capped 是为了给 expert cache 留 VRAM,尽管 MLA 已经在架构层把 per-token bytes 压了 64×;`--moe-cache-size 512` 适配 MLA-pool KV footprint + per-layer 288-expert table;b12x Triton backend 同样适用——kernel-level choice,arch-agnostic。BudgetSlider default on;encoder towers default load(glm5_next vision + video);CUDA-graph ladder auto-tuned from VRAM。
 
 ## Requirements & install
 
