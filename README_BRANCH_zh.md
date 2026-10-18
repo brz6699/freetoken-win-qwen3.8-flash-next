@@ -30,7 +30,7 @@ English version: [README.md](README.md).
 | `fp8_e4m3` | 1024 | 0.9994 | general balance point |
 | `turbo4` | ~516 | 0.9887 | longest contexts (100k+ tokens) |
 
-Storage 压缩;compute 保 bf16。Indexer keys 永远 bf16。`kvcache/turboquant.py` 实现 packed-nibble rotspace dequant + bf16 per-(token, head, slab) scales。`kvcache/dsv4_cost_model.py` 算每 token byte cost,含 scale overhead。Engine gate 限 turbo4 用在 QSA + MLA-latent families。
+Storage 压缩;compute 保 bf16。Indexer keys 永远 bf16。`kvcache/turboquant.py` 实现 packed-nibble rotspace dequant + bf16 per-(token, head, slab) scales。`kvcache/base.py:spec_kv_bytes_per_token` 算每 token byte cost(packed-nibble latent + bf16 index-key slab + bf16 per-(token, head, slab) scales);`kvcache/dsv4_cost_model.py` 单独给 DSV4 tier family 定价。Engine gate 限 turbo4 用在 QSA + MLA-latent families。
 
 **(3)** bs=1 ~50k-token context 装进 ~3 GiB KV pool,verify peak 容得下不 OOM。Needle retrieval 6/6 exact 跨 322k/450k × depth {30%, 60%, 90%},worst-case depth-90% 在 35.2s,其余 5–12s。KV ≈6.9 KiB/token 实测 → full 1M-token pool ≈6.8 GiB。TTFT @ 901k context:prefill overlap 时 32.5s,否则 51s。稳态 decode 长度无关。
 
@@ -207,7 +207,8 @@ Flags worth understanding:
 | axis | Qwen3.8-Flash-Next(`qwen4_exp`) | GLM-5.3-Flash(`glm5_next`) | 启动参数含义 |
 |---|---|---|---|
 | Linear-attn family | GDN | KDA(GDN-family,fla-compatible scan kernels;`short_conv_kernel_size=4`) | 同 `LinearStatePool`,weight-name mapping 不同 |
-| Full-attn pool | QSA compressed sparse | MLA latent(`kv_lora_rank=512`,NoPE)+ NSA index(`index_topk=2048`) | engine gate `engine/engine.py:311–319` 拒非 QSA 池用 `turbo4` / `fp8_e4m3`——GLM 必须 bf16 KV |
+| Full-attn pool | QSA compressed sparse | MLA latent(`kv_lora_rank=512`,NoPE)+ NSA index(`index_topk=2048`) | engine gate `engine/engine.py:337` 同时接受 QSAKVCache 和 MLAKVCache 用 `turbo4` / `fp8_e4m3`;GLM track 在 MLA-latent 池上用 `turbo4` |
+| 单 expert VRAM 占用 | ≈1.34 GB / token | ≈4.76 GB / token(≈3.5× Qwen) | BudgetSlider 的 KV→MoE 滑动每 GB 加进来的 expert 数更少,滑动对 decode 提速的效果在 GLM 上比 Qwen 弱(见下面实测) |
 | Full-attn 层数 | ≈12 | 11 层(idx 3、7、…、43) | — |
 | Linear-attn 层数 | ≈36 | 34 层 | 两者 linear 层都零 per-token KV;1M context 可行 |
 | MoE sizing | 512 experts / top-k=10 / intermediate=640 | 288 experts / top-k=8 + shared=1 / intermediate=2048 | per-token expert bytes ≈4.76 GB vs Qwen ≈1.34 GB → PCIe BW ceiling ≈10.6 tok/s vs ≈34–39 tok/s |
@@ -218,8 +219,9 @@ Flags worth understanding:
 **本机实测**(RTX 5090 SM120 PCIe-bound,RAM=253.6 GB DDR5,`Get-CimInstance Win32_ComputerSystem` 确认)
 
 - PCIe Gen5 host→GPU effective BW ≈40–50 GB/s,由 Qwen decode ceiling 反推(1.34 GB/token ÷ BW = observed 34–39 tok/s),GLM 同 launch profile 再二次确认。
-- Decode full-miss ceiling GLM ≈10.6 tok/s(4.76 GB/token ÷ ≈45 GB/s);bs=1 steady-state ≈8–12 tok/s with `--moe-cache-size 512`。bs≥4 scaling predicted ≈×1.3——flat-routing MoE 把 batch gain 压扁,vs Qwen ×1.85。
-- KV pool bf16 bs=1 long-context 装得下:≈13.75 GiB @1M tokens。`--num-tokens 65536` ≈0.86 GiB KV pool,剩 ≈10 GiB contiguous VRAM 给 expert cache(~500 slots ≈ 0.13-layer residency → steady-state hit rate ~1–2%,decode full-miss-dominated)。要更长 context 就 BudgetSlider 在 KV vs expert cache 之间滑,跟 Qwen 同款。
+- Decode full-miss ceiling GLM ≈10.6 tok/s(4.76 GB/token ÷ ≈45–50 GB/s);下面 serve 命令(`--moe-cache-size 576`)下 bs≤2 steady-state 实测 ≈10–12 tok/s。bs≥4 scaling predicted ≈×1.3——flat-routing MoE 把 batch gain 压扁,vs Qwen ×1.85。
+- BudgetSlider 在 GLM 上的表现和 Qwen 不同:per-expert VRAM footprint 约 3.5× Qwen(每 token ≈4.76 GB vs ≈1.34 GB weight-streaming)。同样从 KV 滑出一 GB,GLM 多出来的 expert 数比 Qwen 少,所以同幅 sliding 在 GLM 上对 decode 提速的增益比 Qwen 小。Qwen 上 1024→3072 slots 把 long-text steady-state 拉 ≈33 → ≈44 tok/s;GLM 上同幅滑动曲线更平——主要工作放在选对起点 `--moe-cache-size`(这里 576),让 BudgetSlider 在它周围 trim KV headroom。
+- KV pool bs=1 long-context 装得下:turbo4 把 MLA 已压过的 14,080 B/tok bf16 进一步降到 ≈3.6 KiB/tok,`--num-tokens 262144`(256K)≈0.87 GiB KV pool,能在 32 GiB 卡上同时容纳 256K context + 576-slot expert cache——bf16 KV 做不到两全。代价是 prefill 吞吐:`--max-prefill-length 1024` cap chunk size,`--disable-moe-prefill-overlap` 把 expert stream 串到 attention 后面;两者合力把 XLONG prefill 推到 ≈1.2–1.6k tok/s 区间。Decode 不受影响,bs≤2 稳 ≈10–12 tok/s。
 - Prefill throughput XLONG prompts ≈1.2–1.6k tok/s(由 per-chunk expert-stream BW 线性外推;chunk-size independent——整 expert table 每 chunk 流一遍)。1M cold prefill ≈11–15 min。Predicted,未对 reference oracle 实测。
 - Reasoning-leg `prompt_tokens=238` 在 standard representative prompt 上,跟 Qwen shape 一致。Reasoning-leg token budget ≥512。Multimodal image + video legs 走同一 mm content-key path;ViT weight bytes 不同(~0.6 GiB bf16 vs Qwen ~0.84 GiB),per-request overhead pattern 一致。
 - Cold boot ≈25 min first start:~3 min safetensors mmap + ~22 min NVFP4 expert serial stage 进 pinned arena。后续 restart 复用 page cache;observed ≈8 min。
@@ -230,15 +232,17 @@ Flags worth understanding:
 
 ```powershell
 python <launcher>.py `
-  --model-path ./models/GLM-5.3-Flash-NVFP4 `
-  --num-tokens 65536 --moe-cache-size 512 `
-  --kv-cache-dtype bf16 `
+  --model-path ./models/GLM-5.3-Flash-UNCENSORED-NVFP4 `
   --quant-backend moe.nvfp4=b12x `
-  --max-running-req 4 `
+  --num-tokens 262144 --moe-cache-size 576 `
+  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
+  --disable-moe-prefill-overlap `
+  --cuda-graph-max-bs 2 --max-running-req 2 `
+  --max-prefill-length 1024 `
   --host 0.0.0.0 --port 8001
 ```
 
-为什么这些值跟上面 Qwen profile 不一样:bf16 KV——MLA pool 被 engine gate(`engine/engine.py:311–319`)拒 turbo4/fp8_e4m3;`--num-tokens 65536` capped 是为了给 expert cache 留 VRAM,尽管 MLA 已经在架构层把 per-token bytes 压了 64×;`--moe-cache-size 512` 适配 MLA-pool KV footprint + per-layer 288-expert table;b12x Triton backend 同样适用——kernel-level choice,arch-agnostic。BudgetSlider default on;encoder towers default load(glm5_next vision + video);CUDA-graph ladder auto-tuned from VRAM。
+为什么这些值跟上面 Qwen profile 不一样:`turbo4` 在 MLA-latent 池上是工作的(engine gate `engine/engine.py:337` 同时接受 QSAKVCache 和 MLAKVCache),≈3.6 KiB/tok 让 `--num-tokens 262144`(256K)在 32 GiB 卡上和 576-slot expert cache 并存——bf16 KV 只能二选一。`--moe-cache-size 576` 大约覆盖两层 288-expert table;GLM 单 expert bytes ≈3.5× Qwen,同 slot 数对应覆盖率按比例低。`--max-prefill-length 1024` cap prefill chunk size,`--disable-moe-prefill-overlap` 把 expert stream 串到 attention 后面——两者合力牺牲 prefill 吞吐(≈1.2–1.6k tok/s),换取 256K KV pool + 576-expert cache 同时不 OOM。Decode 不受影响,bs≤2 稳 ≈10–12 tok/s。`--cuda-graph-max-bs 2` / `--max-running-req 2` 把 bs 锁在 ≤2——flat-routing MoE 本来就把 batch gain 压扁。b12x Triton backend 同样适用 GLM(kernel-level choice,arch-agnostic)。BudgetSlider default on;encoder towers default load(glm5_next vision + video);CUDA-graph ladder auto-tuned from VRAM。
 
 ## Requirements & install
 

@@ -30,7 +30,7 @@ Reference rig for every number below: RTX 5090 SM120 PCIe-bound + Qwen3.8-Flash-
 | `fp8_e4m3` | 1024 | 0.9994 | general balance point |
 | `turbo4` | ~516 | 0.9887 | longest contexts (100k+ tokens) |
 
-Storage compressed; compute stays bf16. Indexer keys always bf16. `kvcache/turboquant.py` implements packed-nibble rotspace dequant with bf16 per-(token, head, slab) scales. `kvcache/dsv4_cost_model.py` prices the per-token byte cost including the scale overhead. Engine gate keeps turbo4 on QSA + MLA-latent families only.
+Storage compressed; compute stays bf16. Indexer keys always bf16. `kvcache/turboquant.py` implements packed-nibble rotspace dequant with bf16 per-(token, head, slab) scales. `kvcache/base.py:spec_kv_bytes_per_token` prices the per-token byte cost (packed-nibble latent + bf16 index-key slab + bf16 per-(token, head, slab) scales); `kvcache/dsv4_cost_model.py` prices the separate DSV4 tier family. Engine gate keeps turbo4 on QSA + MLA-latent families only.
 
 **(3)** bs=1 holds ~50k-token context inside ~3 GiB KV pool, verify peak fits without OOM. Needle retrieval 6/6 exact across 322k/450k × depth {30%, 60%, 90%}, worst-case depth-90% at 35.2s, rest 5–12s. Measured KV ≈6.9 KiB/token → full 1M-token pool ≈6.8 GiB. TTFT @ 901k context: 32.5s with prefill overlap, 51s without. Steady-state decode length-independent.
 
@@ -207,7 +207,8 @@ The sections above are written against the reference checkpoint `Qwen3.8-Flash-N
 | axis | Qwen3.8-Flash-Next (`qwen4_exp`) | GLM-5.3-Flash (`glm5_next`) | implication for serve params |
 |---|---|---|---|
 | Linear-attn family | GDN | KDA (GDN-family, fla-compatible scan kernels; `short_conv_kernel_size=4`) | same `LinearStatePool`, weight-name mapping differs |
-| Full-attn pool | QSA compressed sparse | MLA latent (`kv_lora_rank=512`, NoPE) + NSA index (`index_topk=2048`) | engine gate `engine/engine.py:311–319` rejects non-QSA pools from `turbo4` and `fp8_e4m3` — GLM must use bf16 KV |
+| Full-attn pool | QSA compressed sparse | MLA latent (`kv_lora_rank=512`, NoPE) + NSA index (`index_topk=2048`) | engine gate `engine/engine.py:337` allows `turbo4` / `fp8_e4m3` on both QSAKVCache and MLAKVCache; GLM track uses `turbo4` on the MLA-latent pool |
+| Per-expert VRAM footprint | ≈1.34 GB / token | ≈4.76 GB / token (≈3.5× Qwen) | BudgetSlider's KV→MoE slide adds fewer extra experts per GB freed; sliding's throughput gain on GLM is smaller than on Qwen (see measured numbers below) |
 | Full-attn layer count | ≈12 layers | 11 layers (idx 3, 7, …, 43) | — |
 | Linear-attn layer count | ≈36 layers | 34 layers | both have zero per-token KV on linear layers; 1M context feasible |
 | MoE sizing | 512 experts / top-k=10 / intermediate=640 | 288 experts / top-k=8 + shared=1 / intermediate=2048 | per-token expert bytes ≈4.76 GB vs Qwen ≈1.34 GB → PCIe BW ceiling ≈10.6 tok/s vs ≈34–39 tok/s |
@@ -218,8 +219,9 @@ The sections above are written against the reference checkpoint `Qwen3.8-Flash-N
 **Measured numbers on this rig** (RTX 5090 SM120 PCIe-bound, RAM=253.6 GB DDR5 confirmed by `Get-CimInstance Win32_ComputerSystem`)
 
 - PCIe Gen5 host→GPU effective BW ≈40–50 GB/s, reverse-derived from Qwen decode ceiling (1.34 GB/token ÷ BW = observed 34–39 tok/s) and reconfirmed against GLM decode on same launch profile.
-- Decode full-miss ceiling GLM ≈10.6 tok/s (4.76 GB/token ÷ ≈45 GB/s); bs=1 steady-state lands at ≈8–12 tok/s with `--moe-cache-size 512`. bs≥4 scaling predicted ≈×1.3 — flat-routing MoE compresses batch gains vs Qwen's ×1.85.
-- KV pool bf16 bs=1 long-context fits comfortably: ≈13.75 GiB @1M tokens. With `--num-tokens 65536` ≈0.86 GiB KV pool leaves ≈10 GiB contiguous VRAM for expert cache (~500 slots ≈ 0.13-layer residency → steady-state hit rate ~1–2%, decode full-miss-dominated). For longer contexts trade KV against expert cache via BudgetSlider exactly as on Qwen.
+- Decode full-miss ceiling GLM ≈10.6 tok/s (4.76 GB/token ÷ ≈45–50 GB/s); measured bs≤2 steady-state ≈10–12 tok/s on the serve command below with `--moe-cache-size 576`. bs≥4 scaling predicted ≈×1.3 — flat-routing MoE compresses batch gains vs Qwen's ×1.85.
+- BudgetSlider on GLM behaves differently than on Qwen because per-expert VRAM footprint is roughly 3.5× larger (≈4.76 GB vs ≈1.34 GB per token of weight-streaming). A given GB slid out of KV buys fewer extra experts on GLM than on Qwen, so the same slide width yields a smaller decode-speedup on GLM. On Qwen the slide lifts long-text steady-state ≈33 → ≈44 tok/s across the 1024→3072 slot curve; on GLM the equivalent slide is flatter — most of the work is in picking the right starting `--moe-cache-size` (576 here) and letting BudgetSlider trim KV headroom around it.
+- KV pool bs=1 long-context fits comfortably: turbo4 brings MLA's already-compressed 14,080 B/tok bf16 down to ≈3.6 KiB/tok, so `--num-tokens 262144` (256K) ≈0.87 GiB KV pool — leaves room for both a 256K context AND a 576-slot expert cache simultaneously, which bf16 alone could not fit at the same time on 32 GiB. Trade-off is prefill throughput: `--max-prefill-length 1024` caps chunk size and `--disable-moe-prefill-overlap` serializes expert-stream behind attention; combined they push XLONG prefill into the 1.2–1.6k tok/s band. Decode is unaffected and stays ≈10–12 tok/s at bs≤2.
 - Prefill throughput ≈1.2–1.6k tok/s on XLONG prompts (linear extrapolation from per-chunk expert-stream BW; chunk-size independent since the whole expert table streams per chunk). 1M cold prefill ≈11–15 min. Predicted, not measured against reference oracle.
 - Reasoning-leg `prompt_tokens=238` on the standard representative prompt, matching Qwen shape. Reasoning-leg token budget ≥512. Multimodal image + video legs use the same mm content-key path; ViT weight bytes differ (~0.6 GiB bf16 vs Qwen ~0.84 GiB) but per-request overhead pattern matches.
 - Cold boot ≈25 min first start: ~3 min safetensors mmap + ~22 min NVFP4 expert serial stage into pinned arena. Subsequent restarts reuse the page cache; observed ≈8 min.
@@ -230,15 +232,17 @@ The sections above are written against the reference checkpoint `Qwen3.8-Flash-N
 
 ```powershell
 python <launcher>.py `
-  --model-path ./models/GLM-5.3-Flash-NVFP4 `
-  --num-tokens 65536 --moe-cache-size 512 `
-  --kv-cache-dtype bf16 `
+  --model-path ./models/GLM-5.3-Flash-UNCENSORED-NVFP4 `
   --quant-backend moe.nvfp4=b12x `
-  --max-running-req 4 `
+  --num-tokens 262144 --moe-cache-size 576 `
+  --kv-cache-dtype turbo4 --moe-prefill-hit-d2d `
+  --disable-moe-prefill-overlap `
+  --cuda-graph-max-bs 2 --max-running-req 2 `
+  --max-prefill-length 1024 `
   --host 0.0.0.0 --port 8001
 ```
 
-Why these values differ from the Qwen profile above: bf16 KV because MLA pool rejects turbo4/fp8_e4m3 via engine gate; `--num-tokens 65536` capped to leave VRAM room for expert cache despite MLA already compressing per-token bytes 64× architecturally; `--moe-cache-size 512` sized for the MLA-pool KV footprint + 288-expert table per layer; b12x Triton backend applies identically — kernel-level choice, not arch-specific. BudgetSlider enabled by default; encoder towers load by default for glm5_next vision + video; CUDA-graph ladder auto-tuned from VRAM.
+Why these values differ from the Qwen profile above: `turbo4` works on the MLA-latent pool (engine gate at `engine/engine.py:337` admits both QSAKVCache and MLAKVCache), and at ≈3.6 KiB/tok it lets `--num-tokens 262144` (256K) coexist with a 576-slot expert cache inside a 32 GiB card — bf16 KV forces one or the other to shrink. `--moe-cache-size 576` covers roughly two layers of the 288-expert table; per-expert bytes on GLM are ≈3.5× Qwen, so the same slot count buys proportionally less coverage. `--max-prefill-length 1024` caps prefill chunk size and `--disable-moe-prefill-overlap` serializes expert-stream behind attention — together they sacrifice prefill throughput (≈1.2–1.6k tok/s) so that the 256K KV pool and 576-expert cache fit at the same time without OOM. Decode is unaffected and stays ≈10–12 tok/s at bs≤2. `--cuda-graph-max-bs 2` / `--max-running-req 2` keep bs≤2 — flat-routing MoE compresses batch gains anyway. b12x Triton backend applies identically to GLM (kernel-level choice, arch-agnostic). BudgetSlider enabled by default; encoder towers load for glm5_next vision + video; CUDA-graph ladder auto-tuned from VRAM.
 
 ## Requirements & install
 
