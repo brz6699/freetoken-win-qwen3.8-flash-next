@@ -416,15 +416,16 @@ class CpuMoeExecutor:
         if fmt == "fp8_block":
             return self._resolve_fp8_block_banks(banks)
 
-        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
+        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp32 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
         assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
+        assert gug[0].dtype == torch.float32 and dng[0].dtype == torch.float32, (gug[0].dtype, dng[0].dtype)
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
+
         assert H % 16 == 0 and I % 16 == 0, (H, I)
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 16), (gus[0].shape, I, H)
