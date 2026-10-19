@@ -789,8 +789,9 @@ def parse_args(
         help=(
             "KV budget-slide ladder: an integer N makes N evenly spaced tiers "
             "(k/N; N=4 -> 25/50/75/100, N=16 -> 6.25/12.5/.../100). Alternatively "
-            "pass a comma-separated percentage list like '25,50,75,100'. A single "
-            "'100' disables the ladder (the slider follows demand continuously)."
+            "pass a comma-separated percentage list like '25,50,75,100'. N=1 gives "
+            "the single rung at the ceiling, which disables the ladder (the slider "
+            "follows demand continuously)."
         ),
     )
 

@@ -40,7 +40,7 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     if not getattr(tokenizer, "chat_template", None):
         try:
             path = hf_hub_download(repo_id=model_path, filename="chat_template.json")
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 tokenizer.chat_template = json.load(f)["chat_template"]
         except Exception:
             pass

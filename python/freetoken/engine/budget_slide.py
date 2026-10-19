@@ -223,6 +223,21 @@ def propose_targets(
                         // per_expert_bytes,
                     ),
                 )
+        # Re-apply the KV ceiling AFTER the envelope clamp: its second stage can raise
+        # the page count back above the declared cap (the cap clamp above ran BEFORE the
+        # envelope, and the zero-gap scan stops at the cap but never pulls an already
+        # overshooting base back). Hand the freed page bytes to the MoE half -- at most
+        # what the pages gave up, so the envelope stays intact; the cap never sits below
+        # what the fitting current geometry proves affordable.
+        if max_kv_pages is not None and new_pages > max_kv_pages:
+            new_moe = min(
+                hi,
+                max(
+                    floor,
+                    new_moe + (new_pages - max_kv_pages) * cache_per_page // per_expert_bytes,
+                ),
+            )
+            new_pages = max_kv_pages
         # Re-assert the demand floor AFTER the envelope clamp but BEFORE the zero-gap
         # scan (which only ever walks pages UP, so the landing stays at or above the
         # demand). The clamp prices what fits in the arena; the floor then keeps the
@@ -398,4 +413,15 @@ class BudgetSlider:
         self._last_move = self._pending_move
         self._pending_move = None
         self._ema = None  # re-measure the new steady state under the new geometry
+        self._low_streak = 0
+
+    def reset_for_resize(self) -> None:
+        """Drop the smoother after a geometry change that bypassed propose/confirm.
+
+        The admission-grow path (_grow_to_cover) sizes the pools from a concrete
+        prompt's footprint without a slider proposal, so nothing else clears the
+        smoother; without this the next non-forced propose reads a pre-grow EMA
+        against the new pools and proposes from a stale occupancy."""
+        self._ema = None
+        self._pending_move = None
         self._low_streak = 0

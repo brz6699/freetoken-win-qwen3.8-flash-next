@@ -1211,6 +1211,9 @@ class Scheduler(SchedulerIOMixin):
         )
         if not (self.prefill_manager.runnable or self.decode_manager.runnable):
             self._execute_pending_rebuild()
+        slider = getattr(self, "_budget_slider", None)
+        if slider is not None:
+            slider.reset_for_resize()  # geometry changed without a propose/confirm cycle
         return True
 
     def _current_cache_geometry(self) -> dict:
