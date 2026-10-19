@@ -20,6 +20,9 @@ def _self(**cfg_over):
     cfg = dict(
         budget_slide=True, num_page_override=None, num_token_override=None,
         kv_reserve_tokens=8192,
+        # Real EngineConfig always carries max_seq_len (engine/config.py); the
+        # dense-branch ceiling in _build_budget_slider derives from it.
+        max_seq_len=131072,
     )
     cfg.update(cfg_over)
     eng = SimpleNamespace(_pool_cls=_Pool, moe_offload_cache=None, num_pages=1000)
