@@ -1083,15 +1083,25 @@ class Scheduler(SchedulerIOMixin):
         geo = self._current_cache_geometry()
         page_tokens = getattr(self, "_kv_page_tokens", 1)
         demand = getattr(self, "_kv_demand_tokens", 0)
+        cm = getattr(self, "cache_manager", None)
+        live_tokens = cm.page_usage()[0] * page_tokens if cm is not None else demand
         # Relax the shrink-only floor halfway toward what the pool actually holds each idle tick
         # (never below it), so a big old turn does not pin KV and starve the MoE cache later.
-        if not force:
-            cm = getattr(self, "cache_manager", None)
-            if cm is not None:
-                live_tokens = cm.page_usage()[0] * page_tokens
-                if demand > live_tokens:
-                    demand = live_tokens + (demand - live_tokens) // 2
-                    self._kv_demand_tokens = demand
+        if not force and demand > live_tokens:
+            demand = live_tokens + (demand - live_tokens) // 2
+            self._kv_demand_tokens = demand
+        # Queued prompts are concrete WAITING KV demand: invisible to the occupancy EMA until
+        # each is admitted, yet every one claims its full prompt span on admission. After an
+        # idle shrink a burst must lift the demand floor IMMEDIATELY -- cover live occupancy
+        # plus the queued prompts as a hard floor (propose_targets bumps the proposal to the
+        # demand floor after its clamps) instead of waiting for the EMA to catch up tick by
+        # tick while prepares over-fill the shrunk pool. With the queue drained this lift is
+        # inert and the half-relax above resumes decaying the floor again.
+        queued_tokens = sum(
+            int(getattr(p, "input_len", 0) or 0)
+            for p in getattr(getattr(self, "prefill_manager", None), "pending_list", ())
+        )
+        demand = max(demand, live_tokens + queued_tokens)
         hot_cap = getattr(self, "_hot_window_tokens", 0)
         demand_tokens = min(demand, hot_cap) if hot_cap > 0 else demand
         targets = slider.propose(
