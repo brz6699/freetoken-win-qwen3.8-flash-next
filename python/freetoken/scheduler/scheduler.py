@@ -1121,6 +1121,7 @@ class Scheduler(SchedulerIOMixin):
             ):
                 return
             self._slide_last_queued = now
+        slider.confirm()
         logger.info_rank0(f"budget slide queued: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(
             request_id="budget-slide", mode="if_idle", **targets
@@ -1154,13 +1155,12 @@ class Scheduler(SchedulerIOMixin):
             self._process_one_msg(dq.popleft())
 
     def _grow_to_cover(self, need_tokens: int) -> bool:
-        """Ceil-rounded follow-up to grow-before-reject. propose_targets rounds a move to
-        the NEAREST joint lcm step, which can land a few pages below a concrete prompt's
+        """Ceil-rounded follow-up to grow-before-reject. propose_targets rounds a trade
+        to whole expert slots, which can land a few pages below a concrete prompt's
         footprint (observed: a 77610-token prompt against a 77312-token post-grow ceiling).
-        A hard admission demand must round UP, so price the residual against whole chunks
-        here and queue the exact target through the same rebuild slot."""
-        import math
-
+        A hard admission demand must round UP, so ceil the slot payment and hand over
+        the exact page count when the full trade survives the clamps, queueing through
+        the same rebuild slot."""
         try:
             cpp, _fixed, page_tokens, _mr = self.engine._pool_cls.kv_cost(self.config)
         except Exception:  # noqa: BLE001 — same optional-pool semantics as the builder
@@ -1191,11 +1191,19 @@ class Scheduler(SchedulerIOMixin):
             floor = min(
                 hi, max(mc.num_experts, 2 * mc.num_experts if mc.prefill_overlap else mc.num_experts)
             )
-            chunk_pages = math.lcm(cpp, peb) // cpp
-            steps = max(0, -(-(need_pages - cur_pages) // chunk_pages))
-            new_pages = min(cur_pages + steps * chunk_pages, max_pages)
             cur_moe = int(geo.get("moe_cache_size") or 0)
-            new_moe = max(floor, min(hi, cur_moe - (new_pages - cur_pages) * cpp // peb))
+            # Trade in whole EXPERT SLOTS (same lattice as propose_targets): CEIL the slot
+            # payment so the traded bytes cover the page delta, without the near-coprime
+            # blow-up lcm(cpp, peb) produced on latent-KV geometries (a 0.2 MiB page
+            # against a 13.5 MiB slot put its lcm far past the whole envelope).
+            delta_slots = -(-(need_pages - cur_pages) * cpp // peb)
+            new_moe = max(floor, min(hi, cur_moe - delta_slots))
+            new_pages = min(cur_pages + (cur_moe - new_moe) * peb // cpp, max_pages)
+            if new_pages < need_pages and floor <= cur_moe - delta_slots <= hi:
+                # Full trade survived the clamps: ceil-slots then floor-pages can still
+                # strand one page under the prompt; a hard admission bound hands over
+                # the exact count instead of bouncing the request for a missing page.
+                new_pages = min(need_pages, max_pages)
             targets = {"num_pages": int(new_pages), "moe_cache_size": int(new_moe)}
         logger.info_rank0(f"budget slide admission grow: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(

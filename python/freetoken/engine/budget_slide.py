@@ -131,7 +131,7 @@ def propose_targets(
         if arena_bytes and cache_per_page > 0:
             desired_pages = min(
                 desired_pages,
-                (arena_bytes - kv_fixed_bytes) // cache_per_page,
+                max(min_kv_pages, (arena_bytes - kv_fixed_bytes) // cache_per_page),
             )
         if desired_pages == cur_pages:
             return None
@@ -160,14 +160,6 @@ def propose_targets(
         # Keep the KV floor exact and let the slot count absorb the rounding:
         # price the extra pages back against the same envelope.
         new_pages = min_kv_pages
-        new_moe = min(
-            hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
-        )
-    # The slot floor can truncate the trade below the demand floor: re-assert it (the
-    # cap at cur_pages keeps it shrink-only even when the demand exceeds the pool).
-    demand_pages = min(int(demand_pages), cur_pages)
-    if new_pages < demand_pages:
-        new_pages = demand_pages
         new_moe = min(
             hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
         )
@@ -231,6 +223,21 @@ def propose_targets(
                         // per_expert_bytes,
                     ),
                 )
+        # Re-assert the demand floor AFTER the envelope clamp but BEFORE the zero-gap
+        # scan (which only ever walks pages UP, so the landing stays at or above the
+        # demand). The clamp prices what fits in the arena; the floor then keeps the
+        # recent workload's footprint covered inside what fits. The bump is always
+        # affordable: demand is capped at cur_pages and the CURRENT pair fits the arena,
+        # so the bytes left for the MoE half at the bumped page count still clear the
+        # slot floor. The MoE side pays via the remaining arena bytes (bounded above by
+        # the already-clamped slot count, below by the floor).
+        demand_pages = min(int(demand_pages), cur_pages)
+        if max_kv_pages is not None:
+            demand_pages = min(demand_pages, max_kv_pages)
+        if new_pages < demand_pages:
+            new_pages = demand_pages
+            room = (arena_bytes - kv_fixed_bytes - new_pages * cache_per_page) // per_expert_bytes
+            new_moe = max(floor, min(new_moe, room))
         # ZERO-GAP landing: the two carves must meet FLUSH -- among the exact-boundary
         # points (pairs whose bytes fill the arena to the last byte) take the smallest
         # page count at or above the demand that still respects the KV cap and the slot
@@ -241,9 +248,8 @@ def propose_targets(
         # floor/cap, keep the floor-fill pair (gap < one slot).
         if per_expert_bytes > 0 and _fits(new_moe, new_pages):
             g = math.gcd(cache_per_page, per_expert_bytes)
-            cap = min(max_kv_pages if max_kv_pages is not None else hi, hi)
             for p in range(new_pages, new_pages + per_expert_bytes // g + 1):
-                if p > cap:
+                if max_kv_pages is not None and p > max_kv_pages:
                     break
                 rest = arena_bytes - kv_fixed_bytes - p * cache_per_page
                 if rest % per_expert_bytes:
@@ -252,6 +258,18 @@ def propose_targets(
                 if floor <= m <= hi:
                     new_pages, new_moe = p, m
                     break
+    else:
+        # No declared arena to price against: the slot-floor/demand re-assert works in
+        # slot units off the CURRENT geometry (the same arithmetic the arena branch
+        # prices from remaining bytes), shrink-only via the cur_pages cap on demand.
+        demand_pages = min(int(demand_pages), cur_pages)
+        if max_kv_pages is not None:
+            demand_pages = min(demand_pages, max_kv_pages)
+        if new_pages < demand_pages:
+            new_pages = demand_pages
+            new_moe = min(
+                hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
+            )
     if not allow_small and (
         abs(new_moe - cur_moe) < max(4, round(cur_moe * min_step_ratio))
         and abs(new_pages - cur_pages) < max(1, round(cur_pages * min_step_ratio))
@@ -297,6 +315,7 @@ class BudgetSlider:
         self._ema: float | None = None
         self._last_move = 0.0
         self._low_streak = 0
+        self._pending_move: float | None = None
 
     def observe(self, used_pages: int, total_pages: int) -> None:
         """Feed one KV occupancy sample (pages, non-evictable semantics).
@@ -310,6 +329,7 @@ class BudgetSlider:
         slow alpha would otherwise lose."""
         if self._ema is None:
             self._ema = float(used_pages)
+            self._low_streak = 0
             return
         if used_pages >= self._ema:
             alpha = 0.1
@@ -364,6 +384,18 @@ class BudgetSlider:
         )
         if out is None:
             return None
-        self._last_move = now
-        self._ema = None  # re-measure the new steady state under the new geometry
+        self._pending_move = now
         return out
+
+    def confirm(self) -> None:
+        """Commit the debounce/reset state for a proposal the caller actually queued.
+
+        Separate from ``propose`` because the scheduler can still discard a returned
+        proposal at its dead-band/interval gate; committing at propose time would burn
+        a full interval and wipe the smoother for a move that never landed."""
+        if self._pending_move is None:
+            return
+        self._last_move = self._pending_move
+        self._pending_move = None
+        self._ema = None  # re-measure the new steady state under the new geometry
+        self._low_streak = 0

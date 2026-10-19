@@ -266,6 +266,7 @@ async def stream_chat_completion_chunks(
     completion_tokens = 0
     cached_tokens = 0
     tool_calls_sent = 0
+    errored = False
     open_tool: dict[str, Any] | None = None
     events = with_keepalive(
         generate_events(uid, spec, state, source="/v1/chat/completions"),
@@ -282,6 +283,7 @@ async def stream_chat_completion_chunks(
             yield _sse(
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
             )
+            errored = True
             break
         if ev is KEEPALIVE:
             # Empty-delta data-bearing chunk: resets clients' stream-idle timers
@@ -389,7 +391,9 @@ async def stream_chat_completion_chunks(
             cached_tokens = ev.cached_tokens
             yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
 
-    if req.stream_options and req.stream_options.include_usage:
+    # After an error chunk the terminal signal is the error itself (+ [DONE]); a
+    # success-shaped usage frame on top of it double-terminates the stream.
+    if not errored and req.stream_options and req.stream_options.include_usage:
         yield _sse(
             {
                 "id": f"chatcmpl-{uid}",

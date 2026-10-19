@@ -23,8 +23,9 @@ def test_grow_kv_borrows_from_expert_slots():
         headroom=0.25, min_step_ratio=0.05, **GEOM,
     )
     assert out is not None
-    # desired pages = ceil(950*1.25)=1188 -> delta 188 pages ~= 15 slot-steps
-    assert out["num_pages"] == 1183 and out["moe_cache_size"] == 5105
+    # desired pages = ceil(950*1.25)=1188 -> delta 188 pages ~= 15 slot-steps; the
+    # full-trade top-up hands over the exact desired count when the slot trade survives.
+    assert out["num_pages"] == 1188 and out["moe_cache_size"] == 5105
 
 
 def test_shrink_kv_gives_experts_back():
@@ -93,10 +94,11 @@ def test_slider_debounce_and_reset():
     s.observe(950, 1000)
     out = s.propose(1000, 5120)
     assert out is not None and out["num_pages"] > 1000
-    s.observe(950, 1000)
-    assert s.propose(out["num_pages"], out["moe_cache_size"]) is None  # interval gate
+    s.confirm()  # commit on accept: debounce stamped + smoother re-measures from here
+    assert s.propose(out["num_pages"], out["moe_cache_size"]) is None  # ema reset on confirm
     s._last_move = 0.0
-    assert s.propose(out["num_pages"], out["moe_cache_size"]) is None  # ema reset on apply
+    s.observe(950, out["num_pages"])
+    assert s.propose(out["num_pages"], out["moe_cache_size"]) is None  # equal-target quiet
     # Admission demand re-arms the smoother; force skips the interval gate.
     s.observe_need(20000)
     out2 = s.propose(out["num_pages"], out["moe_cache_size"], force=True)
@@ -112,16 +114,16 @@ def test_declared_sizes_fit_measured_budget():
         kv_reserve_pages=100, num_experts=1280, total_experts=6400, max_slots=6400,
         prefill_overlap=False,
     )
-    # Declared over affordable: experts fill to what the budget leaves after the KV
-    # floor; KV takes the remainder.
+    # KV-first policy: with no declared KV the pool sits at its own reserve floor and
+    # the MoE cache fills the remainder above that reservation.
     moe, pages = fit_declared_cache_sizes(declared_moe=5120, declared_pages=None, **kw)
-    assert moe == 1991 and pages == 109
+    assert moe == 1991 and pages == 100
     # Declared below the floors: floors win (working set must stay runnable).
     moe, pages = fit_declared_cache_sizes(declared_moe=50, declared_pages=None, **kw)
-    assert moe == 1280 and pages > 100
-    # Declared KV over affordable: clamped, never below the reserve.
+    assert moe == 1280 and pages >= 100
+    # Declared KV is honored when affordable; MoE absorbs the smaller remainder.
     moe, pages = fit_declared_cache_sizes(declared_moe=5120, declared_pages=400, **kw)
-    assert moe == 1991 and pages == 109
+    assert moe == 1967 and pages == 400
     # Even both floors together do not fit -> loud failure, not an under-sized cache.
     try:
         fit_declared_cache_sizes(declared_moe=5120, declared_pages=None, budget_bytes=100_000_000, **{
@@ -139,7 +141,9 @@ def test_demand_page_floor_is_shrink_only():
         ema_used_pages=0.0, cur_pages=200, cur_moe=5120, min_kv_pages=10,
         headroom=0.25, min_step_ratio=0.05, demand_pages=150, **GEOM,
     )
-    assert out is not None and out["num_pages"] == 150
+    # Slot-unit trades floor whole slots, so the landing can sit a page ABOVE the
+    # demand footprint; the invariant is that it never lands below it.
+    assert out is not None and out["num_pages"] >= 150
     # The bytes the shrink freed from KV went to the expert slots, envelope ~constant
     # within one page + one slot (same band test_shrink_kv_gives_experts_back uses; the
     # exact slot count is a floor-division detail, not the invariant).
@@ -160,7 +164,7 @@ def test_demand_page_floor_is_shrink_only():
         ema_used_pages=0.0, cur_pages=300, cur_moe=5120, min_kv_pages=10,
         headroom=0.25, min_step_ratio=0.05, demand_pages=200, **GEOM,
     )
-    assert out is not None and out["num_pages"] == 200 and out["moe_cache_size"] >= GEOM["num_experts"]
+    assert out is not None and out["num_pages"] >= 200 and out["moe_cache_size"] >= GEOM["num_experts"]
     # Dense path: the same floor applies with the MoE term inert.
     out = propose_targets(
         ema_used_pages=1.0, cur_pages=200, cur_moe=None, min_kv_pages=10,
@@ -183,7 +187,7 @@ def test_slider_demand_passthrough():
     s._ema = 0.0
     # The demand floor handed to propose() holds the pool at the recent prompt's footprint.
     out = s.propose(300, 5120, force=True, demand_pages=250)
-    assert out is not None and out["num_pages"] == 250
+    assert out is not None and out["num_pages"] >= 250
     # propose() resets the smoother on an accepted move; re-seed it WITHOUT the per-call
     # demand floor and the same state now slides to the KV floor (the floor is per-call).
     s._ema = 0.0
