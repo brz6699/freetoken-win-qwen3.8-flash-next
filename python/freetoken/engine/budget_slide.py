@@ -231,6 +231,27 @@ def propose_targets(
                         // per_expert_bytes,
                     ),
                 )
+        # ZERO-GAP landing: the two carves must meet FLUSH -- among the exact-boundary
+        # points (pairs whose bytes fill the arena to the last byte) take the smallest
+        # page count at or above the demand that still respects the KV cap and the slot
+        # floor; MoE absorbs the rest exactly. Runs AFTER the envelope clamp above so a
+        # clamped pair is pulled onto the lattice too. On the gcd(cpp, peb) lattice the
+        # exact points repeat every peb/gcd pages (the declared pair is itself exact: the
+        # arena IS its footprint), so the scan is bounded. When no exact point fits under
+        # floor/cap, keep the floor-fill pair (gap < one slot).
+        if per_expert_bytes > 0 and _fits(new_moe, new_pages):
+            g = math.gcd(cache_per_page, per_expert_bytes)
+            cap = min(max_kv_pages if max_kv_pages is not None else hi, hi)
+            for p in range(new_pages, new_pages + per_expert_bytes // g + 1):
+                if p > cap:
+                    break
+                rest = arena_bytes - kv_fixed_bytes - p * cache_per_page
+                if rest % per_expert_bytes:
+                    continue
+                m = rest // per_expert_bytes
+                if floor <= m <= hi:
+                    new_pages, new_moe = p, m
+                    break
     if not allow_small and (
         abs(new_moe - cur_moe) < max(4, round(cur_moe * min_step_ratio))
         and abs(new_pages - cur_pages) < max(1, round(cur_pages * min_step_ratio))
