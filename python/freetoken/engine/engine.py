@@ -683,7 +683,7 @@ class Engine:
             return
         from freetoken.engine.cache_budget import net_cache_budget_bytes, required_bytes
 
-        cache_per_page, pool_fixed, _, _ = self._pool_cls.kv_cost(config)
+        cache_per_page, pool_fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         # Sibling pools (GDN state, MTP bank) allocate their OWN tensors -- they do not
         # carve the arena -- but they consume the same post-weights VRAM, so they enter
         # the CEILING accounting; only the pool's fixed index tiers carve the arena.
@@ -722,6 +722,15 @@ class Engine:
         # offset from the arena END -- a multiple-of-16 length keeps that anchor aligned.
         budget = (budget + 15) & ~15
         self._cache_arena = torch.empty(budget, dtype=torch.uint8, device=self.device)
+        # The startup geometry the arena was sized for -- the reference point every later
+        # slide/rebuild proposal is judged against (what was DECLARED vs what fits).
+        logger.info(
+            f"Cache arena {budget:,} B for initial geometry: KV {pages} pages"
+            f" x {cache_per_page:,} B"
+            + (f" ({pages * page_tokens:,} tokens)" if page_tokens else "")
+            + f", MoE {config.moe_cache_size} slots x {per_expert:,} B"
+            + f", pool fixed tiers {pool_fixed:,} B"
+        )
 
     def _fit_declared_cache_sizes(self, config: EngineConfig, banks, method) -> None:
         """Fit the DECLARED cache sizes into the MEASURED byte budget — the explicit-flag

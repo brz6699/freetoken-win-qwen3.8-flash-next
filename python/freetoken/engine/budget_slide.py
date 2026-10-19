@@ -171,6 +171,15 @@ def propose_targets(
         new_moe = min(
             hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
         )
+    if desired_pages > new_pages and floor <= cur_moe - delta_slots <= hi:
+        # FULL trade (the slot delta survived the floor/cap clamps): the KV half is owed
+        # exactly the demand-side page count. Deriving pages from the traded BYTES floors
+        # twice -- round(slots), then floor(pages) -- and strands one or two pages inside
+        # the arena: too small to buy another whole MoE slot, left as untouched bytes that
+        # neither pool carves. Hand over the demand's page count directly (it is already
+        # capped and tier-snapped above); the arena clamp below absorbs any byte overshoot
+        # from the slot rounding.
+        new_pages = desired_pages
     if max_kv_pages is not None and new_pages > max_kv_pages:
         # The slot delta rounds UP, so the back-derived page count can overshoot the
         # user's declared KV ceiling by a page or two (e.g. 333 slots = 2049.1 pages of
