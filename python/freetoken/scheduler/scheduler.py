@@ -1205,6 +1205,17 @@ class Scheduler(SchedulerIOMixin):
                 # the exact count instead of bouncing the request for a missing page.
                 new_pages = min(need_pages, max_pages)
             targets = {"num_pages": int(new_pages), "moe_cache_size": int(new_moe)}
+        pending = self._pending_rebuild
+        if (
+            pending is not None
+            and pending.num_pages == targets["num_pages"]
+            and pending.moe_cache_size == targets.get("moe_cache_size")
+        ):
+            # The identical grow is already queued toward the idle safe point (a long
+            # decode holds it off). Every further admission that hits the same wall is
+            # satisfied by that same pending rebuild: return quiet, no re-log, no
+            # smoother reset -- the resize (and its reset) happens once, at land time.
+            return True
         logger.info_rank0(f"budget slide admission grow: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(
             request_id="budget-slide", mode="if_idle", **targets
