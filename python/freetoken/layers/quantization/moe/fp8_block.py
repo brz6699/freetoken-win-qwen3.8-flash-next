@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_size
+from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_scheme
 from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
 FP8 = torch.float8_e4m3fn
@@ -25,7 +25,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
-        if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
+        if cfg.scheme is not None and fp8_block_scheme(cfg.scheme) != BLOCK:
             return f"fp8 block MoE kernel serves {BLOCK}x{BLOCK} expert blocks only"
         reason = gated_epilogue_reason(cfg)
         if reason:

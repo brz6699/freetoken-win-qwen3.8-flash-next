@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from functools import partial
 from typing import Callable, Generic, TypeVar
 
@@ -90,5 +91,34 @@ class EnvClassSingleton:
             assert isinstance(attr_value, BaseEnv)
             attr_value._init(f"{ENV_PREFIX}{attr_name}")
 
+
+def _bootstrap_windows_host_env() -> None:
+    """Host-env prep so a plain `python -m freetoken` / ft.exe launch behaves like the
+    exp launcher on Windows. flashinfer's JIT shells out to a bare ``ninja`` (which
+    lives in the venv's Scripts dir next to the interpreter) and nvcc derives its root
+    from CUDA_HOME whose default carries spaces that CreateProcess rejects unquoted.
+    The peripheral flashinfer kernels additionally JIT with gcc-style link flags an
+    MSVC-only host cannot satisfy, so default those ops to the triton kernels; the
+    b12x fused-MoE gate is unaffected (see kernel/backend.periph_flashinfer_ok).
+    setdefault throughout: a real env value always wins. Workers on spawn re-import
+    this module and inherit the env."""
+    if os.name != "nt":
+        return
+    scripts = os.path.dirname(os.path.abspath(sys.executable))
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if scripts not in path_parts:
+        os.environ["PATH"] = scripts + os.pathsep + os.environ.get("PATH", "")
+    os.environ.setdefault("FREETOKEN_FLASHINFER_PERIPH", "0")
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home and " " in cuda_home:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(cuda_home, buf, 1024)
+        if 0 < n < 1024:
+            os.environ["CUDA_HOME"] = buf.value
+
+
+_bootstrap_windows_host_env()
 
 ENV = EnvClassSingleton()

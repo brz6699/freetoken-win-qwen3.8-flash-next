@@ -296,6 +296,16 @@ def propose_targets(
         # Skip it so the caller just falls through to its normal context_length_exceeded reject
         # instead of bouncing the cache and forcing the next request to re-prefill cold.
         return None
+    # ``moe_cache_size`` here is the TOTAL slot count. The consumer (engine slide path) must
+    # split it across the per-layer pools (split_slots) and hand BOTH numbers to rebuild_slide,
+    # which re-carves the banks at a new right-anchored arena position. Because the banks move,
+    # BOTH their views must be rebuilt off the NEW banks: the read-side pool_bank_views
+    # (_slice_pools) AND the write-side fused-copy descriptor (_build_copy_plan). Missing either
+    # one leaves reads on the freed pre-slide banks while writes go to the new ones -> every MoE
+    # kernel reads misaligned/stale expert rows -> garbled decode right after the first slide
+    # (observed on the w4a4/gluon path, but it is not gluon-specific -- all three kernels read
+    # through the same cached views). The per-pool split travels with the total so pool_sizes
+    # stay consistent with cache_size and the resized banks slice without a gap.
     return {"num_pages": int(new_pages), "moe_cache_size": int(new_moe)}
 
 

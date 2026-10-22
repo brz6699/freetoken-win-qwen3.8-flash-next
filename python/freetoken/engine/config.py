@@ -114,6 +114,9 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
+    # DeepSeek-V4.1 decoder SWA bounded replay: "bounded" (default, the tech-report 128-token
+    # window) or "exact" (run the decoder layers on every prompt token).
+    swa_decoder_replay: str = "bounded"
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True

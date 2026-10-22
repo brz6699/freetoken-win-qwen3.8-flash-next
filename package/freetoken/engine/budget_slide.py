@@ -16,6 +16,25 @@ QSA hybrid, plain-MoE (GLM-class) and dense no-cache-model shapes all take the
 same arithmetic. Models without an offload cache keep the dense branch: KV-only
 resize with the MoE term inert. Pure arithmetic -- unit-testable without a
 device, mirroring cache_budget.py's no-GPU style.
+
+Envelope contract, learned from the garbled-output incident (targets sized against
+the loose VRAM ceiling aliased the right-anchored MoE banks onto the KV carves):
+EVERY layer -- this proposal, the pre-teardown validate_rebuild, the MoE half-check --
+enforces the same inequality, byte-exact, in this order of authority:
+    moe*per_expert_bytes + pages*cache_per_page + kv_fixed_bytes <= arena_bytes
+The arena is the cold-start footprint (allocated once, never grown); VRAM between it
+and the memory_ratio ceiling is graph-capture/activation headroom, NOT cache space,
+so a budget-ceiling pass does not imply an arena fit. ``kv_fixed_bytes`` counts ONLY
+the KV pool's own fixed tiers (they carve the arena alongside the pages); sibling
+pools (GDN state, MTP bank) allocate OUTSIDE the arena and must not be added here.
+Equality at the boundary is the accepted cold geometry (zero tolerance: the arena has
+no borrowable slack, unlike the ceiling check's few-MiB accounting tolerance).
+Clamping happens HERE, before any teardown, so an over-sized target never reaches the
+rebuild path -- a rejected-after-free rebuild loses the whole prefix tree, a
+pre-clamped proposal never does. Startup's double slide (idle shrink to a tier, then
+forced grow-before-reject when queued demand crosses it) is this contract working,
+not thrashing: both moves land on tier boundaries and the equal-target gate then
+quiets the slider.
 """
 
 from __future__ import annotations
@@ -112,7 +131,7 @@ def propose_targets(
         if arena_bytes and cache_per_page > 0:
             desired_pages = min(
                 desired_pages,
-                (arena_bytes - kv_fixed_bytes) // cache_per_page,
+                max(min_kv_pages, (arena_bytes - kv_fixed_bytes) // cache_per_page),
             )
         if desired_pages == cur_pages:
             return None
@@ -144,14 +163,15 @@ def propose_targets(
         new_moe = min(
             hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
         )
-    # The slot floor can truncate the trade below the demand floor: re-assert it (the
-    # cap at cur_pages keeps it shrink-only even when the demand exceeds the pool).
-    demand_pages = min(int(demand_pages), cur_pages)
-    if new_pages < demand_pages:
-        new_pages = demand_pages
-        new_moe = min(
-            hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
-        )
+    if desired_pages > new_pages and floor <= cur_moe - delta_slots <= hi:
+        # FULL trade (the slot delta survived the floor/cap clamps): the KV half is owed
+        # exactly the demand-side page count. Deriving pages from the traded BYTES floors
+        # twice -- round(slots), then floor(pages) -- and strands one or two pages inside
+        # the arena: too small to buy another whole MoE slot, left as untouched bytes that
+        # neither pool carves. Hand over the demand's page count directly (it is already
+        # capped and tier-snapped above); the arena clamp below absorbs any byte overshoot
+        # from the slot rounding.
+        new_pages = desired_pages
     if max_kv_pages is not None and new_pages > max_kv_pages:
         # The slot delta rounds UP, so the back-derived page count can overshoot the
         # user's declared KV ceiling by a page or two (e.g. 333 slots = 2049.1 pages of
@@ -203,6 +223,68 @@ def propose_targets(
                         // per_expert_bytes,
                     ),
                 )
+        # Re-apply the KV ceiling AFTER the envelope clamp: its second stage can raise
+        # the page count back above the declared cap (the cap clamp above ran BEFORE the
+        # envelope, and the zero-gap scan stops at the cap but never pulls an already
+        # overshooting base back). Hand the freed page bytes to the MoE half -- at most
+        # what the pages gave up, so the envelope stays intact; the cap never sits below
+        # what the fitting current geometry proves affordable.
+        if max_kv_pages is not None and new_pages > max_kv_pages:
+            new_moe = min(
+                hi,
+                max(
+                    floor,
+                    new_moe + (new_pages - max_kv_pages) * cache_per_page // per_expert_bytes,
+                ),
+            )
+            new_pages = max_kv_pages
+        # Re-assert the demand floor AFTER the envelope clamp but BEFORE the zero-gap
+        # scan (which only ever walks pages UP, so the landing stays at or above the
+        # demand). The clamp prices what fits in the arena; the floor then keeps the
+        # recent workload's footprint covered inside what fits. The bump is always
+        # affordable: demand is capped at cur_pages and the CURRENT pair fits the arena,
+        # so the bytes left for the MoE half at the bumped page count still clear the
+        # slot floor. The MoE side pays via the remaining arena bytes (bounded above by
+        # the already-clamped slot count, below by the floor).
+        demand_pages = min(int(demand_pages), cur_pages)
+        if max_kv_pages is not None:
+            demand_pages = min(demand_pages, max_kv_pages)
+        if new_pages < demand_pages:
+            new_pages = demand_pages
+            room = (arena_bytes - kv_fixed_bytes - new_pages * cache_per_page) // per_expert_bytes
+            new_moe = max(floor, min(new_moe, room))
+        # ZERO-GAP landing: the two carves must meet FLUSH -- among the exact-boundary
+        # points (pairs whose bytes fill the arena to the last byte) take the smallest
+        # page count at or above the demand that still respects the KV cap and the slot
+        # floor; MoE absorbs the rest exactly. Runs AFTER the envelope clamp above so a
+        # clamped pair is pulled onto the lattice too. On the gcd(cpp, peb) lattice the
+        # exact points repeat every peb/gcd pages (the declared pair is itself exact: the
+        # arena IS its footprint), so the scan is bounded. When no exact point fits under
+        # floor/cap, keep the floor-fill pair (gap < one slot).
+        if per_expert_bytes > 0 and _fits(new_moe, new_pages):
+            g = math.gcd(cache_per_page, per_expert_bytes)
+            for p in range(new_pages, new_pages + per_expert_bytes // g + 1):
+                if max_kv_pages is not None and p > max_kv_pages:
+                    break
+                rest = arena_bytes - kv_fixed_bytes - p * cache_per_page
+                if rest % per_expert_bytes:
+                    continue
+                m = rest // per_expert_bytes
+                if floor <= m <= hi:
+                    new_pages, new_moe = p, m
+                    break
+    else:
+        # No declared arena to price against: the slot-floor/demand re-assert works in
+        # slot units off the CURRENT geometry (the same arithmetic the arena branch
+        # prices from remaining bytes), shrink-only via the cur_pages cap on demand.
+        demand_pages = min(int(demand_pages), cur_pages)
+        if max_kv_pages is not None:
+            demand_pages = min(demand_pages, max_kv_pages)
+        if new_pages < demand_pages:
+            new_pages = demand_pages
+            new_moe = min(
+                hi, max(floor, cur_moe - (new_pages - cur_pages) * cache_per_page // per_expert_bytes)
+            )
     if not allow_small and (
         abs(new_moe - cur_moe) < max(4, round(cur_moe * min_step_ratio))
         and abs(new_pages - cur_pages) < max(1, round(cur_pages * min_step_ratio))
@@ -214,6 +296,16 @@ def propose_targets(
         # Skip it so the caller just falls through to its normal context_length_exceeded reject
         # instead of bouncing the cache and forcing the next request to re-prefill cold.
         return None
+    # ``moe_cache_size`` here is the TOTAL slot count. The consumer (engine slide path) must
+    # split it across the per-layer pools (split_slots) and hand BOTH numbers to rebuild_slide,
+    # which re-carves the banks at a new right-anchored arena position. Because the banks move,
+    # BOTH their views must be rebuilt off the NEW banks: the read-side pool_bank_views
+    # (_slice_pools) AND the write-side fused-copy descriptor (_build_copy_plan). Missing either
+    # one leaves reads on the freed pre-slide banks while writes go to the new ones -> every MoE
+    # kernel reads misaligned/stale expert rows -> garbled decode right after the first slide
+    # (observed on the w4a4/gluon path, but it is not gluon-specific -- all three kernels read
+    # through the same cached views). The per-pool split travels with the total so pool_sizes
+    # stay consistent with cache_size and the resized banks slice without a gap.
     return {"num_pages": int(new_pages), "moe_cache_size": int(new_moe)}
 
 
@@ -248,6 +340,7 @@ class BudgetSlider:
         self._ema: float | None = None
         self._last_move = 0.0
         self._low_streak = 0
+        self._pending_move: float | None = None
 
     def observe(self, used_pages: int, total_pages: int) -> None:
         """Feed one KV occupancy sample (pages, non-evictable semantics).
@@ -261,6 +354,7 @@ class BudgetSlider:
         slow alpha would otherwise lose."""
         if self._ema is None:
             self._ema = float(used_pages)
+            self._low_streak = 0
             return
         if used_pages >= self._ema:
             alpha = 0.1
@@ -315,6 +409,29 @@ class BudgetSlider:
         )
         if out is None:
             return None
-        self._last_move = now
-        self._ema = None  # re-measure the new steady state under the new geometry
+        self._pending_move = now
         return out
+
+    def confirm(self) -> None:
+        """Commit the debounce/reset state for a proposal the caller actually queued.
+
+        Separate from ``propose`` because the scheduler can still discard a returned
+        proposal at its dead-band/interval gate; committing at propose time would burn
+        a full interval and wipe the smoother for a move that never landed."""
+        if self._pending_move is None:
+            return
+        self._last_move = self._pending_move
+        self._pending_move = None
+        self._ema = None  # re-measure the new steady state under the new geometry
+        self._low_streak = 0
+
+    def reset_for_resize(self) -> None:
+        """Drop the smoother after a geometry change that bypassed propose/confirm.
+
+        The admission-grow path (_grow_to_cover) sizes the pools from a concrete
+        prompt's footprint without a slider proposal, so nothing else clears the
+        smoother; without this the next non-forced propose reads a pre-grow EMA
+        against the new pools and proposes from a stale occupancy."""
+        self._ema = None
+        self._pending_move = None
+        self._low_streak = 0

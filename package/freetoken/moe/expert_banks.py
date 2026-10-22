@@ -48,6 +48,8 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # per-layer quant tag (e.g. the gate_up and down GGUF types), for layers whose banks match in dtype and row shape but not in quant; None = one quant
+    layer_tags: list | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -393,3 +395,33 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
             "but saves no pinned quota"
         )
     return banks
+
+
+def attach_resident_banks(layers, banks: ExpertBanks) -> None:
+    """Give each resident MoE layer its rows of the device ``banks``; bank layer ``i`` goes to the layer whose ``layer_id`` is ``i``."""
+    ids = sorted(layer.layer_id for layer in layers if layer.layer_id is not None)
+    num_layers = len(next(iter(banks.sources.values())))
+    if ids != list(range(num_layers)) or len(ids) != len(layers):
+        raise ValueError(f"resident MoE layer ids {ids} do not cover the {num_layers} expert bank layers")
+    for layer in layers:
+        i, e = layer.layer_id, layer.num_experts
+        layout = layer.quant_method.layout()
+        rows = {role: (e, *spec.shape) for role, spec in layout.items() if not spec.resident}
+        if set(banks.sources) != set(rows):
+            raise ValueError(f"expert banks hold {sorted(banks.sources)}, the {layer.quant_method.kernel.name} kernel reads {sorted(rows)}")
+        for role, shape in rows.items():
+            bank = banks.sources[role][i]
+            if tuple(bank.shape) != shape or bank.dtype != layout[role].dtype:
+                raise ValueError(
+                    f"bank {role!r} of layer {i} is {tuple(bank.shape)} {bank.dtype} but the {layer.quant_method.kernel.name} kernel "
+                    f"wants {shape} {layout[role].dtype}; the banks were packed for another kernel or model"
+                )
+        alphas = []
+        # apply() reads view.alphas as (gate_up, down)
+        for role in (role for role in ("gate_up_alpha", "down_alpha") if role in layout):
+            a = getattr(banks, role)
+            if a is None or a.numel() != num_layers * e or a.dtype != layout[role].dtype:
+                raise ValueError(f"the {layer.quant_method.kernel.name} kernel needs {num_layers * e} {layout[role].dtype} {role} values, the expert banks carry {None if a is None else (a.numel(), a.dtype)}")
+            alphas.append(a)
+        layer._expert_banks = {role: per_layer[i] for role, per_layer in banks.sources.items()}
+        layer._expert_alphas = tuple(a[i * e : (i + 1) * e] for a in alphas) or None

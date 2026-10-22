@@ -789,8 +789,9 @@ def parse_args(
         help=(
             "KV budget-slide ladder: an integer N makes N evenly spaced tiers "
             "(k/N; N=4 -> 25/50/75/100, N=16 -> 6.25/12.5/.../100). Alternatively "
-            "pass a comma-separated percentage list like '25,50,75,100'. A single "
-            "'100' disables the ladder (the slider follows demand continuously)."
+            "pass a comma-separated percentage list like '25,50,75,100'. N=1 gives "
+            "the single rung at the ceiling, which disables the ladder (the slider "
+            "follows demand continuously)."
         ),
     )
 
@@ -946,7 +947,8 @@ def parse_args(
     if kv_tiers:
         specs = str(kv_tiers).strip()
         if specs.isdigit():
-            n = int(specs)
+            # A single rung (N=1 or "0") is the documented "disable the ladder" spelling.
+            n = max(1, int(specs))
             os.environ["FREETOKEN_KV_TIERS"] = ",".join(f"{100.0 * k / n:g}" for k in range(1, n + 1))
         else:
             os.environ["FREETOKEN_KV_TIERS"] = specs
@@ -1011,7 +1013,21 @@ def parse_args(
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+    # config.json spells dtypes inconsistently across exporters (bf16/fp16/half/float);
+    # normalize aliases, and treat the literal "auto" written into a config as unset.
+    # Anything still unknown lands on the documented bf16 default instead of raising.
+    ALIASES = {
+        "fp16": "float16",
+        "half": "float16",
+        "bf16": "bfloat16",
+        "fp32": "float32",
+        "float": "float32",
+    }
+    if isinstance(dtype_str, str):
+        dtype_str = ALIASES.get(dtype_str.strip().lower(), dtype_str.strip().lower())
+        if dtype_str in ("", "auto"):
+            dtype_str = "bfloat16"
+    kwargs["dtype"] = DTYPE_MAP.get(dtype_str, torch.bfloat16) if isinstance(dtype_str, str) else dtype_str
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

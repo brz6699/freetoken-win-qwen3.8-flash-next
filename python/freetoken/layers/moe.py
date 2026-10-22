@@ -400,13 +400,16 @@ class OffloadMoELayer(MoELayer):
         # run the same grouped GEMM over the slots, instead of streaming every expert of the layer.
         if cache.loads_prefill_on_demand(hidden_states.shape[0]):
             slots = cache.load_prefill_experts(self.layer_id, topk_ids)
+            # Slot ids index rows of this layer's pool bank, so the kernel count is the
+            # pool's slot count, not the model expert count (they differ once slides
+            # resize pools; ids can exceed num_experts).
             return self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
                 slots,
                 views=cache.pool_bank_views(self.layer_id),
-                n=None,
+                n=cache.pool_slots(self.layer_id),
                 alphas=cache.alphas_for_slots(self.layer_id),
                 is_prefill=True,
             )

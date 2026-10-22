@@ -4,7 +4,7 @@ import collections
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Collection
 
 import safetensors
 import torch
@@ -90,6 +90,7 @@ def iter_nvfp4_expert_pieces(
     config,
     spec: Nvfp4ExpertSourceSpec,
     *,
+    layers: Collection[int] | None = None,
     parallel: bool = False,
     workers: int = 8,
     chunk: int = 8 << 20,
@@ -103,6 +104,7 @@ def iter_nvfp4_expert_pieces(
 
     Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
+    ``layers`` (bank layer ids, default all) reads only those layers' experts.
     """
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map
@@ -114,14 +116,13 @@ def iter_nvfp4_expert_pieces(
 
     keep = None if layers is None else set(layers)
     act = _activation_scale()
-
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:
         match = spec.key_pattern.match(name)
         if match is None:
             continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
-        if bank_layer is None:
+        if bank_layer is None or (keep is not None and bank_layer not in keep):
             continue
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
@@ -144,7 +145,6 @@ def iter_nvfp4_expert_pieces(
     per_expert = 12 if acts else 9
     if len(wanted) != experts * per_expert:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * per_expert}")
-
 
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import errno
 import gc
 import math
 import os
@@ -34,6 +36,41 @@ from freetoken.kvcache.linear_state_pool import (
 from freetoken.mm.config import ENCODER_SECTIONS
 
 logger = init_logger(__name__)
+
+
+class WeightLoadError(RuntimeError):
+    """The checkpoint itself could not be read. Resource and config failures keep their own type."""
+
+
+def _is_resource_failure(exc: Exception) -> bool:
+    if isinstance(exc, (torch.OutOfMemoryError, MemoryError, PinFailed)):
+        return True
+    # an anonymous mmap that does not fit raises ENOMEM, not MemoryError
+    if isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        return True
+    # torch has no type for a failed CPU allocation
+    return isinstance(exc, RuntimeError) and "DefaultCPUAllocator" in str(exc)
+
+
+@contextlib.contextmanager
+def _weight_load_context():
+    """Wrap a checkpoint read so the startup failure reason (log and /health) starts with WeightLoadError."""
+    try:
+        yield
+    except Exception as exc:
+        if _is_resource_failure(exc):
+            raise
+        raise WeightLoadError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _pin_hint(reserved: int) -> str:
+    if _pin_budget_bytes(reserved) is None:
+        return "the expert banks need more page-locked host RAM than this host has; free host RAM or serve a smaller model"
+    return (
+        "pass --moe-cpu-layers auto to lock the layers over the pin budget for CPU decode, "
+        "or --moe-cpu-layers <count|fraction|ids> to choose them yourself"
+    )
+
 
 def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
@@ -1461,7 +1498,9 @@ class Engine:
                     "moe_cache_size requested but this model has no MoE offload cache"
                 )
             try:
-                self.moe_offload_cache.validate_rebuild(moe_cache_size)
+                batch = config.max_running_req if self.moe_offload_cache.decode_target == "gpu" else 1
+                moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
+                self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
         if num_pages is not None and num_pages <= 0:
@@ -1488,7 +1527,9 @@ class Engine:
                 raise CacheRebuildRejected(
                     f"num_swa_pages must be positive, got {num_swa_pages}"
                 )
-        target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(moe_cache_size)
+        target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(
+            moe_cache_size, moe_pool_sizes if moe_cache_size is not None else None
+        )
         target_mamba = (
             num_mamba_slots + 1
             if num_mamba_slots is not None
@@ -1523,7 +1564,7 @@ class Engine:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            self.moe_offload_cache.rebuild_slide(moe_cache_size)
+            self.moe_offload_cache.rebuild_slide(moe_cache_size, moe_pool_sizes)
         if num_pages is not None:
             self._resize_kv_pool(config, num_pages, num_swa_pages)
         elif num_swa_pages is not None:

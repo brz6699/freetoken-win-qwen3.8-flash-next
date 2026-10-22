@@ -40,7 +40,7 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     if not getattr(tokenizer, "chat_template", None):
         try:
             path = hf_hub_download(repo_id=model_path, filename="chat_template.json")
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 tokenizer.chat_template = json.load(f)["chat_template"]
         except Exception:
             pass
@@ -186,7 +186,9 @@ def _raw_config_json(model_path: str) -> dict:
         path = os.path.join(model_path, "config.json")
     else:
         path = hf_hub_download(repo_id=model_path, filename="config.json")
-    with open(path, encoding="utf-8") as f:
+    # utf-8-sig also swallows the BOM some Windows exporters leave on config.json;
+    # plain UTF-8 files decode identically.
+    with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -195,7 +197,7 @@ def sidecar_quantization_config(model_path: str) -> dict | None:
     sidecar = optional_hf_file(model_path, "hf_quant_config.json")
     if sidecar is None:
         return None
-    with open(sidecar, encoding="utf-8") as f:
+    with open(sidecar, encoding="utf-8-sig") as f:
         quant = json.load(f).get("quantization")
     if not isinstance(quant, dict):
         return None

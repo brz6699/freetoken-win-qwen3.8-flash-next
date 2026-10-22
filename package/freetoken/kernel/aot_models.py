@@ -95,7 +95,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
-        # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
+        # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp32
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
         # folded into GPU-resident alphas (layers/quantization/moe/nvfp4.py), so no global banks.
         banks = {
@@ -105,8 +105,8 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             "down_scale": H * (I // 16),
         }
         if fmt == "nvfp4":
-            banks["gate_up_global"] = 2 * I * 2
-            banks["down_global"] = H * 2
+            banks["gate_up_global"] = 2 * I * 4
+            banks["down_global"] = H * 4
         return banks
     if fmt == "mxfp4_triton":
         # gpt-oss mxfp4 expert banks: transposed split-K blocks/scales + bf16 bias

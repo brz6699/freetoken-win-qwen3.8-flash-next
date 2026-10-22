@@ -48,6 +48,11 @@ CODEX_CLEAR_ENV = (*CLOUD_PROVIDER_API_KEY_ENV, "CODEX_API_KEY")
 OPENCLAW_CLEAR_ENV = CLOUD_PROVIDER_API_KEY_ENV
 
 
+def resolve_api_key(api_key: str | None) -> str | None:
+    """An explicit --api-key wins, else the FREETOKEN_API_KEY env var, else None (serve open)."""
+    return api_key or os.environ.get(CODEX_PROVIDER_API_KEY_ENV) or None
+
+
 @dataclass(frozen=True)
 class ServerURL:
     origin: str

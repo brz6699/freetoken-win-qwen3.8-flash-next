@@ -667,6 +667,8 @@ class OffloadMoeCache:
         for p in range(len(self.pool_sizes)):
             ids = self._gather_bank_ids[self._pool_layout(p)]
             self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
+        from freetoken.kernel.fast_index_copy import default_blocks_per_bank
+
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
 
         self._copy_fused_ok = True
@@ -799,7 +801,7 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
-    def rebuild_slide(self, cache_size: int) -> None:
+    def rebuild_slide(self, cache_size: int, pool_sizes: list[int] | None = None) -> None:
         """Resize the GPU slot cache WHILE KEEPING resident expert rows (budget-slide path).
 
         Same validation and bookkeeping lifecycle as rebuild(); the difference is the
@@ -811,7 +813,9 @@ class OffloadMoeCache:
         requests hit the rows they already paid for; stat counters reset like rebuild.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild_slide"
-        self.validate_rebuild(cache_size)
+        sizes = [cache_size] if pool_sizes is None else list(pool_sizes)
+        assert len(sizes) == len(self.pool_sizes) and sum(sizes) == cache_size and min(sizes) > 0, (sizes, cache_size)
+        self.validate_rebuild(cache_size, sizes)
         # Same prefill-overlap teardown as rebuild(): buffer views alias the old caches.
         self.prefill_bank_buffers = []
         self.prefill_copy_stream = None
@@ -837,6 +841,7 @@ class OffloadMoeCache:
         self.bank_caches = {}
         self.banks = []
         self.cache_size = cache_size
+        self.pool_sizes = sizes
         # Reset the carve cursor like rebuild() does: the old views are released by the
         # rotate below, so the resized banks re-carve from the anchored end at the same
         # positions instead of stacking one bank-set lower on every slide.
@@ -877,6 +882,10 @@ class OffloadMoeCache:
             eids = torch.as_tensor(new_ids[:n_keep], dtype=torch.int64, device=self.device)
             slots = torch.arange(n_keep, dtype=torch.int32, device=self.device)
             self.slot_for_id.view(-1).index_put_((eids,), slots)
+        # Rebuild the per-pool bank views + id/usage slices from the resized banks and maps,
+        # exactly as rebuild() does: without this, pool_bank_views() keeps returning views
+        # into the freed pre-slide banks and every MoE kernel reads stale/wrong expert rows.
+        self._slice_pools()
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)

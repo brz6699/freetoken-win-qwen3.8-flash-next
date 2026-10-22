@@ -69,7 +69,8 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4,
+             "fp8_block": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -143,7 +144,7 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0 or fp8_block — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -175,6 +176,14 @@ class CpuMoeExecutor:
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
         # handles its act inside the kernel and predates the marker.)
+        # A prebuilt .so that predates this format would accept the id and then take
+        # the wrong dequant branch -- silently wrong output rather than a crash.
+        if _WFMT_IDS[fmt] > getattr(_cpu_moe, "max_weight_format_id", lambda: 4)():
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension predates the {fmt!r} expert format; "
+                "rebuild it with `python setup.py build_ext --inplace` (or reinstall "
+                "the wheel) before serving this checkpoint on the cpu/hybrid backend."
+            )
         if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:
@@ -337,6 +346,32 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
+    def _resolve_fp8_block_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """Block-FP8 schema: row-major e4m3 + one bf16 scale per 128x128 block; the scale banks pad their last dim, so C++ gets the real row stride."""
+        gu, gus = banks["gate_up"], banks["gate_up_scale"]
+        dn, dns = banks["down"], banks["down_scale"]
+        assert gu[0].element_size() == 1 and dn[0].element_size() == 1, (gu[0].dtype, dn[0].dtype)
+        assert gus[0].dtype == torch.bfloat16 and dns[0].dtype == torch.bfloat16, (gus[0].dtype, dns[0].dtype)
+        I = int(gu[0].shape[1] // 2)
+        H = int(gu[0].shape[2])
+        assert gu[0].shape[1] == 2 * I
+        assert tuple(dn[0].shape[1:]) == (H, I), (dn[0].shape, H, I)
+        assert gus[0].shape[1] == (2 * I + 127) // 128 and gus[0].shape[2] >= (H + 127) // 128, (gus[0].shape, H, I)
+        assert dns[0].shape[1] == (H + 127) // 128 and dns[0].shape[2] >= (I + 127) // 128, (dns[0].shape, H, I)
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gu).data_ptr(),
+            down_ptr=self._make_table(dn).data_ptr(),
+            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
+            gate_up_global_ptr=0,
+            down_scale_ptr=self._make_table(dns).data_ptr(),
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+            fp8_block_gu_scale_stride=int(gus[0].stride(1)),
+            fp8_block_dn_scale_stride=int(dns[0].stride(1)),
+        )
+        return ptrs, (H, I)
+
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
@@ -378,15 +413,19 @@ class CpuMoeExecutor:
         if fmt == "ds_fp4":
             return self._resolve_dsfp4_banks(banks)
 
-        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
+        if fmt == "fp8_block":
+            return self._resolve_fp8_block_banks(banks)
+
+        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp32 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
         assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
+        assert gug[0].dtype == torch.float32 and dng[0].dtype == torch.float32, (gug[0].dtype, dng[0].dtype)
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
+
         assert H % 16 == 0 and I % 16 == 0, (H, I)
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 16), (gus[0].shape, I, H)
@@ -493,11 +532,16 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
+            alloc_io = (
+                (lambda *shape, dtype: torch.empty(*shape, dtype=dtype))
+                if self.device.type == "cpu"
+                else alloc_pinned_tensor
+            )
             io = {
-                "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
-                "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "x": alloc_io(bs, self.H, dtype=torch.bfloat16),
+                "ids": alloc_io(bs, self.top_k, dtype=torch.int32),
+                "w": alloc_io(bs, self.top_k, dtype=torch.float32),
+                "y": alloc_io(bs, self.H, dtype=torch.bfloat16),
             }
             self._io[bs] = io
         return io
