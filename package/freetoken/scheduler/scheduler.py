@@ -1046,12 +1046,19 @@ class Scheduler(SchedulerIOMixin):
             )
         else:
             from freetoken.engine.cache_budget import expert_bytes_per_slot
-            from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
+            from freetoken.layers.quantization.moe.base import MoEKernel
+            from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE, iter_offload_moe_layers
 
+            active_kernels = {
+                layer.quant_method.kernel
+                for layer in iter_offload_moe_layers(engine.model)
+                if getattr(layer, "quant_method", None) is not None
+            }
+            row_align = MoEKernel.align_of(active_kernels) if active_kernels else 128
             total_experts = mc.num_layers * mc.num_experts
             geometry = dict(
                 cache_per_page=cache_per_page,
-                per_expert_bytes=expert_bytes_per_slot(mc.bank_sources),
+                per_expert_bytes=expert_bytes_per_slot(mc.bank_sources, row_align),
                 num_experts=mc.num_experts,
                 total_experts=total_experts,
                 max_slots=(MARLIN_MAX_CACHE_SIZE if mc.quant_format == "nvfp4_marlin" else total_experts),
@@ -1083,15 +1090,25 @@ class Scheduler(SchedulerIOMixin):
         geo = self._current_cache_geometry()
         page_tokens = getattr(self, "_kv_page_tokens", 1)
         demand = getattr(self, "_kv_demand_tokens", 0)
+        cm = getattr(self, "cache_manager", None)
+        live_tokens = cm.page_usage()[0] * page_tokens if cm is not None else demand
         # Relax the shrink-only floor halfway toward what the pool actually holds each idle tick
         # (never below it), so a big old turn does not pin KV and starve the MoE cache later.
-        if not force:
-            cm = getattr(self, "cache_manager", None)
-            if cm is not None:
-                live_tokens = cm.page_usage()[0] * page_tokens
-                if demand > live_tokens:
-                    demand = live_tokens + (demand - live_tokens) // 2
-                    self._kv_demand_tokens = demand
+        if not force and demand > live_tokens:
+            demand = live_tokens + (demand - live_tokens) // 2
+            self._kv_demand_tokens = demand
+        # Queued prompts are concrete WAITING KV demand: invisible to the occupancy EMA until
+        # each is admitted, yet every one claims its full prompt span on admission. After an
+        # idle shrink a burst must lift the demand floor IMMEDIATELY -- cover live occupancy
+        # plus the queued prompts as a hard floor (propose_targets bumps the proposal to the
+        # demand floor after its clamps) instead of waiting for the EMA to catch up tick by
+        # tick while prepares over-fill the shrunk pool. With the queue drained this lift is
+        # inert and the half-relax above resumes decaying the floor again.
+        queued_tokens = sum(
+            int(getattr(p, "input_len", 0) or 0)
+            for p in getattr(getattr(self, "prefill_manager", None), "pending_list", ())
+        )
+        demand = max(demand, live_tokens + queued_tokens)
         hot_cap = getattr(self, "_hot_window_tokens", 0)
         demand_tokens = min(demand, hot_cap) if hot_cap > 0 else demand
         targets = slider.propose(
@@ -1121,6 +1138,7 @@ class Scheduler(SchedulerIOMixin):
             ):
                 return
             self._slide_last_queued = now
+        slider.confirm()
         logger.info_rank0(f"budget slide queued: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(
             request_id="budget-slide", mode="if_idle", **targets
@@ -1154,13 +1172,12 @@ class Scheduler(SchedulerIOMixin):
             self._process_one_msg(dq.popleft())
 
     def _grow_to_cover(self, need_tokens: int) -> bool:
-        """Ceil-rounded follow-up to grow-before-reject. propose_targets rounds a move to
-        the NEAREST joint lcm step, which can land a few pages below a concrete prompt's
+        """Ceil-rounded follow-up to grow-before-reject. propose_targets rounds a trade
+        to whole expert slots, which can land a few pages below a concrete prompt's
         footprint (observed: a 77610-token prompt against a 77312-token post-grow ceiling).
-        A hard admission demand must round UP, so price the residual against whole chunks
-        here and queue the exact target through the same rebuild slot."""
-        import math
-
+        A hard admission demand must round UP, so ceil the slot payment and hand over
+        the exact page count when the full trade survives the clamps, queueing through
+        the same rebuild slot."""
         try:
             cpp, _fixed, page_tokens, _mr = self.engine._pool_cls.kv_cost(self.config)
         except Exception:  # noqa: BLE001 — same optional-pool semantics as the builder
@@ -1191,18 +1208,40 @@ class Scheduler(SchedulerIOMixin):
             floor = min(
                 hi, max(mc.num_experts, 2 * mc.num_experts if mc.prefill_overlap else mc.num_experts)
             )
-            chunk_pages = math.lcm(cpp, peb) // cpp
-            steps = max(0, -(-(need_pages - cur_pages) // chunk_pages))
-            new_pages = min(cur_pages + steps * chunk_pages, max_pages)
             cur_moe = int(geo.get("moe_cache_size") or 0)
-            new_moe = max(floor, min(hi, cur_moe - (new_pages - cur_pages) * cpp // peb))
+            # Trade in whole EXPERT SLOTS (same lattice as propose_targets): CEIL the slot
+            # payment so the traded bytes cover the page delta, without the near-coprime
+            # blow-up lcm(cpp, peb) produced on latent-KV geometries (a 0.2 MiB page
+            # against a 13.5 MiB slot put its lcm far past the whole envelope).
+            delta_slots = -(-(need_pages - cur_pages) * cpp // peb)
+            new_moe = max(floor, min(hi, cur_moe - delta_slots))
+            new_pages = min(cur_pages + (cur_moe - new_moe) * peb // cpp, max_pages)
+            if new_pages < need_pages and floor <= cur_moe - delta_slots <= hi:
+                # Full trade survived the clamps: ceil-slots then floor-pages can still
+                # strand one page under the prompt; a hard admission bound hands over
+                # the exact count instead of bouncing the request for a missing page.
+                new_pages = min(need_pages, max_pages)
             targets = {"num_pages": int(new_pages), "moe_cache_size": int(new_moe)}
+        pending = self._pending_rebuild
+        if (
+            pending is not None
+            and pending.num_pages == targets["num_pages"]
+            and pending.moe_cache_size == targets.get("moe_cache_size")
+        ):
+            # The identical grow is already queued toward the idle safe point (a long
+            # decode holds it off). Every further admission that hits the same wall is
+            # satisfied by that same pending rebuild: return quiet, no re-log, no
+            # smoother reset -- the resize (and its reset) happens once, at land time.
+            return True
         logger.info_rank0(f"budget slide admission grow: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(
             request_id="budget-slide", mode="if_idle", **targets
         )
         if not (self.prefill_manager.runnable or self.decode_manager.runnable):
             self._execute_pending_rebuild()
+        slider = getattr(self, "_budget_slider", None)
+        if slider is not None:
+            slider.reset_for_resize()  # geometry changed without a propose/confirm cycle
         return True
 
     def _current_cache_geometry(self) -> dict:

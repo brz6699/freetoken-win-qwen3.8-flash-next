@@ -40,6 +40,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    row_align_bytes = 32
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
@@ -227,6 +228,7 @@ class MarlinNvfp4MoEKernel(MoEKernel):
 
     name = "marlin"
     max_slots = MARLIN_MAX_SLOTS
+    row_align_bytes = 64
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not backend.is_vllm_installed():
@@ -591,6 +593,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
     """flashinfer's SM12x CuTe-DSL W4A16 MoE; the packed blocks reuse the native bank bytes."""
 
     name = "b12x"
+    row_align_bytes = 128
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         cc = backend.device_capability()

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from freetoken.utils import div_ceil
+from freetoken.utils import align_ceil, div_ceil
 
 if TYPE_CHECKING:
     import torch
@@ -26,18 +26,24 @@ def effective_ratio(memory_ratio: float | None) -> float:
     return DEFAULT_MEMORY_RATIO if memory_ratio is None else float(memory_ratio)
 
 
-def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
+def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"], row_align: int = 16) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
 
     Each bank source is per-layer ``[num_experts, *row_shape]`` tensors and is
     already TP-sharded upstream, so the per-row byte count is the per-rank slot
-    size.
+    size. ``row_align`` is the lcm of the active kernels' READ-contract atoms
+    (``MoEKernel.row_align_bytes``); per-bank row bytes and the final total are both
+    ROUND_UP-ed to it, so the arena's gcd(cpp, peb) lattice lands on points every
+    backend can read cleanly without misaligned tile loads.
     """
     # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
     # tensor[0].numel() is the per-row element count (one expert slot); see the matching
     # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    total = sum(
+        align_ceil(t[0][0].numel() * t[0].element_size(), row_align) for t in sources.values()
+    )
+    return align_ceil(total, row_align)
 
 
 def net_cache_budget_bytes(
@@ -165,42 +171,44 @@ def fit_declared_cache_sizes(
     max_slots: int,
     prefill_overlap: bool,
 ) -> tuple[int, int]:
-    """Clamp DECLARED cache sizes into the MEASURED byte budget.
+    """Fit DECLARED cache sizes into the MEASURED byte budget, respecting declared when it fits.
 
-    KV-FIRST policy (the intended sliding behavior): the KV pool is provisioned to the
-    declared context length (--num-tokens -> declared_pages) FIRST so max_seq_len reaches
-    it at boot; the MoE expert-slot cache then fills whatever bytes remain, down to the
-    kernel floor of a FULL expert layer (``num_experts`` slots, or 2x with prefill
-    overlap: the offload GEMM hard-requires >= num_experts resident slots to run, so that
-    is the lowest MoE can drop -- far below what the declared KV needs, so reserving the
-    KV first still leaves ample room). The MoE side is the elastic one: the runtime budget
-    slide grows it back when context is short and hands bytes back when context grows.
-    This is the opposite of the old fill-MoE-first policy, which reserved only a tiny KV
-    floor and left KV at the remainder -- capping max_seq_len far below --num-tokens and
-    dropping long prompts once the idle slide shrank KV further. Envelope-conserving:
-    ``moe * per_expert + pages * cache_per_page <= budget_bytes``."""
+    Both MoE slots and KV pages are treated as USER-DECLARED ceilings (not targets to grow into):
+    when ``(declared_moe x peb) + (declared_pages x cpp)`` fits inside ``budget_bytes``, the boot
+    geometry equals the declaration exactly and the leftover VRAM is left for graph capture +
+    activations. When the declaration exceeds ``budget_bytes``, it is clamped DOWN to the largest
+    sub-fit that keeps the KV-first ordering -- never raised above what the user asked for. The
+    MoE side then fills whatever headroom the KV clamp leaves, down to the kernel floor of one
+    FULL expert layer (``num_experts``, or 2x with prefill overlap). Envelope-conserving:
+    ``moe * peb + pages * cpp <= budget_bytes``."""
     assert per_expert_bytes > 0 and cache_per_page > 0
 
     hi = min(total_experts, max_slots)
-    # MoE floor = one full layer's experts (num_experts, or 2x with prefill overlap): the
-    # offload MoE kernel (OffloadMoeCache.validate_rebuild) hard-requires >= num_experts
-    # resident slots to run a GEMM, so that is the lowest MoE can safely drop. It is far
-    # below what the declared KV needs, so reserving the KV below leaves ample room.
+    # MoE floor = one full layer's experts (num_experts, or 2x with prefill overlap): the offload
+    # MoE kernel hard-requires >= num_experts resident slots to run a GEMM. Always reserved first.
     floor = min(hi, max(num_experts, 2 * num_experts if prefill_overlap else num_experts))
-    # The KV pool is sized to the declared context length (never below the model's own
-    # KV reserve); that reservation takes priority so max_seq_len reaches --num-tokens.
-    kv_pages = max(declared_pages or 0, kv_reserve_pages)
-    kv_bytes = kv_pages * cache_per_page
-    if budget_bytes < kv_bytes + floor * per_expert_bytes:
+    floor_bytes = floor * per_expert_bytes
+    kv_reserve_bytes = kv_reserve_pages * cache_per_page
+
+    # Smallest possible plan: MoE floor + KV hard reserve. Anything smaller than this cannot run
+    # at all -- raise before clamping so the failure explains WHICH knob to turn.
+    min_needed = floor_bytes + kv_reserve_bytes
+    if budget_bytes < min_needed:
         raise ValueError(
-            f"cache budget too small: declared KV ({kv_pages} pages = {kv_bytes} B) "
-            f"+ {floor} MoE slots does not fit; budget {budget_bytes} B "
-            "(lower --num-tokens or free VRAM)"
+            f"cache budget too small: minimum plan (MoE floor={floor} slots x {per_expert_bytes} B"
+            f" + KV reserve={kv_reserve_pages} pages x {cache_per_page} B) needs {min_needed} B"
+            f" > budget {budget_bytes} B (raise --memory-ratio, lower --kv-reserve-tokens, or free VRAM)"
         )
-    # MoE fills the remainder above the KV reservation, down to the kernel floor, capped
-    # at the declared request and the model's slot ceiling.
+
+    # Clamp declared KV down so MoE floor still fits. ``kv_cap >= kv_reserve_pages`` follows from
+    # the min_needed check above, so the max(...) below never contradicts the cap.
+    declared_kv = declared_pages or 0
+    kv_cap = (budget_bytes - floor_bytes) // cache_per_page
+    kv_pages = max(kv_reserve_pages, min(declared_kv, kv_cap))
+    kv_bytes = kv_pages * cache_per_page
+
+    # MoE takes the remainder, capped at the declared size: declared is the ceiling, the runtime
+    # budget_slide can grow later only if KV idle hands bytes back inside the SAME envelope.
     afford_moe = (budget_bytes - kv_bytes) // per_expert_bytes
     moe = max(floor, min(declared_moe, hi, afford_moe))
-    # pages = the full declared KV reservation (KV-first); the runtime slide then trades
-    # MoE<->KV within this same envelope so max_seq_len can reach the declared length.
     return moe, kv_pages

@@ -683,7 +683,7 @@ class Engine:
             return
         from freetoken.engine.cache_budget import net_cache_budget_bytes, required_bytes
 
-        cache_per_page, pool_fixed, _, _ = self._pool_cls.kv_cost(config)
+        cache_per_page, pool_fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         # Sibling pools (GDN state, MTP bank) allocate their OWN tensors -- they do not
         # carve the arena -- but they consume the same post-weights VRAM, so they enter
         # the CEILING accounting; only the pool's fixed index tiers carve the arena.
@@ -717,11 +717,32 @@ class Engine:
                 + pool_fixed
             )
             budget = min(footprint, ceiling) if footprint > 0 else ceiling
-        # Round to 16 bytes: the fused-copy descriptor requires every bank cache's
-        # data_ptr to be 16-aligned, and the right-anchored packing derives each bank's
-        # offset from the arena END -- a multiple-of-16 length keeps that anchor aligned.
-        budget = (budget + 15) & ~15
+        # Round UP to the lcm of active kernels' READ-contract atoms: the fused-copy descriptor
+        # needs every bank cache's data_ptr aligned, and each backend's tile load has its own
+        # minimum row-stride granularity (Triton 32 / Marlin 64 / b12x 128). Aligning the arena
+        # length to the lcm keeps the right-anchor base aligned AND lets budget_slide's gcd
+        # lattice land on points every backend reads cleanly. Falls back to lcm(32,64,128)=128
+        # when no offload layer is present (dense / owned-cache path).
+        from freetoken.layers.quantization.moe.base import MoEKernel
+        from freetoken.moe.offload_cache import iter_offload_moe_layers
+
+        active_kernels = {
+            layer.quant_method.kernel
+            for layer in iter_offload_moe_layers(self.model)
+            if getattr(layer, "quant_method", None) is not None
+        }
+        align = MoEKernel.align_of(active_kernels) if active_kernels else 128
+        budget = align_ceil(budget, align)
         self._cache_arena = torch.empty(budget, dtype=torch.uint8, device=self.device)
+        # The startup geometry the arena was sized for -- the reference point every later
+        # slide/rebuild proposal is judged against (what was DECLARED vs what fits).
+        logger.info(
+            f"Cache arena {budget:,} B for initial geometry: KV {pages} pages"
+            f" x {cache_per_page:,} B"
+            + (f" ({pages * page_tokens:,} tokens)" if page_tokens else "")
+            + f", MoE {config.moe_cache_size} slots x {per_expert:,} B"
+            + f", pool fixed tiers {pool_fixed:,} B"
+        )
 
     def _fit_declared_cache_sizes(self, config: EngineConfig, banks, method) -> None:
         """Fit the DECLARED cache sizes into the MEASURED byte budget — the explicit-flag
@@ -745,7 +766,12 @@ class Engine:
         num_experts = mc.num_experts
         total_experts = mc.num_moe_layers * num_experts
         max_slots = MARLIN_MAX_CACHE_SIZE if banks.quant_format == "nvfp4_marlin" else total_experts
-        self._arena_per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        # The active kernel's READ atom (lcm over the active set) is what peb must round to so
+        # the arena envelope matches what budget_slide later enforces (also align-aware via
+        # scheduler._build_budget_slider). Without this the boot-fit sees a smaller peb than
+        # the slide does, and slides can land on points that exceed envelope.
+        row_align = method.kernel.row_align_bytes if method is not None else 16
+        self._arena_per_expert_bytes = expert_bytes_per_slot(banks.sources, row_align)
         kv_floor = max(config.kv_reserve_tokens, min_reserve)
         if method is not None:
             # the expert kernel's int32 slot cap also binds a DECLARED size: an over-cap
@@ -757,7 +783,7 @@ class Engine:
             declared_moe=config.moe_cache_size,
             declared_pages=config.num_page_override,
             budget_bytes=budget,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=expert_bytes_per_slot(banks.sources, row_align),
             cache_per_page=cache_per_page,
             kv_reserve_pages=div_ceil(kv_floor, page_tokens),
             num_experts=num_experts,

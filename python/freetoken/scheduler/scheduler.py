@@ -1046,12 +1046,19 @@ class Scheduler(SchedulerIOMixin):
             )
         else:
             from freetoken.engine.cache_budget import expert_bytes_per_slot
-            from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
+            from freetoken.layers.quantization.moe.base import MoEKernel
+            from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE, iter_offload_moe_layers
 
+            active_kernels = {
+                layer.quant_method.kernel
+                for layer in iter_offload_moe_layers(engine.model)
+                if getattr(layer, "quant_method", None) is not None
+            }
+            row_align = MoEKernel.align_of(active_kernels) if active_kernels else 128
             total_experts = mc.num_layers * mc.num_experts
             geometry = dict(
                 cache_per_page=cache_per_page,
-                per_expert_bytes=expert_bytes_per_slot(mc.bank_sources),
+                per_expert_bytes=expert_bytes_per_slot(mc.bank_sources, row_align),
                 num_experts=mc.num_experts,
                 total_experts=total_experts,
                 max_slots=(MARLIN_MAX_CACHE_SIZE if mc.quant_format == "nvfp4_marlin" else total_experts),
