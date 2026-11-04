@@ -212,7 +212,10 @@ class MLAKVCache(BaseKVCachePool):
         slots -- MHAKVCache convention: byte-level so the packed/quantized representation
         round-trips untouched and restore needs no re-quantize. Backing arrays are
         ``[layers, tokens, head]`` / ``[layers, tokens]``, so the gather is along dim 1."""
-        idx = self._row_idx(slots)
+        # Body-device indices: normally host_offload means a host body (CPU idx), but the
+        # pin-failure fallback keeps the body on GPU while the flag stays True -- derive
+        # from the buffer, not the flag (index_copy_ needs all three on one device).
+        idx = self._row_idx(slots).to(self._kv_buffer.device)
         tokens = self._num_pages * self._page_size
         out = {"kv": self._kv_buffer.view(self._num_layers, tokens, -1)[:, idx].cpu()}
         if self._dscale_buffer is not None:
@@ -223,7 +226,7 @@ class MLAKVCache(BaseKVCachePool):
         """Promote a ``snapshot_rows`` payload back into the pool at freshly allocated token
         slots -- the swap-in half. index_copy_ along dim 1 (advanced indexing gathers into a
         temporary, so copying into it never reaches the slab)."""
-        idx = self._row_idx(slots)
+        idx = self._row_idx(slots).to(self._kv_buffer.device)
         tokens = self._num_pages * self._page_size
         n = idx.shape[0]
         # the body device follows the tier: pinned host bodies take host-side copies,
