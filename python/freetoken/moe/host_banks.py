@@ -152,6 +152,32 @@ class HostBank:
         if hasattr(self._buf, "madvise"):  # POSIX only; Windows mmap.mmap has no madvise
             self._buf.madvise(mmap.MADV_DONTNEED)
 
+    def detach(self) -> None:
+        """Fully retire a finished bank: drop its ``_LIVE_BUFFERS`` keep-alive entry and close
+        the mmap, so a tier that re-allocates on resize (the KV host tier) does not accumulate
+        one retained copy per rebuild. Safe once every view of ``tensor`` is dropped -- the
+        pool's rebuild drops the slab views first. Born-pinned cuda banks need nothing extra:
+        their storage rides the tensor refcount.
+        """
+        try:
+            _LIVE_BUFFERS.remove(self._buf)
+        except ValueError:
+            pass
+        if self._pinned and isinstance(self._buf, mmap.mmap):
+            # the driver keys registrations by VA; an unpaired close leaves the range
+            # registered, and the next bank on the reused address would fail pin()
+            try:
+                from freetoken.kernel.pinned import host_unregister
+
+                host_unregister(self.addr)
+            except Exception:
+                pass
+        close = getattr(self._buf, "close", None)
+        if close is not None:
+            close()
+        self._buf = None
+        self.tensor = None
+
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 

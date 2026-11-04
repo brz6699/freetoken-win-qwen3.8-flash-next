@@ -97,20 +97,12 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", arena_bytes: int | None = None,
-        **targets,
+        extra_fixed_bytes: int = 0, extra_note: str = "", **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
         sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
-
-        ``arena_bytes`` is the shared cache arena's actual size: the tighter, PHYSICAL
-        bound (see the arena check below) that the ceiling-based budget check alone does
-        not enforce. The engine passes it for both rebuild and slide paths. The pool's
-        OWN fixed tiers (from kv_cost) carve the arena alongside the pages, so they join
-        ``need`` in the check; sibling pools (GDN state, MTP bank) allocate OUTSIDE the
-        arena and do not.
 
         The base names no family-specific target: the engine forwards the whole request
         bag through ``**targets``, overrides declare the keys they consume (DSV4:
@@ -142,24 +134,6 @@ class BaseKVCachePool(ABC):
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
                 f"needs {mem_GB(need)} > budget {mem_GB(budget)}; old cache kept, still serving"
-            )
-        if arena_bytes and need + fixed_cache_size > arena_bytes:
-            # The physical bound. The budget ceiling is VRAM accounting; the arena is the
-            # one flat block both pools carve (KV left-anchored, MoE banks right-anchored),
-            # allocated ONCE at the cold-start footprint and never grown -- the free VRAM
-            # between the footprint and the ceiling is graph-capture/activation headroom,
-            # not cache space. A target past it makes the two carves alias each other
-            # (observed: MoE banks overlapping -> corrupted expert rows -> garbled output,
-            # because _alloc_slot_cache clamps its right anchor at 0 instead of failing).
-            # The pool's fixed index tiers carve the arena with the pages, so they join
-            # the target's need; the cold geometry is accepted exactly (its footprint +
-            # fixed tiers IS the arena). Reject before teardown so the old cache keeps
-            # serving; no tolerance here -- the arena has no borrowable slack.
-            raise CacheRebuildRejected(
-                f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
-                f"needs {mem_GB(need + fixed_cache_size)} but the shared cache arena is "
-                f"{mem_GB(arena_bytes)} (allocated once at cold start, never grown); "
-                "old cache kept, still serving"
             )
 
     @abstractmethod

@@ -43,6 +43,13 @@ class FLAMetadata:
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
+    # --- MTP verify window; None for every other forward ---
+    # Rows per request in a speculative verify extend, plus the row-block each sequence writes its
+    # per-step snapshots into (its position in the batch). Set by the scheduler so the GDN op
+    # caches each step's state in the pool's verify buffers (LinearStatePool.ensure_verify_rows).
+    verify_rows: int | None = None
+    verify_idx: torch.Tensor | None = None
+
 
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D

@@ -41,6 +41,10 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # Cumulative bytes the KV host tier served to the sparse-index gathers (last-known,
+        # the pool's own lifetime counter). Diff two polls against completion_tokens_total for
+        # bytes decoded token; the tier is behaving when it tracks the selection width.
+        self.gather_bytes = 0
         # MTP speculation lifetime totals, summed once per finished request (the counters ride
         # the terminal reply only). Prometheus-counter semantics: clients diff two polls.
         self.mtp_steps_total = 0
@@ -88,6 +92,8 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        if getattr(reply, "gather_bytes", 0) > 0:
+            self.gather_bytes = reply.gather_bytes
         if getattr(reply, "finished", False):
             # MTP counters arrive only on the terminal reply of MTP-stepped requests; a plain
             # or non-MTP finish has them at 0 and leaves the totals (and the stats node) alone.
@@ -198,6 +204,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "swa": swa,
         "mtp": mtp,
         "vram_bytes": tr.vram_bytes,
+        "gather_bytes": tr.gather_bytes or None,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),

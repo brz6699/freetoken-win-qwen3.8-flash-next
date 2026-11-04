@@ -152,6 +152,24 @@ def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 
 
+def attention_headroom_bytes(backend: str, config: ModelConfig, device) -> int:
+    """Fixed buffers an attention backend constructor allocates on its own, outside
+    any cache arena: the FlashInfer-family float workspace plus slack for the
+    wrappers' int buffers; a small constant for the other families. The engine's
+    arena leaves this much of its ceiling so backend init never OOMs against a
+    fully-eaten ceiling (a huge declared --num-tokens leaves no other remainder)."""
+    total = 0
+    for part in backend.split(","):
+        head = part.strip()
+        if head in ("fi", "trtllm"):
+            from .fi import fi_workspace_bytes
+
+            total += fi_workspace_bytes(config, device) + 64 * 1024 * 1024
+        else:
+            total += 64 * 1024 * 1024
+    return total
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         parts = backend.split(",")

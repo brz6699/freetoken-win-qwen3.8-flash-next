@@ -30,14 +30,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         )
     args = load_args(model_path, max_batch_size=1)
 
-    rope_scaling = {
-        "rope_type": "yarn",
-        "factor": args.rope_factor,
-        "beta_fast": args.beta_fast,
-        "beta_slow": args.beta_slow,
-        "original_max_position_embeddings": args.original_seq_len,
-    }
-
     # Serving ceiling: the HF top-level config's max_position_embeddings (1M on V4-Flash).
     # args.original_seq_len is yarn's PRE-scaling length (64k); the compressed tiers serve
     # original_seq_len * rope_factor positions, so fall back to that product when a checkpoint
@@ -45,6 +37,21 @@ def parse_config(hf_config: Any) -> ModelConfig:
     max_position = int(getattr(hf_config, "max_position_embeddings", 0) or 0)
     if max_position <= 0:
         max_position = int(args.original_seq_len * args.rope_factor)
+
+    return model_config_from_args(args, max_position=max_position)
+
+
+def model_config_from_args(args, *, max_position: int) -> ModelConfig:
+    """The family's :class:`ModelConfig` from built :class:`DeepseekV4Args`: the one
+    construction the HF checkpoint parser and the GGUF parser share, so the two flows
+    cannot drift. ``expert_quant`` is the caller's to override (``ds_fp4`` vs ``gguf``)."""
+    rope_scaling = {
+        "rope_type": "yarn",
+        "factor": args.rope_factor,
+        "beta_fast": args.beta_fast,
+        "beta_slow": args.beta_slow,
+        "original_max_position_embeddings": args.original_seq_len,
+    }
 
     return ModelConfig(
         num_layers=args.n_layers,
@@ -93,4 +100,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["parse_config", "model_config_from_args"]

@@ -4,9 +4,11 @@ from typing import Sequence
 
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.utils import div_even
+from freetoken.utils import div_even, init_logger
 
 from .base import BaseKVCachePool
+
+logger = init_logger(__name__)
 
 
 class MHAKVCache(BaseKVCachePool):
@@ -68,12 +70,24 @@ class MHAKVCache(BaseKVCachePool):
         if self._kv_quant is None and storage_dtype != dtype:
             self._quant_limit = float(torch.finfo(storage_dtype).max)
         self._device = device
+        self._vram_probe("init entry")
         # Shared flat arena (uint8, engine-owned): when set, every buffer below is a view
         # off it instead of a private allocation, so runtime resizes re-slice without ever
         # moving the base address.
         self._arena = arena
         self._arena_next = 0
-        self._kv_buffer = self._arena_alloc(
+        # turbo4 rotation/codebook constants: functional (compute-device, KB-scale) and
+        # independent of where the KV payload lands, so place them BEFORE the body/dscale
+        # host-tier attempt -- under --kv-offload that placement is what pushes the
+        # process's pinned+mapped total to the driver's ceiling, and the tiny constants
+        # must not be the first device work to land on top of that edge state
+        # (DSA pools already build them before their alloc; same order here).
+        if self._kv_quant == "turbo4":
+            self._vram_probe("before turboquant constants")
+            from .turboquant import TurboQuantConstants
+
+            self._tq = TurboQuantConstants(head_dim, device)
+        self._kv_buffer = self._make_body(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, storage_head_dim),
             storage_dtype,
         )
@@ -81,7 +95,7 @@ class MHAKVCache(BaseKVCachePool):
         if self._kv_quant == "turbo4":
             # dequant scales ride the compute dtype (bf16), in their own section after the
             # packed K/V; zero-init so never-written tokens dequant to a finite 0.
-            ds = self._arena_alloc(
+            ds = self._make_dscale(
                 (2, num_storage_layers, num_pages * page_size, local_kv_heads), dtype
             )
             ds.zero_()
@@ -89,10 +103,33 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._storage_shape = (num_pages * page_size, local_kv_heads, storage_head_dim)
-        if self._kv_quant == "turbo4":
-            from .turboquant import TurboQuantConstants
+        self._gather_bytes = 0
+        self._vram_probe("after host tier")
 
-            self._tq = TurboQuantConstants(head_dim, device)
+    def _vram_probe(self, tag: str) -> None:
+        # Startup diagnostic: the true free/allocated/reserved VRAM at the KV-pool
+        # construction brackets. The crash-point ledger (weights + arena) kept coming up
+        # ~6 GiB short of the observed OOM, so measure instead of infer; the two probes
+        # bracket the body/dscale host-tier placement too (a register-tier path that
+        # consumed VRAM would show as free dropping across them).
+        if self._device.type != "cuda":
+            return
+        free_b, total_b = torch.cuda.mem_get_info(self._device)
+        logger.info(
+            f"kv pool VRAM probe [{tag}]: free {free_b / 2**30:.2f} / {total_b / 2**30:.2f} GiB, "
+            f"allocator {torch.cuda.memory_allocated(self._device) / 2**30:.2f} / "
+            f"reserved {torch.cuda.memory_reserved(self._device) / 2**30:.2f} GiB"
+        )
+
+    def _make_body(self, shape, dtype) -> torch.Tensor:
+        """Bulk K/V section -- overridable so a pool family can park it outside the arena
+        (the KV host tier puts it in pinned host RAM). Default: arena/plain alloc as today."""
+        return self._arena_alloc(shape, dtype)
+
+    def _make_dscale(self, shape, dtype) -> torch.Tensor:
+        """turbo4 dequant-scale section; rides whatever placement the body chose so the
+        attend wrappers see one base for rows and scales."""
+        return self._arena_alloc(shape, dtype)
 
     def _arena_alloc(self, shape, dtype) -> torch.Tensor:
         """Next 16-byte-aligned section of the shared arena, viewed as ``dtype``; a plain
@@ -156,14 +193,14 @@ class MHAKVCache(BaseKVCachePool):
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
                 torch.cuda.empty_cache()
-        self._kv_buffer = self._arena_alloc(
+        self._kv_buffer = self._make_body(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim), dtype
         )
         self._dscale_buffer = None
         if ds_dtype is not None:
             # turbo4: scales are geometry-shaped like the token axis; zero-init matches the
             # constructor (never-written tokens must dequant to a finite 0).
-            ds = self._arena_alloc(
+            ds = self._make_dscale(
                 (2, num_storage_layers, num_pages * page_size, local_kv_heads), ds_dtype
             )
             ds.zero_()
@@ -195,6 +232,25 @@ class MHAKVCache(BaseKVCachePool):
         if self._dscale_buffer is not None:
             total += int(self._dscale_buffer.numel() * self._dscale_buffer.element_size())
         return total // tokens, 0
+
+    def count_gather(self, rows: int) -> None:
+        """Fold one decode step's gather volume into the advisory :meth:`gather_bytes`.
+        ``rows`` counts token rows the selection names across the layers that read them."""
+        self._gather_bytes += int(rows) * self._gather_row_bytes()
+
+    def gather_bytes(self) -> int:
+        """Lifetime bytes this pool had to serve to the sparse-index gathers. Advisory: it
+        lets /v1/stats show the reads track the bounded selection width, not the history."""
+        return self._gather_bytes
+
+    def _gather_row_bytes(self) -> int:
+        """Bytes one token row pulls: both K/V halves at the packed storage width, plus the
+        turbo4 dequant scales when that layout is in use."""
+        heads, dim = int(self._storage_shape[1]), int(self._storage_shape[2])
+        row = heads * dim * self._kv_buffer.element_size()
+        if self._dscale_buffer is not None:
+            row += int(self._dscale_buffer.shape[3]) * self._dscale_buffer.element_size()
+        return 2 * row
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -237,6 +293,12 @@ class MHAKVCache(BaseKVCachePool):
     def _gather_host(self, view: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         n = int(idx.numel())
         step = self._tier_step(view, n)
+        if not view.is_cuda:
+            # Host-tier body: the payload already lives on host, so the tier copy is a
+            # host-side row slice -- index with host indices and skip the D2H hop.
+            idx = idx.cpu()
+            parts = [view[:, idx[a:a + step]].clone() for a in range(0, n, step)]
+            return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
         parts = [view[:, idx[a:a + step]].cpu() for a in range(0, n, step)]
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
 
@@ -261,9 +323,18 @@ class MHAKVCache(BaseKVCachePool):
             # stored payload; the extra columns are rows past the restore point -- drop them so
             # index_copy_'s source height matches the index count.
             data = data[:, :n]
+        if not view.is_cuda:
+            # Host-tier body: both sides of the swap are host-resident -- scatter with host
+            # indices and skip the H2D hop (the payloads already sit here).
+            idx = idx.cpu()
+            data = data.cpu()
         step = self._tier_step(view, n)
+        # Destination device is the slab's own: a tiered slab is host-resident, so both the
+        # indices and the payload stay on host and the hop is skipped entirely.
+        dst = view.device
+        idx = idx.to(dst)
         for a in range(0, n, step):
-            view.index_copy_(1, idx[a:a + step], data[:, a:a + step].to(self._device))
+            view.index_copy_(1, idx[a:a + step], data[:, a:a + step].to(dst))
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[self._dense(index)]
@@ -290,6 +361,9 @@ class MHAKVCache(BaseKVCachePool):
         layer_id: int,
     ) -> None:
         dense = self._dense(layer_id)
+        if self._kv_buffer is not None and not self._kv_buffer.is_cuda:
+            self._store_kv_host(dense, k, v, out_loc)
+            return
         if self._kv_quant == "turbo4":
             self._store_kv_turbo4(k, v, out_loc, dense)
             return
@@ -322,6 +396,39 @@ class MHAKVCache(BaseKVCachePool):
             idx,
             v.clamp(-limit, limit).to(buf_dtype).reshape(v.shape[0], -1).view(torch.uint8),
         )
+
+    def _store_kv_host(
+        self, dense: int, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor
+    ) -> None:
+        """Store into a host-resident body (the KV host tier).
+
+        The rows are prepared exactly as in the device path (turbo4 pack / fp8 saturating
+        clamp on the compute device) and then written straight through into the pinned slab
+        by one Triton launch, so no D2H round-trip or host sync sits on the store path."""
+        from freetoken.kernel.triton.host_store import (
+            store_kv_rows_to_host,
+            store_rows_to_host,
+        )
+
+        tokens = self._storage_shape[0]
+        k_dst = self._k_buffer[dense].view(tokens, -1)
+        v_dst = self._v_buffer[dense].view(tokens, -1)
+        if self._kv_quant == "turbo4":
+            kv_heads = int(self._dscale_buffer.shape[3])
+            for source, dst, ds_dst in (
+                (k, k_dst, self._dscale_buffer[0][dense].view(tokens, -1)),
+                (v, v_dst, self._dscale_buffer[1][dense].view(tokens, -1)),
+            ):
+                packed, dscale = self._tq.quantize(source)
+                rows = packed.shape[0] // kv_heads
+                store_rows_to_host(dst, packed.view(rows, -1), out_loc)
+                store_rows_to_host(ds_dst, dscale.view(rows, kv_heads), out_loc)
+            return
+        if self._quant_limit is not None:
+            limit = self._quant_limit
+            k = k.clamp(-limit, limit).to(self._kv_buffer.dtype)
+            v = v.clamp(-limit, limit).to(self._kv_buffer.dtype)
+        store_kv_rows_to_host(k_dst, v_dst, k, v, out_loc)
 
     def _store_kv_turbo4(
         self,

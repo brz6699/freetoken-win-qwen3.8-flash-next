@@ -51,7 +51,15 @@ def _glm_dsa_sparse_kernel(
     HAS_COUNTS: tl.constexpr,
     HAS_ROPE: tl.constexpr,
     PACKED4: tl.constexpr,
+    HOST: tl.constexpr,
+    ET: tl.constexpr,
 ):
+    if HOST:
+        # The latent slab is pinned host memory (--kv-offload): the wrapper passed the
+        # address the GPU must dereference as a plain number, so rebuild the typed pointers.
+        pool_ptr = pool_ptr.to(tl.int64).to(tl.pointer_type(ET))
+        if PACKED4:
+            ds_ptr = ds_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_h = tl.program_id(2)
@@ -269,10 +277,16 @@ def _glm_dsa_splitk_kernel(
     HAS_ROPE: tl.constexpr,
     PACKED4: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    HOST: tl.constexpr,
+    ET: tl.constexpr,
 ):
     """Stage 1 (decode flash-decoding): each program reduces one BLOCK_T-aligned slice of
     the candidate list and writes a normalized [D_V] partial + log-sum-exp. Same structure
     as dsv4's split-k stage, with the two-part 512|64 gather and no window half."""
+    if HOST:
+        pool_ptr = pool_ptr.to(tl.int64).to(tl.pointer_type(ET))
+        if PACKED4:
+            ds_ptr = ds_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     pid_ms = tl.program_id(0)
     pid_m = pid_ms // NUM_SPLITS
     split_id = pid_ms % NUM_SPLITS
@@ -500,6 +514,20 @@ def glm_dsa_sparse_attn(
     else:
         cnt, stride_nb, stride_nm = idx, 0, 0
 
+    # A host-tier slab reaches the kernel as a mapped address, not a tensor (see ple.py).
+    host = not pool_2d.is_cuda
+    if host:
+        from freetoken.kernel.pinned import device_ptr
+        from freetoken.kernel.triton.host_store import host_element_type
+
+        et = host_element_type(pool_2d.dtype)
+        pool_arg = int(device_ptr(pool_2d))
+        ds_arg = int(device_ptr(ds)) if packed4 else cnt
+    else:
+        et = tl.bfloat16
+        pool_arg = pool_2d
+        ds_arg = ds if packed4 else cnt
+
     c0 = float(tq.c0) if packed4 else 0.0
     step = float(tq.step) if packed4 else 1.0
 
@@ -509,7 +537,7 @@ def glm_dsa_sparse_attn(
         mid_lse = q.new_empty(b, m, h, n_splits, dtype=torch.float32)
         grid1 = (m * n_splits, b, triton.cdiv(h, BLOCK_H))
         _glm_dsa_splitk_kernel[grid1](
-            q, pool_2d, mid_o, mid_lse, idx, cnt, ds if packed4 else cnt,
+            q, pool_arg, mid_o, mid_lse, idx, cnt, ds_arg,
             float(softmax_scale), c0, step,
             h, topk,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -521,6 +549,7 @@ def glm_dsa_sparse_attn(
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
             HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, PACKED4=packed4, NUM_SPLITS=n_splits,
+            HOST=host, ET=et,
             num_warps=4, num_stages=2,
         )
         grid2 = (m, b, h)
@@ -546,6 +575,7 @@ def glm_dsa_sparse_attn(
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
             HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, PACKED4=packed4,
+            HOST=host, ET=et,
             num_warps=4, num_stages=2,
         )
 

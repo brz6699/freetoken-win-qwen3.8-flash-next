@@ -23,11 +23,15 @@ fixed and priced through ``kv_cost``'s ``fixed_cache_size``.
 from __future__ import annotations
 
 import math
+import sys
 from typing import Sequence
 
 import torch
+from freetoken.utils import init_logger
 
 from .mha_pool import MHAKVCache
+
+logger = init_logger(__name__)
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
 _INDEX_DTYPE_BYTES = 2
@@ -69,6 +73,7 @@ class QSAKVCache(MHAKVCache):
         kv_quant: str | None = None,
         mrope: bool = False,
         arena: torch.Tensor | None = None,
+        host_offload: bool = False,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -96,6 +101,8 @@ class QSAKVCache(MHAKVCache):
         self._index_dtype = dtype
         self._page_size = page_size
         self._mrope = mrope
+        self._host_offload = host_offload
+        self._host_banks: list = []
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
@@ -111,6 +118,78 @@ class QSAKVCache(MHAKVCache):
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
+
+    # -- bulk body placement (KV host tier) ------------------------------------------
+    # With the tier on, the packed K/V rows and their turbo4 scales live in pinned host
+    # RAM (outside the arena; the body rides the same registered-mmap mechanism as the
+    # expert banks -- see _alloc_host for why not fresh cudaHostAlloc) and the attend
+    # kernels read the selected rows over PCIe through
+    # their existing stride/index paths. The index slab, rings, scratch rows and rope
+    # positions stay device-side: every decode step reads them, the bulk rows only at
+    # the top-k positions the selection already names.
+    def _make_body(self, shape, dtype) -> torch.Tensor:
+        if not self._host_offload:
+            return super()._make_body(shape, dtype)
+        return self._alloc_host(shape, dtype)
+
+    def _make_dscale(self, shape, dtype) -> torch.Tensor:
+        if not self._host_offload:
+            return super()._make_dscale(shape, dtype)
+        return self._alloc_host(shape, dtype)
+
+    def _alloc_host(self, shape, dtype) -> torch.Tensor:
+        # Windows: register-direct from the first byte. By the time the KV tier allocates,
+        # the expert banks and host tables (PLE) have already registered ~97 GiB, putting
+        # total mapped (fresh + registered) against the driver ceiling's edge (~92-104 GiB,
+        # floats with free RAM) -- the fresh cudaHostAlloc attempt then fails on EVERY
+        # kv-offload boot regardless of free RAM, and that failed mapped alloc is what
+        # leaves subsequent small device allocations OOMing with GiB of VRAM still free
+        # (the 2026-11-03 21:35 conv_states crash). Registered mmap has no such ceiling
+        # (banks production >=163 GiB) and reads at the same PCIe roofline. Other platforms
+        # keep fresh-first: cudaHostAlloc succeeds there and skips the boot-time zero+register
+        # pass. backing="mmap" is explicit everywhere -- FREETOKEN_BANK_CUDA_ALLOC is the
+        # banks' born-pinned opt-in and must not route the KV tier back into the fresh pool.
+        from freetoken.moe.host_banks import HostBank
+
+        shape = tuple(int(s) for s in shape)
+
+        def _registered() -> torch.Tensor:
+            bank = HostBank(shape, dtype, backing="mmap")  # lazy mmap: address space only
+            bank.tensor.zero_()  # commit every page; registration demands resident pages
+            bank.pin()
+            self._host_banks.append(bank)
+            logger.info(
+                f"kv host tier: pinned {bank.nbytes / 2**30:.2f} GiB via cudaHostRegister (register-direct)"
+            )
+            return bank.tensor
+
+        if sys.platform.startswith("win"):
+            try:
+                return _registered()
+            except Exception as exc:
+                # Pin quota exhausted: keep serving from VRAM, the tier is an
+                # optimization not a requirement.
+                logger.info(f"kv host tier: pin failed ({exc}), keeping the KV body on GPU")
+                return torch.empty(shape, dtype=dtype, device=self._device)
+        try:
+            from freetoken.kernel.pinned import alloc_pinned_tensor
+
+            return alloc_pinned_tensor(*shape, dtype=dtype)
+        except Exception:
+            try:
+                return _registered()
+            except Exception as exc:
+                logger.info(f"kv host tier: pin failed ({exc}), keeping the KV body on GPU")
+                return torch.empty(shape, dtype=dtype, device=self._device)
+
+    def host_bytes(self) -> int:
+        """Bytes of this pool's bulk KV that live in pinned host RAM."""
+        if not self._host_offload or self._kv_buffer.is_cuda:
+            return 0
+        total = int(self._kv_buffer.numel()) * self._kv_buffer.element_size()
+        if self._dscale_buffer is not None:
+            total += int(self._dscale_buffer.numel()) * self._dscale_buffer.element_size()
+        return total
 
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
@@ -151,6 +230,16 @@ class QSAKVCache(MHAKVCache):
             rope.zero_()
             self._rope_positions = rope
 
+    def _detach_host_banks(self) -> None:
+        # Retire the middle-tier banks of the outgoing generation so each rebuild replaces
+        # its host banks instead of stacking another full KV tier on top (banks ride
+        # _LIVE_BUFFERS for their lifetime; detach() drops that keep-alive). Called before
+        # super().rebuild(), which reads the old slab's geometry, then frees the views --
+        # after that only metadata keeps the tensors alive, so closing the mmaps is safe.
+        for bank in self._host_banks:
+            bank.detach()
+        self._host_banks.clear()
+
     def rebuild(self, num_pages: int) -> None:
         # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
         # empty_cache), then re-derive them at the new page count. If the index alloc itself
@@ -160,6 +249,7 @@ class QSAKVCache(MHAKVCache):
         self._cmp_k_buffer = None
         self._pending_ring = None
         self._rope_positions = None
+        self._detach_host_banks()
         super().rebuild(num_pages)
         self._zero_kv_slabs()
         try:
@@ -171,17 +261,42 @@ class QSAKVCache(MHAKVCache):
             raise
 
     @classmethod
+    def _index_row_bytes_per_token(cls, spec) -> int:
+        """The compressed-shadow term of the per-token price: one 2-byte index row per
+        ``index_ratio`` tokens (mirrors the trailing term of ``spec_kv_bytes_per_token``)."""
+        return spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES // spec.index_ratio
+
+    @classmethod
+    def host_bytes_per_token(cls, config) -> int:
+        """Per-token bytes the host tier parks in pinned RAM: the bulk K/V rows with the
+        index-shadow term (which stays device-side) subtracted."""
+        from .base import spec_kv_bytes_per_token
+
+        total = 0
+        for spec in config.model_config.kv_cache_group_specs():
+            if spec.is_swa:
+                continue
+            total += spec_kv_bytes_per_token(spec, config) - cls._index_row_bytes_per_token(spec)
+        return total
+
+    @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
         from .base import spec_kv_bytes_per_token
         from freetoken.attention import AttnType
 
+        host_offload = bool(getattr(config, "kv_offload", False))
         num_req_slots = config.max_running_req + 1
         per_token = 0
         fixed = 0
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            per_token += spec_kv_bytes_per_token(spec, config)
+            if host_offload:
+                # Bulk rows priced through host_bytes_per_token; VRAM keeps only the
+                # index shadow (the arena fit and the slide both denominate in these).
+                per_token += cls._index_row_bytes_per_token(spec)
+            else:
+                per_token += spec_kv_bytes_per_token(spec, config)
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
@@ -196,7 +311,6 @@ class QSAKVCache(MHAKVCache):
     def unit_bytes(self) -> tuple[int, int]:
         # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
         # the scratch rows are the fixed term kv_cost reports separately.
-        kv, swa = super().unit_bytes()
         tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
         slab = (
             self._num_index_layers
@@ -204,6 +318,8 @@ class QSAKVCache(MHAKVCache):
             * self._index_head_dim
             * self._index_dtype.itemsize
         )
+        offloaded = self._host_offload and not self._kv_buffer.is_cuda
+        kv, swa = (0, 0) if offloaded else super().unit_bytes()
         return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
 
     def snapshot_rows(self, slots: torch.Tensor) -> dict[str, torch.Tensor]:

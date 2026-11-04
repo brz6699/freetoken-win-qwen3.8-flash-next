@@ -128,6 +128,8 @@ def create_kv_pool(
         ),
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         arena=arena,
+        # sparse-index families only; the base MHA/SWA/DSV4 paths ignore it
+        host_offload=bool(getattr(config, "kv_offload", False)),
     )
 
 
@@ -142,6 +144,7 @@ def create_kvcache_pool(
     kv_dtype: torch.dtype | None = None,
     kv_quant: str | None = None,
     arena: torch.Tensor | None = None,
+    host_offload: bool = False,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -233,6 +236,7 @@ def create_kvcache_pool(
             kv_quant=kv_quant,
             mrope=model_config.model_is_mrope,
             arena=arena,
+            host_offload=host_offload,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -255,6 +259,7 @@ def create_kvcache_pool(
                 layer_ids=layer_ids,
                 kv_dtype=kv_dtype,
                 kv_quant=kv_quant,
+                host_offload=host_offload,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.

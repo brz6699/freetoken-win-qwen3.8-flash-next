@@ -132,6 +132,11 @@ class EngineConfig:
     # index keys stay bf16. QSA models (Qwen3.8-Flash-Next) only -- enforced by the engine.
     # Every per-byte budget formula must price kv_dtype/kv_cache_dtype, never dtype.
     kv_cache_dtype: str = "bf16"
+    # Host-RAM KV offload for the sparse-index cache lines only (QSA, MLA/DSA/Kpool), mirroring
+    # how the MoE expert banks live in host RAM: bulk KV rows are pinned host memory and the GPU
+    # keeps the index slabs plus a hot window sized from max_running_req, so long contexts stop
+    # competing with MoE expert slots for VRAM. Other cache managers ignore it.
+    kv_offload: bool = False
 
 
     @property

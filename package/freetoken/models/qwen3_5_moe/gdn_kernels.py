@@ -73,4 +73,39 @@ def gdn_decode_fla(
     return o[0]
 
 
-__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla"]
+def gdn_verify_fla(
+    q: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16
+    k: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16
+    v: torch.Tensor,        # [1, total, num_v_heads, head_v_dim] bf16
+    a: torch.Tensor,        # [total, num_v_heads] raw
+    b: torch.Tensor,        # [total, num_v_heads] raw
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_source: torch.Tensor,  # [num_slots, num_v_heads, k, v] (in place, ends at the last row)
+    indices: torch.Tensor,       # [num_seqs] live slot per sequence
+    cu_seqlens: torch.Tensor,    # [num_seqs+1] query indptr
+    scale: float,
+    snap_buffer: torch.Tensor,   # [num_slots, ROWS, num_v_heads, k, v] per-step snapshot rows
+    snap_indices: torch.Tensor,  # [num_seqs] snapshot row-block per sequence (= live slot)
+) -> torch.Tensor:
+    """The recurrent half of a speculative verify forward: ``K+1`` rows per request walked by the
+    fused recurrent kernel, which caches the state AFTER each step into
+    ``snap_buffer[idx, step]`` while still leaving the live slot at the final state. The commit
+    then selects the accepted prefix's row instead of re-running that prefix through the model.
+
+    Returns ``o`` of shape ``[total, num_v_heads, head_v_dim]``, like the chunk path."""
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+    o = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log, a=a, dt_bias=dt_bias,  # already fp32 (stored fp32)
+        softplus_beta=1.0, softplus_threshold=20.0,
+        q=q, k=k, v=v, b=b,
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens.to(torch.int64),
+        intermediate_states_buffer=snap_buffer, intermediate_state_indices=snap_indices,
+    )
+    return o[0]  # [total, num_v, V]
+
+
+__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla", "gdn_verify_fla"]

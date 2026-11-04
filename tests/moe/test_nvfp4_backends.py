@@ -9,16 +9,15 @@ Coverage by hardware:
   - Triton (any CUDA GPU): prefill + the production fast decode GEMV, plus a fast-vs-
     baseline-kernel equality guard. This is the path used on sm_120 + CUDA 12.x.
   - Marlin (sm_80..sm_99, e.g. H100): prefill + decode + overlap.
-  - b12x (sm_120 + CUDA>=13): pack + fused decode, skipped where the kernel cannot run.
-  - Gluon (sm_120): the prefill GEMMs it takes over from the Triton kernel, against that kernel, and the W4A4 prefill
-    against a torch emulation of its NVFP4 activation rounding.
-Banks are built the way the loader builds them: the bound kernel object packs native pieces.
+  - b12x (sm_120 + CUDA>=13): pure-torch pack everywhere; the fused decode forward is
+    gated and skipped where the kernel cannot run.
+The ``--nvfp4-backend`` selection + CUDA-13 gate is checked without a GPU.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import math
+import types
 
 import pytest
 import torch
@@ -64,9 +63,9 @@ def _make_native_sources(device: torch.device, seed: int = 0) -> dict[str, list[
     def rand_scale(*shape):
         return (torch.rand(*shape, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
 
-    gate_up_global = torch.full((total, 2 * I), 1.0, dtype=torch.float32)
+    gate_up_global = torch.full((total, 2 * I), 1.0, dtype=torch.float16)
     gate_up_global[:, I:] = 0.5  # w3 global != w1 global: exercises the alpha fold
-    down_global = torch.full((total, H), 0.75, dtype=torch.float32)
+    down_global = torch.full((total, H), 0.75, dtype=torch.float16)
     flat = {
         "gate_up_packed": rand_u8(total, 2 * I, H // 2),
         "gate_up_scale": rand_scale(total, 2 * I, H // 16),
@@ -118,63 +117,33 @@ def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu
     return out
 
 
-def _bound_layer(kernel: str):
-    """An NVFP4 offload layer with ``kernel`` bound, as the engine binds it."""
-    from freetoken.distributed import set_tp_info, try_get_tp_info
-    from freetoken.layers.moe import OffloadMoELayer
-    from freetoken.layers.quantization import QuantBackend, QuantConfig, set_quant_backend
-
-    if try_get_tp_info() is None:
-        set_tp_info(0, 1)
-    set_quant_backend(QuantBackend.parse(f"moe.nvfp4={kernel}"))
-    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
-    return OffloadMoELayer(0, E, TOPK, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
-
-
-def _pieces(sources):
-    for layer_id in range(L):
-        yield layer_id, 0, E, {
-            "gate_up": sources["gate_up_packed"][layer_id],
-            "gate_up_scale": sources["gate_up_scale"][layer_id],
-            "gate_up_global": sources["gate_up_global"][layer_id],
-            "down": sources["down_packed"][layer_id],
-            "down_scale": sources["down_scale"][layer_id],
-            "down_global": sources["down_global"][layer_id],
-        }
-
-
-def _packed_cache(device, kernel: str, *, seed=0, cache_size=S, prefill_overlap=False):
-    """Native sources packed by ``kernel`` into an offload cache; the sources stay the dequant reference."""
-    from freetoken.moe.expert_banks import build_expert_banks
+def _marlin_cache(device, *, cache_size=S, prefill_overlap=False):
+    from freetoken.moe.nvfp4_backends import marlin_repack_sources_inplace
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    sources = _make_native_sources(device, seed=seed)
-    layer = _bound_layer(kernel)
-    banks = build_expert_banks(layer.quant_method, L, _pieces(sources), device=device)
+    sources = _make_native_sources(device)
+    ref_sources = {k: [t.clone() for t in v] for k, v in sources.items()}  # repack is in place
+    cfg = types.SimpleNamespace(hidden_size=H, moe_intermediate_size=I)
+    packed = marlin_repack_sources_inplace(sources, cfg, device, chunk=5)
+
     cache = OffloadMoeCache(
         num_layers=L,
         num_experts=E,
         cache_size=cache_size,
         device=device,
-        quant_format=banks.quant_format,
+        quant_format="nvfp4_marlin",
         prefill_overlap=prefill_overlap,
-        layout=banks.layout,
-        max_slots=layer.quant_method.slot_limit(),
     )
-    cache.set_bank_sources(banks.sources)
-    cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+    cache.set_bank_sources({name: packed[name] for name in cache.bank_schema})
+    cache.set_alphas(packed["gate_up_alpha"], packed["down_alpha"])
     cache.reset()
-    return cache, sources
-
-
-def _marlin_cache(device, *, cache_size=S, prefill_overlap=False):
-    return _packed_cache(device, "marlin", cache_size=cache_size, prefill_overlap=prefill_overlap)
+    return cache, ref_sources
 
 
 @cuda
 @marlin
 def test_marlin_prefill_matches_dequant_reference():
-    from freetoken.layers.quantization.moe.nvfp4 import marlin_fused_experts
+    from freetoken.moe.nvfp4_backends import marlin_fused_experts
 
     device = torch.device("cuda")
     cache, ref_sources = _marlin_cache(device)
@@ -190,7 +159,7 @@ def test_marlin_prefill_matches_dequant_reference():
     cache.materialize_layer(0)
     cache.copy_missing()
     g1, g2 = cache.alphas_for_layer(0)
-    gu_p, gu_s, dn_p, dn_s = cache.stage_views(0, 0)
+    gu_p, gu_s, dn_p, dn_s = cache.bank_views(E)
     out = marlin_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
         topk_weights, topk_ids, "silu", False,
@@ -203,7 +172,7 @@ def test_marlin_prefill_matches_dequant_reference():
 def test_marlin_decode_matches_dequant_reference_after_prefill_stomp():
     """Decode through the slot cache, including the request-B-after-request-A pattern
     that B1 guarded against: a layer-1 full-layer prefill between two layer-0 decodes."""
-    from freetoken.layers.quantization.moe.nvfp4 import marlin_fused_experts
+    from freetoken.moe.nvfp4_backends import marlin_fused_experts
 
     device = torch.device("cuda")
     cache, ref_sources = _marlin_cache(device)
@@ -217,7 +186,7 @@ def test_marlin_decode_matches_dequant_reference_after_prefill_stomp():
         cache.ensure_experts(layer_id, ids)  # rewrites ids -> slots in place
         cache.copy_missing()
         g1, g2 = cache.alphas_for_slots(layer_id)
-        gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(layer_id)
+        gu_p, gu_s, dn_p, dn_s = cache.bank_views()
         out = marlin_fused_experts(
             hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
             topk_weights, ids, "silu", False,
@@ -242,7 +211,7 @@ def test_marlin_overlap_prefill_matches_dequant_reference():
     (cache_size == 2E, so every slot is buffer-backed): if the prefetch failed to
     invalidate them, the post-prefill decode would "hit" stale mappings and read other
     experts' bytes; we assert it misses both experts instead."""
-    from freetoken.layers.quantization.moe.nvfp4 import marlin_fused_experts
+    from freetoken.moe.nvfp4_backends import marlin_fused_experts
 
     device = torch.device("cuda")
     cache, ref_sources = _marlin_cache(device, cache_size=2 * E, prefill_overlap=True)
@@ -281,7 +250,7 @@ def test_marlin_overlap_prefill_matches_dequant_reference():
     assert int(cache.num_indices.item()) == 2, "stale slot mappings survived the prefetch"
     cache.copy_missing()
     g1, g2 = cache.alphas_for_slots(0)
-    gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(0)
+    gu_p, gu_s, dn_p, dn_s = cache.bank_views()
     out = marlin_fused_experts(
         dec_hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
         dec_weights, ids, "silu", False,
@@ -369,146 +338,6 @@ def test_triton_swigluoai_matches_dequant_reference():
     _assert_close(out, ref)
 
 
-@cuda
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="needs sm_120")
-@pytest.mark.parametrize("hidden_size,inter", [(256, 128), (384, 192)])
-@pytest.mark.parametrize("block_m", [64, 128])
-def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter, block_m):
-    """Both prefill GEMMs go to the Gluon kernel and match the Triton kernel: persistent (BLOCK_SIZE_M 64) and not (128), 256- and 128-row tiles, K % 256 == 0 and not."""
-    import freetoken.moe.fused_nvfp4 as fused_nvfp4
-    from freetoken.kernel import gluon, nvfp4_moe
-
-    if not gluon.available():
-        pytest.skip(f"Gluon is off or needs Triton {'.'.join(map(str, gluon.TRITON_VERSION))}")
-    from freetoken.kernel.gluon.nvfp4.moe import sm120
-
-    # the GPU class picks BLOCK_SIZE_M from tokens per expert; pin it so every sm_120 class runs both kernel modes
-    config = nvfp4_moe.prefill_config
-    monkeypatch.setattr(nvfp4_moe, "prefill_config", lambda *args: {**config(*args), "BLOCK_SIZE_M": block_m})
-
-    device = torch.device("cuda")
-    g = torch.Generator(device=device).manual_seed(0)
-
-    def bank(n, k):
-        packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
-        scale = (torch.rand(E, n, k // 16, device=device, generator=g) + 0.25).to(torch.float8_e4m3fn)
-        return packed, scale, torch.rand(E, n, device=device, generator=g) + 0.5
-
-    banks = (*bank(2 * inter, hidden_size), *bank(hidden_size, inter))
-    M = 1024
-    hidden = torch.randn(M, hidden_size, dtype=torch.bfloat16, device=device, generator=g) / 4
-    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device, generator=g)
-    topk_weights = torch.rand(M, TOPK, device=device, generator=g)
-
-    calls = []
-    gluon_gemm = sm120.prefill_gemm
-
-    def counted(*args):
-        calls.append(args)
-        return gluon_gemm(*args)
-
-    monkeypatch.setattr(sm120, "prefill_gemm", counted)
-    out = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
-    assert len(calls) == 2
-    monkeypatch.setattr(nvfp4_moe, "_gluon_prefill", lambda device_index: None)
-    ref = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
-    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
-
-
-def _round_e2m1(v: torch.Tensor) -> torch.Tensor:
-    """Round to the nearest e2m1 value, ties to the even code, saturating at 6 (cvt.rn.satfinite)."""
-    grid = _E2M1[:8].to(v.device)
-    a = v.abs().clamp(max=6.0)
-    hi = torch.searchsorted(grid, a.contiguous()).clamp(max=7)
-    lo = (hi - 1).clamp(min=0)
-    d_lo, d_hi = a - grid[lo], grid[hi] - a
-    code = torch.where(d_lo < d_hi, lo, torch.where(d_hi < d_lo, hi, torch.where(lo % 2 == 0, lo, hi)))
-    return torch.copysign(grid[code], v)
-
-
-def _nvfp4_qdq(x: torch.Tensor, g: float) -> torch.Tensor:
-    """x [R, K] through NVFP4 under the static global g, back to fp32."""
-    xb = x.float().view(x.shape[0], -1, 16)
-    # fp32 scalar math like the kernels: a one-ulp difference in 6 * g can flip an e4m3 block scale
-    g = torch.tensor(g, dtype=torch.float32, device=x.device)
-    sf = ((xb.abs().amax(-1) / (6.0 * g)).to(torch.float8_e4m3fn).float() * g).unsqueeze(-1)
-    inv = torch.where(sf > 0, 1.0 / sf, torch.zeros_like(sf))
-    return (_round_e2m1(xb * inv) * sf).view_as(x)
-
-
-def _gated_ref(h: torch.Tensor, activation: str, inter: int, alpha: float, limit: float) -> torch.Tensor:
-    gate, up = h[:, :inter], h[:, inter:]
-    if activation == "gelu_tanh":
-        return torch.nn.functional.gelu(gate, approximate="tanh") * up
-    if activation in ("swiglu_clamp", "swigluoai"):
-        gate = gate.clamp(max=limit)
-        return gate * torch.sigmoid(alpha * gate) * (up.clamp(-limit, limit) + (activation == "swigluoai"))
-    return torch.nn.functional.silu(gate) * up
-
-
-@cuda
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="needs sm_120")
-@pytest.mark.parametrize("hidden_size,inter,activation,tokens", [
-    (256, 128, "silu", 256), (320, 192, "gelu_tanh", 1024), (512, 1024, "swiglu_clamp", 256), (256, 128, "swigluoai", 256),
-])
-def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, activation, tokens):
-    """The w4a4 kernel from checkpoint pieces to the prefill output, against a torch emulation of the same NVFP4 activation rounding.
-
-    Covers 256- / 128-row gated tiles, K % 256 != 0 in both GEMMs, the persistent down GEMM (I < 1024) and the other one, BLOCK_SIZE_M 64 and 128.
-    """
-    from types import SimpleNamespace
-
-    from freetoken.kernel import nvfp4_moe
-    from freetoken.layers.quantization.moe.base import ExpertView, MoEConfig
-    from freetoken.layers.quantization.moe.nvfp4 import W4a4Nvfp4MoEKernel
-
-    device = torch.device("cuda")
-    if not nvfp4_moe.w4a4_available(device.index or 0):
-        pytest.skip("the W4A4 Gluon kernels need Triton's Gluon on sm_120")
-    alpha, limit = (1.5, 2.0) if activation in ("swiglu_clamp", "swigluoai") else (1.0, None)
-    g = torch.Generator(device=device).manual_seed(0)
-
-    def bank(n, k):
-        packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
-        scale = (torch.rand(E, n, k // 16, device=device, generator=g) + 0.25).to(torch.float8_e4m3fn)
-        return packed, scale, torch.rand(E, n, device=device, generator=g) * 0.02 + 0.01
-
-    gu, gus, gug = bank(2 * inter, hidden_size)
-    dn, dns, dng = bank(hidden_size, inter)
-    hidden = torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device=device, generator=g)
-    topk_ids = torch.randint(0, E, (tokens, TOPK), dtype=torch.int32, device=device, generator=g)
-    topk_weights = torch.rand(tokens, TOPK, device=device, generator=g)
-
-    # static scales near a calibration's amax / (6 * 448), off by an irrational factor: with amax / 2688 itself many values sit exactly on an
-    # e2m1 midpoint, where the kernel's approximate fp32 reciprocal and torch's exact one round apart; per expert, below the max for some experts
-    g1 = float(hidden.float().abs().max()) / 2688 * math.pi / 3
-    xq = _nvfp4_qdq(hidden, g1)
-    w_gu = torch.stack([_dequant_ref(gu[e], gus[e], gug[e]) for e in range(E)])
-    w_dn = torch.stack([_dequant_ref(dn[e], dns[e], dng[e]) for e in range(E)])
-    routes = topk_ids.reshape(-1).long()
-    h = torch.bmm(w_gu[routes], xq.repeat_interleave(TOPK, 0).unsqueeze(-1)).squeeze(-1).bfloat16().float()
-    act = _gated_ref(h, activation, inter, alpha, limit or 0.0).bfloat16().float()
-    g2 = float(act.abs().max()) / 2688 * math.pi / 3
-    ref = torch.bmm(w_dn[routes], _nvfp4_qdq(act, g2).unsqueeze(-1)).squeeze(-1)
-    ref = (ref * topk_weights.reshape(-1, 1)).view(tokens, TOPK, hidden_size).sum(1)
-
-    def input_scale(top):
-        return torch.full((E, 1), top, device=device).index_fill_(0, torch.tensor([1, 2], device=device), top / 2)
-
-    pieces = {"gate_up": gu, "gate_up_scale": gus, "gate_up_global": gug, "down": dn, "down_scale": dns, "down_global": dng,
-              "gate_input": input_scale(g1), "up_input": input_scale(g1).roll(1, 0), "down_input": input_scale(g2)}
-    cfg = MoEConfig(num_experts=E, hidden=hidden_size, intermediate=inter, top_k=TOPK, activation=activation, alpha=alpha, limit=limit)
-    kernel = W4a4Nvfp4MoEKernel()
-    layout = kernel.layout(cfg)
-    banks = {role: torch.empty((E, *spec.shape), dtype=spec.dtype, device=device) for role, spec in layout.items() if not spec.resident}
-    alphas = kernel.pack(pieces, cfg, banks)
-    view = ExpertView(banks, n=E, alphas=(alphas["gate_up_alpha"], alphas["down_alpha"]))
-    layer = SimpleNamespace(activation=activation, alpha=alpha, limit=limit, apply_router_weight_on_input=False)
-    out = kernel.apply(layer, hidden, topk_weights, topk_ids, view, is_prefill=True)
-    assert torch.equal(alphas["gate_up_alpha"], torch.maximum(pieces["gate_input"], pieces["up_input"]).squeeze(1))
-    torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
-
-
 def _triton_cache(device, *, cache_size=S, prefill_overlap=False):
     """Native 6-bank NVFP4 cache (no repack), consumed directly by the Triton kernels.
     The banks are not transformed, so ``sources`` doubles as the dequant reference."""
@@ -546,7 +375,7 @@ def test_triton_decode_marlin_matches_dequant_reference_after_prefill_stomp():
         ref = _ref_moe(ref_sources, layer_id, hidden, topk_weights, ids)
         cache.ensure_experts(layer_id, ids)  # rewrites ids -> slots in place
         cache.copy_missing()
-        gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.pool_bank_views(layer_id)
+        gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.bank_views()
         out = fused_experts_decode_nvfp4_marlin(
             hidden, gu_p, gu_s, gu_g, dn_p, dn_s, dn_g, topk_weights, ids, "silu", False
         )
@@ -576,24 +405,55 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     ids = torch.tensor([[1, 6]], dtype=torch.int32, device=device)
     cache.ensure_experts(0, ids)
     cache.copy_missing()
-    banks = cache.pool_bank_views(0)
+    banks = cache.bank_views()
     marlin = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids, "silu", False)
     base = fused_experts_decode_nvfp4_serial(hidden, *banks, topk_weights, ids, "silu", False)
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
+
+
+def test_nvfp4_backend_selection():
+    """--nvfp4-backend selection + the flashinfer/marlin device gates -- runs without a GPU
+    via the CPU branch (forced backends need a usable device, so they error loudly there)."""
+    from freetoken.moe.nvfp4_backends import select_nvfp4_backend
+
+    cpu = torch.device("cpu")
+    assert select_nvfp4_backend(cpu, None, "triton") == "triton"
+    assert select_nvfp4_backend(cpu, None, "auto") == "triton"  # auto on CPU
+    with pytest.raises(RuntimeError):
+        select_nvfp4_backend(cpu, None, "flashinfer")  # b12x needs a CUDA device
+    with pytest.raises(RuntimeError):
+        select_nvfp4_backend(cpu, None, "marlin")  # marlin needs a CUDA device
+    with pytest.raises(ValueError):
+        select_nvfp4_backend(cpu, None, "bogus")
 
 
 @cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
     vs the dequant reference (skipped on hardware/toolkits where b12x cannot run)."""
-    from freetoken.layers.quantization.moe.nvfp4 import _b12x_unusable_reason, b12x_fused_experts
+    from freetoken.moe.nvfp4_backends import (
+        _b12x_unusable_reason,
+        b12x_fused_experts,
+        b12x_repack_sources_inplace,
+    )
+    from freetoken.moe.offload_cache import OffloadMoeCache
 
     device = torch.device("cuda")
     reason = _b12x_unusable_reason(torch.cuda.get_device_capability(device))
     if reason is not None:
         pytest.skip(f"b12x not runnable here: {reason}")
 
-    cache, ref_sources = _packed_cache(device, "b12x", seed=8)
+    sources = _make_native_sources(device, seed=8)
+    ref_sources = {k: [t.clone() for t in v] for k, v in sources.items()}  # repack is in place
+    cfg = types.SimpleNamespace(hidden_size=H, moe_intermediate_size=I)
+    packed = b12x_repack_sources_inplace(sources, cfg, device, chunk=6)
+
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=S, device=device, quant_format="nvfp4_b12x"
+    )
+    cache.set_bank_sources({name: packed[name] for name in cache.bank_schema})
+    cache.set_alphas(packed["gate_up_alpha"], packed["down_alpha"])
+    cache.reset()
 
     torch.manual_seed(2)
     hidden = torch.randn(1, H, dtype=torch.bfloat16, device=device) / 4
@@ -604,7 +464,7 @@ def test_b12x_decode_matches_dequant_reference():
     cache.ensure_experts(0, ids)
     cache.copy_missing()
     g1, g2 = cache.alphas_for_slots(0)
-    gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(0)
+    gu_p, gu_s, dn_p, dn_s = cache.bank_views()
     out = b12x_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2, topk_weights, ids, "silu", False
     )
@@ -612,23 +472,27 @@ def test_b12x_decode_matches_dequant_reference():
 
 
 @cuda
-def test_dummy_nvfp4_banks_match_the_triton_layout():
-    """--use-dummy-weight banks follow the bound kernel's layout (shapes, dtypes, pinning)."""
-    from freetoken.moe.expert_banks import build_expert_banks
+def test_dummy_nvfp4_sources_match_loader_contract():
+    """--use-dummy-weight banks must match the real loader's shapes/dtypes/pinning so the
+    engine repack/offload path is exercised unchanged. The marlin repack + offload gather
+    tail (which needs vllm) lives in test_dummy_nvfp4_sources_marlin_repack."""
+    from freetoken.models.weight import dummy_nvfp4_expert_sources
 
-    layer = _bound_layer("triton")
-    banks = build_expert_banks(layer.quant_method, L, None, device=torch.device("cuda"), dummy=True)
+    cfg = types.SimpleNamespace(
+        num_layers=L, num_experts=E, hidden_size=H, moe_intermediate_size=I
+    )
+    sources = dummy_nvfp4_expert_sources(cfg)
     expected = {
-        "gate_up": ((E, 2 * I, H // 2), torch.uint8),
+        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
         "gate_up_scale": ((E, 2 * I, H // 16), torch.float8_e4m3fn),
-        "gate_up_global": ((E, 2 * I), torch.float32),
-        "down": ((E, H, I // 2), torch.uint8),
+        "gate_up_global": ((E, 2 * I), torch.float16),
+        "down_packed": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 16), torch.float8_e4m3fn),
-        "down_global": ((E, H), torch.float32),
+        "down_global": ((E, H), torch.float16),
     }
-    assert banks.sources.keys() == expected.keys()
+    assert sources.keys() == expected.keys()
     for name, (shape, dtype) in expected.items():
-        layers = banks.sources[name]
+        layers = sources[name]
         assert len(layers) == L, (name, len(layers))
         for t in layers:
             assert t.shape == shape and t.dtype == dtype and t.is_pinned(), name
@@ -636,42 +500,54 @@ def test_dummy_nvfp4_banks_match_the_triton_layout():
 
 @cuda
 @marlin
-def test_dummy_nvfp4_banks_marlin_pack_gathers_zero_copy():
-    """Dummy banks packed by marlin drop into the offload gather path like the real loader's."""
-    from freetoken.moe.expert_banks import build_expert_banks
+def test_dummy_nvfp4_sources_marlin_repack():
+    """The --use-dummy-weight banks drop into the same marlin repack + offload path as the
+    real loader's (in-place repack). The gather kernel reads the banks zero-copy from the
+    GPU, which requires the allocator's memory to be device-mapped, not merely page-locked."""
+    from freetoken.models.weight import dummy_nvfp4_expert_sources
+    from freetoken.moe.nvfp4_backends import marlin_repack_sources_inplace
     from freetoken.moe.offload_cache import OffloadMoeCache
 
+    cfg = types.SimpleNamespace(
+        num_layers=L, num_experts=E, hidden_size=H, moe_intermediate_size=I
+    )
+    sources = dummy_nvfp4_expert_sources(cfg)
+
     device = torch.device("cuda")
-    layer = _bound_layer("marlin")
-    banks = build_expert_banks(layer.quant_method, L, None, device=device, dummy=True)
-    assert torch.isfinite(banks.gate_up_alpha.float()).all()
-    assert torch.isfinite(banks.down_alpha.float()).all()
+    packed = marlin_repack_sources_inplace(sources, cfg, device, chunk=5)
+    assert torch.isfinite(packed["gate_up_alpha"].float()).all()
+    assert torch.isfinite(packed["down_alpha"].float()).all()
 
     cache = OffloadMoeCache(
-        num_layers=L, num_experts=E, cache_size=S, device=device, quant_format=banks.quant_format,
-        layout=banks.layout, max_slots=layer.quant_method.kernel.max_slots,
+        num_layers=L, num_experts=E, cache_size=S, device=device, quant_format="nvfp4_marlin"
     )
-    cache.set_bank_sources(banks.sources)
-    cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+    cache.set_bank_sources({name: packed[name] for name in cache.bank_schema})
+    cache.set_alphas(packed["gate_up_alpha"], packed["down_alpha"])
     cache.reset()
     cache.materialize_layer(0)
     cache.copy_missing()
     torch.cuda.synchronize()
-    assert torch.equal(cache.bank_caches["gate_up"][:E].cpu(), banks.sources["gate_up"][0])
+    assert torch.equal(cache.bank_caches["gate_up_packed"][:E].cpu(), packed["gate_up_packed"][0])
 
 
 @cuda
 @pytest.mark.slow
-def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
-    """The b12x pack is pure torch: its banks stay per-layer lists with flat [L*E] alphas."""
-    from freetoken.layers.quantization.moe.nvfp4 import _b12x_unusable_reason
+def test_b12x_pack_is_byte_compatible_with_native_banks():
+    """The b12x kernel needs sm_120, but its pack is pure torch: verify the prepared
+    blocks drop into the native banks byte-for-byte (the in-place repack contract)."""
+    from freetoken.moe.nvfp4_backends import b12x_repack_sources_inplace
 
     device = torch.device("cuda")
-    reason = _b12x_unusable_reason(torch.cuda.get_device_capability(device))
-    if reason is not None:
-        pytest.skip(f"b12x not runnable here: {reason}")
-    cache, _ = _packed_cache(device, "b12x", seed=3)
+    sources = _make_native_sources(device, seed=3)
+    cfg = types.SimpleNamespace(hidden_size=H, moe_intermediate_size=I)
+    try:
+        packed = b12x_repack_sources_inplace(sources, cfg, device, chunk=6)
+    except Exception as exc:  # pragma: no cover - depends on flashinfer internals
+        pytest.skip(f"flashinfer w4a16 prepare unavailable off-target: {exc}")
     total = L * E
-    assert len(cache.bank_sources["gate_up"]) == L
-    assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
-    assert cache.gate_up_alpha.shape == (total,)
+    # packed banks stay per-layer lists; alphas are the one flat [L*E] exception (see
+    # cache_budget.expert_bytes_per_slot).
+    assert len(packed["gate_up_packed"]) == L
+    assert sum(t.shape[0] for t in packed["gate_up_packed"]) == total
+    assert packed["gate_up_alpha"].shape == (total,)
+    assert packed["down_packed"][0].dtype == torch.int32

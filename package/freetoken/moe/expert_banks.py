@@ -50,6 +50,8 @@ class ExpertBanks:
     layout: dict | None = None
     # per-layer quant tag (e.g. the gate_up and down GGUF types), for layers whose banks match in dtype and row shape but not in quant; None = one quant
     layer_tags: list | None = None
+    # per-role MMQ tail bytes ggml reads past the last element of a packed bank ({role: [bytes per layer]}); None = no tail needed
+    row_tail_bytes: dict[str, list[int]] | None = field(default=None)
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -198,6 +200,15 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
+    if method.kind is QuantKind.GGUF:
+        # GGUF banks are per-layer by construction (each layer carries its own ggml types, so its
+        # packed row widths differ): the GGUF-native provider shapes every layer's banks from its
+        # own tensors and tags them, which one sampled layout cannot express. Host banks for the
+        # offload cache; residency settles through the ambient plan in the provider's PinPipeline.
+        from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+        dense_prefix = getattr(model_config, "num_layers", num_layers) - num_layers
+        return load_gguf_expert_banks(model_path, num_layers, first_layer=dense_prefix, dummy=dummy)
     if dummy:
         return build_expert_banks(method, num_layers, None, device=device, dummy=True)
     pieces = iter_expert_pieces(

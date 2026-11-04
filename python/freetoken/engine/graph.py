@@ -131,6 +131,9 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
+        # Declared BEFORE capture so the graphs-disabled path (early return in
+        # _capture_graphs) still has the attribute the replay guard reads.
+        self.buffer = None
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -202,7 +205,10 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        # ``buffer is None`` = graphs were torn down (a rebuild that failed midway leaves the
+        # old runner latched with nothing captured). Treat that as "graphs disabled" so the
+        # next forward runs eager instead of crashing on the missing static buffer.
+        return self.buffer is not None and batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

@@ -45,6 +45,9 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # Lifetime bytes the KV host tier served to the sparse-index gathers (cumulative). Shows
+    # the tier's reads scale with the bounded selection window, not the context length.
+    gather_bytes: int = 0
     # MTP speculation counters of a finished request (steps / drafted / accepted / first-position
     # matches / fully accepted steps), attached once on the terminal reply and folded by the
     # StatsTracker into the /v1/stats `mtp` section. All 0 on the plain path.

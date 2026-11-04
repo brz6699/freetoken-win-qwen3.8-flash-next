@@ -461,6 +461,7 @@ class OffloadMoeCache:
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
         layer_tags: list | None = None,
+        row_tail_bytes: dict[str, list[int]] | None = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -506,24 +507,31 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        # Resolve each layer's own layout key BEFORE validating: layers may legitimately differ in
+        # a bank's COLUMN width -- the packed ggml row_bytes depend on each layer's ggml type --
+        # as long as every layer sharing a key agrees. The sampled kernel layout stays the
+        # reference for dtype, rank and row counts; the last (column) dim is per-layer.
+        keys = bank_layouts(sources, layer_tags)
+        unique = list(dict.fromkeys(keys))
+        self.layouts = [banks for _, banks in unique]
+        self.layer_layout = [unique.index(key) for key in keys]
+        role_order = list(self.bank_schema)
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
+            role_i = role_order.index(name)
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
                 if self.layout is not None:
                     spec = self.layout[name]
-                    if tuple(source.shape[1:]) != tuple(spec.shape) or source.dtype != spec.dtype:
+                    dtype, shape = self.layouts[self.layer_layout[layer_id]][role_i]
+                    if dtype != spec.dtype or len(shape) != len(spec.shape) or tuple(shape[:-1]) != tuple(spec.shape[:-1]):
                         raise ValueError(
-                            f"bank {name!r} rows are {tuple(source.shape[1:])} {source.dtype} but the expert kernel's layout "
+                            f"bank {name!r} rows are {tuple(shape)} {dtype} but the expert kernel's layout "
                             f"wants {tuple(spec.shape)} {spec.dtype}; the banks were packed for another kernel"
                         )
             self.bank_sources[name] = list(per_layer)
-        keys = bank_layouts(sources, layer_tags)
-        unique = list(dict.fromkeys(keys))
-        self.layouts = [banks for _, banks in unique]
-        self.layer_layout = [unique.index(key) for key in keys]
         for p in range(len(self.pool_sizes)):
             mixed = {self.layer_layout[l] for l, q in enumerate(self.pool_of_layer) if q == p}
             assert len(mixed) == 1, f"slot pool {p} holds layers of {len(mixed)} layouts; a pool needs one"
@@ -533,6 +541,13 @@ class OffloadMoeCache:
             # every pool view and staging buffer starts on a row boundary of its own layout
             assert all(r % 16 == 0 for rows in self._row_bytes for r in rows), self._row_bytes
         self._stage_bytes = [self.num_experts * max(rows[k] for rows in self._row_bytes) for k in range(len(self.bank_schema))]
+        # Per-role MMQ tail: ggml reads up to mmq_tail_bytes past a packed matrix's last row,
+        # so each bank cache needs that many zero bytes right after its data. Take the max over
+        # the role's layers (one cache serves them all). None -> no tail (float / unquantized).
+        self._role_tail = {
+            name: max(tails) if tails else 0
+            for name, tails in (row_tail_bytes or {}).items()
+        }
         self._alloc_banks()
         if not self._stage_fits(1):
             raise ValueError(f"MoE cache of {self.cache_size} slots cannot stage one whole layer of experts")
@@ -545,45 +560,53 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
-    def _alloc_slot_cache(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    def _alloc_slot_cache(self, shape: tuple[int, ...], dtype: torch.dtype, tail_bytes: int = 0) -> torch.Tensor:
         """One bank's GPU slot cache: a right-anchored slice of the shared arena (the KV
         pool owns the left end), so the two sliding caches meet at the boundary and the
         byte envelope is conserved by construction. Starts stay 16-byte aligned -- the
         fused-copy descriptor requires it -- by rounding each carve down from the arena
-        END. Without an arena this is a plain zero-filled allocation."""
+        END. Without an arena this is a plain zero-filled allocation.
+
+        ``tail_bytes`` zero bytes sit right after the data inside this block so ggml's MMQ
+        tail reads (which run past the matrix's last row) land in this bank's own zeros
+        instead of the neighbouring bank. The returned view covers only the data half."""
         arena = self.arena
-        if arena is None:
-            return torch.zeros(shape, dtype=dtype, device=self.device)
         nbytes = int(math.prod(shape)) * torch.empty(0, dtype=dtype).element_size()
+        if arena is None:
+            block = torch.zeros(nbytes + tail_bytes, dtype=torch.uint8, device=self.device)
+            return block[:nbytes].view(dtype).reshape(shape)
+        block_bytes = nbytes + tail_bytes
         cursor = int(arena.numel()) if self._arena_cursor is None else self._arena_cursor
-        if cursor - nbytes < 0:
+        if cursor - block_bytes < 0:
             # The MoE banks would not all fit in the arena: clamping start to 0 would let
             # this bank and the earlier ones alias the same bytes (observed: down/down_scale
             # clobbering gate_up rows -> garbled MoE output). Fail loudly instead; the
             # pre-teardown fit checks (validate_rebuild + engine arena check) are the ones
             # that should have rejected this target.
             raise RuntimeError(
-                f"MoE slot cache overflow: bank carve needs {nbytes} B at arena offset "
-                f"{cursor}..{cursor - nbytes}, arena is {int(arena.numel())} B -- the "
+                f"MoE slot cache overflow: bank carve needs {block_bytes} B at arena offset "
+                f"{cursor}..{cursor - block_bytes}, arena is {int(arena.numel())} B -- the "
                 f"(moe, kv) target exceeds the shared cache arena; rebuild/slide targets "
                 "must be validated against arena bytes before teardown"
             )
-        start = max(0, (cursor - nbytes) // 16 * 16)
+        start = max(0, (cursor - block_bytes) // 16 * 16)
+        arena[start : start + block_bytes].zero_()  # data + its MMQ tail read as zeros
         buf = arena[start : start + nbytes].view(dtype).reshape(shape)
-        buf.zero_()
         self._arena_cursor = start
         return buf
 
     def _alloc_banks(self) -> None:
+        tail = getattr(self, "_role_tail", {})
         for k, name in enumerate(self.bank_schema):
+            role_tail = tail.get(name, 0)
             if self._raw_banks:
                 nbytes = sum(s * self._row_bytes[self._pool_layout(p)][k] for p, s in enumerate(self.pool_sizes))
                 # Raw multi-layout banks are byte-typed; share the arena when present so the
                 # KV/MoE envelope stays contiguous.
-                self.bank_caches[name] = self._alloc_slot_cache((nbytes,), torch.uint8)
+                self.bank_caches[name] = self._alloc_slot_cache((nbytes,), torch.uint8, role_tail)
             else:
                 dtype, shape = self.layouts[0][k]
-                self.bank_caches[name] = self._alloc_slot_cache((self.cache_size, *shape), dtype)
+                self.bank_caches[name] = self._alloc_slot_cache((self.cache_size, *shape), dtype, role_tail)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
 
 
@@ -854,7 +877,8 @@ class OffloadMoeCache:
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
             old_c = old_caches[name]
-            new_c = self._alloc_slot_cache((cache_size, *head.shape[1:]), head.dtype)
+            role_tail = getattr(self, "_role_tail", {}).get(name, 0)
+            new_c = self._alloc_slot_cache((cache_size, *head.shape[1:]), head.dtype, role_tail)
             for j, old_slot in enumerate(keep):
                 # clone() detaches the row into fresh storage: old/new views share the
                 # arena and end-anchor overlap, which copy_ rejects on shared ranges.

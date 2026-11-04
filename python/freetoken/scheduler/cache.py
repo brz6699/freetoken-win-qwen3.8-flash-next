@@ -346,6 +346,11 @@ class CacheManager:
         if self.is_swa:  # window tier not carried: keep the tree match (no pages to leak)
             return mr
         needed_pages = div_ceil(b, self.page_size)
+        if b > self.available_size:
+            # Fits the pool but not THIS moment's occupancy: live streams plus queued requests
+            # already own the rest, so eviction alone cannot reach the ask and _allocate would
+            # assert. Skip the tier -- the plain tree match plus recompute stays correct.
+            return mr
         if needed_pages > self.num_pages:
             # The pool shrank below this parked entry since it was written (budget slide):
             # eviction alone can never fit it, so skip the tier instead of churning the prefix

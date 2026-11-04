@@ -84,6 +84,10 @@ _MINIMAX_M3_PACKED = _DENSE_PACKED + (
 ) + _EXPERTS_W123_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+# the GGUF scheme reads expert projections in (gate, up, down) order, which is checkpoint (w1, w3, w2)
+_EXPERTS_W132_PACKED = (("experts", ("experts.0.w1", "experts.0.w3", "experts.0.w2")),)
+_QWEN4_EXP_GGUF_PACKED = _QWEN4_EXP_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),)
+_MINIMAX_M3_GGUF_PACKED = _DENSE_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),) + _EXPERTS_W132_PACKED
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "LlamaForCausalLM": ModelSpec(
@@ -259,12 +263,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
     ),
-    # GGUF (native Q4_0/Q6_K) gemma4: same model classes, GGUF config + weight loaders.
+    # llama.cpp gemma4 GGUF (text only): the same model classes with every tensor in its packed ggml type
     "Gemma4GGUFForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
+        checkpoint_segments=_GEMMA4_SEGMENTS,
+        packed_modules_mapping=_GEMMA4_PACKED,
     ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
@@ -303,6 +309,122 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # llama.cpp llama GGUF (Llama, Mistral): the llama model classes with every tensor in its packed ggml type
+    "LlamaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    # llama.cpp qwen2 / qwen3 / qwen3moe GGUF: the same model classes with every tensor in its packed ggml type
+    "Qwen2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen2",
+        "Qwen2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3",
+        "Qwen3ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+    ),
+    # llama.cpp minimax-m2 GGUF: the same model classes with every tensor in its packed ggml type
+    "MiniMaxM2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m2",
+        "MiniMaxM2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W132_PACKED,
+    ),
+    # llama.cpp minimax-m3 GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "MiniMaxM3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m3",
+        "MiniMaxM3ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_MINIMAX_M3_GGUF_PACKED,
+    ),
+    # llama.cpp deepseek4 GGUF (unsloth DeepSeek-V4-Flash-0731-GGUF; text only): the same model
+    # classes with every tensor in its packed ggml type
+    "DeepseekV4GGUFForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v4",
+        "DeepseekV4ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        # the GGUF scheme reads expert types in (gate, up, down) order
+        packed_modules_mapping=_EXPERTS_W132_PACKED,
+        # the KV compressors read their weights through a dense bf16 einsum, so the reader
+        # dequantizes them instead of serving the packed ggml rows
+        unquantized_modules=("*.compressor.wkv", "*.compressor.wgate"),
+    ),
+    # llama.cpp qwen35 / qwen35moe GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "Qwen3_5GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+    ),
+    "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+    ),
+    # llama.cpp qwen4exp GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
+    ),
+    # llama.cpp muse-glimmer GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "MuseGlimmerGGUFForCausalLM": ModelSpec(
+        "freetoken.models.muse_glimmer",
+        "MuseGlimmerForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    # llama.cpp glm4moe GGUF (GLM-4.5, 4.5-Air, 4.6, 4.7): the same model classes with every tensor in its packed ggml type
+    "Glm4MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm4_moe",
+        "Glm4MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_EXPERTS_PACKED,
+    ),
+    # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF; text only): the same model
+    # classes with every tensor in its packed ggml type
+    "Glm5NextGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_GLM5_NEXT_PACKED,
+        # the MLA kv_b ships as two per-head tensors (attn_k_b transposed + attn_v_b), quantized in
+        # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
+        unquantized_modules=("*.self_attn.kv_b_proj",),
+    ),
 }
 
 
@@ -319,16 +441,19 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
-    from freetoken.layers.quantization import NameMap, QuantConfig
+    """The checkpoint's QuantConfig under the family's naming.
 
+    A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
+    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig
+
+    name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
-        return None
-    return QuantConfig.from_hf(
-        hf_config,
-        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
-        unquantized=spec.unquantized_modules,
-    )
+        to_gguf = _load_attr(spec.module, "to_gguf")
+        from freetoken.models.gguf.reader import gguf_tensor_index
+
+        types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
+        return GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    return QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

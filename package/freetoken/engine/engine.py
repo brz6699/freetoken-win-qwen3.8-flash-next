@@ -387,6 +387,8 @@ class Engine:
         winninja.apply()
         winninja.trim_route_pack_smem()
         winninja.allow_ultrawide_fc2_tile()
+        winninja.compact_jit_uris()
+        winninja.force_ninja_output_encoding()
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -502,6 +504,27 @@ class Engine:
             config, self.num_pages, device=self.device, dtype=self.dtype,
             arena=self._cache_arena,
         )
+        # Host KV tier accounting -- advisory only, same shape as _host_tables_bytes: the
+        # pinned bytes live in host RAM and never carve the GPU ceiling. Windows caps
+        # registered memory around half of system RAM (shared with the PLE table and the
+        # MoE banks), so surface the footprint and flag an over-committed box; the pools
+        # themselves fall back to device-resident bodies when the pin itself fails.
+        _hb = getattr(self.kv_cache, "host_bytes", None)
+        if _hb is not None and (_need := _hb()) > 0:
+            _need += self._host_tables_bytes
+            try:
+                from freetoken.moe.benchbw import _available_ram_bytes
+
+                _avail = _available_ram_bytes()
+            except Exception:
+                _avail = 0
+            _msg = f"KV host tier: {mem_GB(_need)} pinned host RAM"
+            if _avail and _need > _avail // 2:
+                _msg += (
+                    f" exceeds half of available RAM ({mem_GB(_avail // 2)});"
+                    " some pools may fall back to device-resident bodies"
+                )
+            logger.info_rank0(_msg)
 
         # ======================= MTP speculative head wiring (--mtp) =======================
         # Private dense-GQA KV for the 1-layer head, indexed by the SAME physical locs the
@@ -668,6 +691,9 @@ class Engine:
             config.model_path,
             self.device,
             include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
+            # the tower only exists on the model when an encoder is active; without this the
+            # reader's visual.* tensors are "unexpected keys" in the strict load
+            include_vision=bool(config.active_encoders),
         )
         if not config.enable_mtp:
             # the MTP head is only constructed with --mtp, so drop its keys for the strict
@@ -759,7 +785,11 @@ class Engine:
         elif computed_cap is not None:
             max_slots = min(max_slots, computed_cap)
 
-        per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        # Same READ atom as the declared-size twin below: an auto plan priced with the
+        # default 16-byte alignment is smaller than the slide later enforces, so its
+        # envelope check accepts geometries the slide cannot land on.
+        row_align = method.kernel.row_align_bytes if method is not None else 16
+        per_expert_bytes = expert_bytes_per_slot(banks.sources, row_align)
         self._arena_per_expert_bytes = per_expert_bytes
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -779,9 +809,27 @@ class Engine:
         )
 
     def _mtp_gpu_bank_bytes(self) -> int:
-        """Expert bytes the MTP bank holds on-device (--mtp only); 0 on every other path."""
+        """GPU bytes the MTP block holds on-device (--mtp only); 0 on every other path.
+
+        Three parts enter the ceiling/fixed-budget accounting: the head's expert bank,
+        its own weight tensors, and the draft KV pool the head wiring allocates right
+        after the KV pool (two rows x (tokens + draft_len + 2) x kv_heads x head_dim).
+        All three are charged because they are allocated BEFORE the attention backend,
+        outside the arena -- an under-count leaves the backend's fixed buffers OOMing
+        by exactly the missing amount. The draft-pool term is skipped when
+        --mtp-device cpu puts the whole head on the CPU."""
         head = getattr(self.model, "mtp", None)
-        return getattr(head.bank, "gpu_bytes", 0) if head is not None else 0
+        if head is None:
+            return 0
+        total = int(getattr(head.bank, "gpu_bytes", 0) or 0)
+        total += sum(int(p.numel()) * p.element_size() for p in head.parameters())
+        cfg = self.config
+        if str(getattr(cfg, "mtp_device", "gpu") or "gpu").lower() != "cpu":
+            mc = cfg.model_config
+            pages = cfg.num_page_override or -(-cfg.max_seq_len // cfg.page_size)
+            extra = max(1, int(cfg.mtp_draft_len or 2)) + 1
+            total += 2 * (pages * cfg.page_size + extra) * mc.num_kv_heads * mc.head_dim * self.dtype.itemsize
+        return total
 
     def _ensure_cache_arena(self, config: EngineConfig) -> None:
         """One flat byte block for the two sliding caches: KV from the LEFT end, MoE bank
@@ -793,6 +841,7 @@ class Engine:
         checks all enforce, so any validated (moe, pages) geometry fits by construction."""
         if getattr(self, "_cache_arena", None) is not None:
             return
+        from freetoken.attention import attention_headroom_bytes
         from freetoken.engine.cache_budget import net_cache_budget_bytes, required_bytes
 
         cache_per_page, pool_fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
@@ -800,11 +849,16 @@ class Engine:
         # carve the arena -- but they consume the same post-weights VRAM, so they enter
         # the CEILING accounting; only the pool's fixed index tiers carve the arena.
         fixed_cache_size = pool_fixed + state_pool_bytes(config) + self._mtp_gpu_bank_bytes()
+        # The attention backend's own fixed buffers (flashinfer's float workspace and the
+        # wrappers' int buffers) are constructed AFTER the arena and are not part of the
+        # pools' self-measured capture budget, so they must survive the ceiling: carve them
+        # out here or a big declared geometry leaves the backend's first torch.empty OOMing.
         ceiling = max(
             0,
             net_cache_budget_bytes(
                 config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
-            ),
+            )
+            - attention_headroom_bytes(config.attention_backend, config.model_config, self.device),
         )
         # Arena = the byte footprint of the resolved kv+moe geometry, capped by the ceiling so an
         # over-declaration still fits physical VRAM. Everything the pools do NOT need is left as
@@ -827,6 +881,7 @@ class Engine:
             footprint = (
                 required_bytes(config.moe_cache_size, pages, per_expert, cache_per_page)
                 + pool_fixed
+                + getattr(self, "_arena_row_tail", 0)
             )
             budget = min(footprint, ceiling) if footprint > 0 else ceiling
         # Round UP to the lcm of active kernels' READ-contract atoms: the fused-copy descriptor
@@ -1063,7 +1118,9 @@ class Engine:
                         f"num_pages={declared_pages} (prefill_overlap={overlap})"
                     )
             elif config.moe_cache_mem is not None:
-                per_slot = expert_bytes_per_slot(banks.sources)
+                per_slot = expert_bytes_per_slot(
+                    banks.sources, method.kernel.row_align_bytes if method is not None else 16
+                )
                 size = min(config.moe_cache_mem // per_slot, size_cap)
                 # per_slot is a mean over layers, so with pools of different slot sizes the split can exceed the budget: shrink until it fits
                 while size > 0 and self._moe_pool_bytes(split_slots(size, pools, self._moe_expert_counts)) > config.moe_cache_mem:
@@ -1097,6 +1154,11 @@ class Engine:
                 max_slots = method.slot_limit()
             # Slider: pre-size the unified arena from the resolved (moe, pages) geometry so
             # budget_slide's KV-left/MoE-right carving has a fixed envelope to slide within.
+            # Each GGUF bank cache reserves its MMQ tail once (after the data), so add the sum
+            # of per-role tails to the footprint the arena is sized against.
+            self._arena_row_tail = sum(
+                max(t) for t in (banks.row_tail_bytes or {}).values() if t
+            )
             self._ensure_cache_arena(config)
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -1120,7 +1182,7 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags)
+            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags, row_tail_bytes=banks.row_tail_bytes)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)

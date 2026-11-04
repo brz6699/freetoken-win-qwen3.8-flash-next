@@ -92,6 +92,56 @@ class EnvClassSingleton:
             attr_value._init(f"{ENV_PREFIX}{attr_name}")
 
 
+_FT_DEFS_H = (
+    "#ifndef FT_DEFS_H_\n"
+    "#define FT_DEFS_H_\n"
+    "typedef unsigned short ushort;\n"
+    "typedef unsigned char uchar;\n"
+    "typedef unsigned int uint;\n"
+    "typedef unsigned long ulong;\n"
+    "#define __attribute__(x)\n"
+    "#define __restrict__ __restrict\n"
+    "#ifdef __cplusplus\n"
+    "namespace std {\n"
+    "inline constexpr unsigned long long max(unsigned long long a, unsigned long b) { return a > b ? a : b; }\n"
+    "inline constexpr unsigned long long max(unsigned long a, unsigned long long b) { return b > a ? b : a; }\n"
+    "}\n"
+    "#endif\n"
+    "#endif\n"
+)
+
+
+def _ensure_jit_defs_header(base: str) -> None:
+    """Materialize the forced-include shim header under the flashinfer JIT root.
+
+    cudafe++ on this CUDA 13.1 box parses host stubs in MSVC-emulation mode and
+    rejects flashinfer's ``FLASHINFER_INLINE`` expansion shape
+    (``inline __attribute__((always_inline)) __device__``): an attribute sitting
+    between ``inline`` and ``__device__`` kills its parser (~100 errors, build
+    aborted). Expanding ``__attribute__(x)`` to nothing before the headers are
+    parsed restores the accepted shape. The typedefs cover ``ushort``/``uchar``
+    which MSVC CRT headers leave undefined in C++ mode while flashinfer's kernels
+    use them freely. kernel/winninja.apply() adds the matching ``-include`` to the
+    ninja cuda rule; the path must stay inside the short JIT root so it never hits
+    this box's MAX_PATH limit. The same header is force-included on the cl-only
+    host-stub pass via ``-Xcompiler /FI``, since nvcc's ``-include`` does not reach
+    that second compile.
+    """
+    hdr = os.path.join(base, "ftdefs.h")
+    try:
+        os.makedirs(base, exist_ok=True)
+        try:
+            with open(hdr, "r", encoding="utf-8") as fh:
+                if fh.read() == _FT_DEFS_H:
+                    return
+        except OSError:
+            pass
+        with open(hdr, "w", encoding="utf-8") as fh:
+            fh.write(_FT_DEFS_H)
+    except OSError:
+        pass
+
+
 def _bootstrap_windows_host_env() -> None:
     """Host-env prep so a plain `python -m freetoken` / ft.exe launch behaves like the
     exp launcher on Windows. flashinfer's JIT shells out to a bare ``ninja`` (which
@@ -109,6 +159,15 @@ def _bootstrap_windows_host_env() -> None:
     if scripts not in path_parts:
         os.environ["PATH"] = scripts + os.pathsep + os.environ.get("PATH", "")
     os.environ.setdefault("FREETOKEN_FLASHINFER_PERIPH", "0")
+    # flashinfer builds its JIT root as <FLASHINFER_WORKSPACE_BASE>/.cache/flashinfer/
+    # <ver>/<arch>/{generated,cached_ops}/<module>/... ; with the compacted short module
+    # names (kernel/winninja.compact_jit_uris) every resulting path stays ~100 chars, so
+    # a plain short root fits this box's MAX_PATH (LongPathsEnabled=0) without the \\?\
+    # prefix -- which cmd.exe treats as UNC ("UNC paths are not supported") and cl then
+    # fails to open with C1083. A real env value still wins.
+    drive = os.path.splitdrive(os.path.abspath(sys.executable))[0] or "C:"
+    ws_base = os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", f"{drive}\\fi")
+    _ensure_jit_defs_header(ws_base)
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home and " " in cuda_home:
         import ctypes

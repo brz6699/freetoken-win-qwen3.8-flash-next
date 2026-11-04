@@ -1,9 +1,11 @@
 // Adatped from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+// ATen's CUDA context header gives the stream helpers without pulling
+// c10/cuda/CUDACachingAllocator.h, which CUDA 13.1's cudafe++ cannot parse.
+#include <ATen/cuda/CUDAContext.h>
 
 // dont use clang-format here, it breaks the include order
 // clang-format off
@@ -77,7 +79,7 @@ torch::Tensor ggml_dequantize(
     int64_t m,
     int64_t n,
     std::optional<at::ScalarType> const& dtype) {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
+  const c10::OptionalDeviceGuard device_guard(device_of(W));
   auto dtype_ = dtype.value_or(torch::kFloat16);
   auto options = torch::TensorOptions().dtype(dtype_).device(W.device());
   at::Tensor DW = torch::empty({m, n}, options);
@@ -99,7 +101,7 @@ torch::Tensor ggml_mul_mat_vec_a8(
   int col = X.sizes()[1];
   int vecs = X.sizes()[0];
   const int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const c10::OptionalDeviceGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -197,7 +199,7 @@ torch::Tensor ggml_mul_mat_a8(
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   int batch = X.sizes()[0];
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const c10::OptionalDeviceGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({batch, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -344,7 +346,7 @@ torch::Tensor ggml_moe_a8(
     int64_t tokens) {
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const c10::OptionalDeviceGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({tokens * top_k, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -548,7 +550,7 @@ torch::Tensor ggml_moe_a8_vec(
     int64_t tokens) {
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const c10::OptionalDeviceGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

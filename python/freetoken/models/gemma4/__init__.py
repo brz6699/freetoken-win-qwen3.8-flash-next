@@ -5,6 +5,7 @@ from .gguf import (
     iter_gguf_weights,
     load_q4_0_expert_sources,
     parse_gguf_config,
+    to_gguf,
 )
 from .model import Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration
 from .moe import Gemma4Router
@@ -34,4 +35,5 @@ __all__ = [
     "iter_gguf_weights",
     "load_q4_0_expert_sources",
     "dummy_q4_0_expert_sources",
+    "to_gguf",
 ]

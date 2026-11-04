@@ -782,6 +782,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-offload",
+        "--kv-host-tier",
+        action="store_true",
+        dest="kv_offload",
+        default=argparse.SUPPRESS,
+        help=(
+            "Offload the bulk KV rows of the sparse-index cache lines (QSA, MLA/DSA/Kpool) "
+            "to pinned host RAM, like the MoE expert banks. VRAM then holds only the index "
+            "slabs plus a hot working set sized from --max-running-req, which frees GPU "
+            "memory for MoE expert slots and lets much longer contexts fit without VRAM OOM."
+        ),
+    )
+
+    parser.add_argument(
         "--kv-tiers",
         dest="kv_tiers",
         type=str,

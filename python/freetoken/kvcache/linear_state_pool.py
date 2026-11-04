@@ -78,6 +78,14 @@ class LinearStatePool:
         )
         self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
 
+        # Per-step state snapshots a speculative verify forward writes into (see
+        # ensure_verify_rows): ``_verify_blocks`` blocks of ``_verify_rows`` rows. None until the
+        # first verify asks for them.
+        self._verify_rows = 0
+        self._verify_blocks = 0
+        self.verify_rec: torch.Tensor | None = None
+        self.verify_conv: torch.Tensor | None = None
+
         self._slot_specs = tuple(slot_states)
         names = [spec.name for spec in self._slot_specs]
         if len(set(names)) != len(names):
@@ -163,35 +171,49 @@ class LinearStatePool:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
+        ov = min(old_num, num_slots)
+
+        # Interleaved alloc -> overlap-copy -> release, per KIND, so the transient peak is one
+        # old/new pair instead of both pools whole: a grow slide is exactly where old+new
+        # together exceed free VRAM and the whole rebuild OOMs. Rebinding self.* before
+        # dropping the local is what makes the old tensor actually free for the next alloc.
+        # Slot 0 is the padding sink; copies cover only the usable range 1..ov.
         new_conv = torch.zeros(
             (n_layers, num_slots, local_conv_dim, km1), dtype=conv_dtype, device=device
         )
+        if ov > 1:
+            new_conv[:, :ov].copy_(old_conv[:, :ov])
+        self.conv_states = new_conv
+        del old_conv
+
         new_rec = torch.zeros(
             (n_layers, num_slots, local_v_heads, key_head_dim, value_head_dim),
             dtype=rec_dtype,
             device=device,
         )
-        new_slot = self._alloc_slot_states(num_slots)
-
-        ov = min(old_num, num_slots)
-        if ov > 1:  # slot 0 is the padding sink; copy only the usable range 1..ov
-            new_conv[:, :ov].copy_(old_conv[:, :ov])
+        if ov > 1:
             new_rec[:, :ov].copy_(old_rec[:, :ov])
+        self.recurrent_states = new_rec
+        del old_rec
+
+        new_slot = self._alloc_slot_states(num_slots)
+        if ov > 1:
             for name, nt in new_slot.items():
                 ot = old_slot.get(name)
                 if ot is not None:
                     nt[:, :ov].copy_(ot[:, :ov])
+        self.slot_states = new_slot
+        del old_slot
 
-        # Drop the old tensors only after the overlap is copied so the transient peak is one
-        # pool, then hand the freed segments back (no expandable_segments on Windows).
-        del old_conv, old_rec, old_slot
+        # Hand the released segments back to the driver (no expandable_segments on Windows).
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        self.conv_states = new_conv
-        self.recurrent_states = new_rec
-        self.slot_states = new_slot
         self._num_slots = num_slots
+        # The verify snapshots are indexed slot-major over the OLD slot count, so a resize has to
+        # rebuild them (their content is one forward deep -- nothing to carry over).
+        if self._verify_rows:
+            self._alloc_verify()
         # Keep exactly the slots that were already allocated and still exist; everything else
         # (the padding slot aside) is free. Slots dropped by a shrink return to the free-list,
         # and previously-free overlap slots are not handed out a second time.
@@ -222,6 +244,51 @@ class LinearStatePool:
         self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
+
+    def ensure_verify_rows(self, rows: int, blocks: int) -> None:
+        """Give each of the ``blocks`` in-flight requests ``rows`` extra snapshot rows for the MTP
+        verify window, so a commit can pick the state of the prefix it accepted instead of
+        re-running that prefix. A verify forward writes one snapshot per query row (the recurrent
+        kernel does it in-kernel, the conv window alongside), so ``rows`` = draft_len + 1 covers
+        every possible cut. Blocks are indexed by position in the batch, not by state slot: at
+        most ``max_running_req`` requests are in flight, and the extra slots of the pool exist for
+        prefix snapshots, which never need a verify window of their own."""
+        rows, blocks = max(1, int(rows)), max(1, int(blocks))
+        if self.verify_rec is not None and self._verify_rows >= rows and self._verify_blocks >= blocks:
+            return
+        self._verify_rows = rows
+        self._verify_blocks = blocks
+        self._alloc_verify()
+
+    def _alloc_verify(self) -> None:
+        n_layers, _, local_v_heads, key_dim, value_dim = self.recurrent_states.shape
+        _, _, local_conv_dim, km1 = self.conv_states.shape
+        n = self._verify_blocks * self._verify_rows
+        # Block-major (blocks, rows, ...): the verify kernel derives the per-request block
+        # stride from ``snap_buffer.shape[1]``, so the rows axis MUST sit at dim 1. A flat
+        # ``[blocks*rows]`` here would make the kernel stride by the head count and scatter
+        # snapshots across blocks (out of bounds once bs > 1). Element mapping inside one
+        # snapshot row matches recurrent_states' (the kernel indexes both as
+        # ``hv*K*V + o_v*K + o_k``), so ``load_verify_row`` is a plain block copy.
+        self.verify_rec = torch.zeros(
+            (n_layers, self._verify_blocks, self._verify_rows,
+             local_v_heads, key_dim, value_dim),
+            dtype=self.recurrent_states.dtype,
+            device=self._device,
+        )
+        self.verify_conv = torch.zeros(
+            (n_layers, n, local_conv_dim, km1),
+            dtype=self.conv_states.dtype,
+            device=self._device,
+        )
+
+    def load_verify_row(self, slot: int, block: int, row: int) -> None:
+        """Copy the snapshot of ``row`` into the live state of the request holding ``slot``. The
+        source is addressed by the request's position in the last verify batch (see
+        ensure_verify_rows), its destination by the slot its state lives in."""
+        flat = block * self._verify_rows + row
+        self.recurrent_states[:, slot].copy_(self.verify_rec[:, block, row])
+        self.conv_states[:, slot].copy_(self.verify_conv[:, flat])
 
     def snapshot_state(self, src: int) -> tuple:
         """Host-RAM copy of one slot's whole-sequence state (conv + recurrent + declared
@@ -306,7 +373,37 @@ def linear_state_bytes_per_req(
     return int(total)
 
 
-__all__ = ["LinearStatePool", "linear_state_bytes_per_req", "fit_linear_pool_slots"]
+def mtp_verify_rows(config) -> int:
+    """Snapshot rows per in-flight request that an MTP verify window needs: one per draft row plus
+    the bonus row the target contributes at the cut. 0 without MTP."""
+    if not getattr(config, "enable_mtp", False):
+        return 0
+    return max(1, int(getattr(config, "mtp_draft_len", 0) or 0)) + 1
+
+
+def mtp_verify_bytes(config) -> int:
+    """Fixed cost of the verify snapshots: one row-block per in-flight request (the pool's extra
+    slots hold prefix snapshots, which never need a verify window of their own)."""
+    rows = mtp_verify_rows(config)
+    if rows <= 0:
+        return 0
+    linear_group = config.model_config.linear_attention_group()
+    if linear_group is None:
+        return 0
+    per_row = linear_state_bytes_per_req(
+        linear_group, config.tp_info.size, config.dtype
+    )
+    return int(config.max_running_req) * rows * per_row
+
+
+__all__ = [
+    "LinearStatePool",
+    "linear_state_bytes_per_req",
+    "fit_linear_pool_slots",
+    "mamba_slots_for_growth",
+    "mtp_verify_bytes",
+    "mtp_verify_rows",
+]
 
 
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
@@ -323,7 +420,7 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     per_req = linear_state_bytes_per_req(
         linear_group, config.tp_info.size, config.dtype, slot_states
     )
-    return per_req * slots
+    return per_req * slots + mtp_verify_bytes(config)
 
 
 def _linear_pool_num_slots(config) -> int:
@@ -348,6 +445,30 @@ def _linear_pool_min_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1
     return 4 * mr + 1
+
+
+def mamba_slots_for_growth(config, cur_pages: int, new_pages: int) -> int | None:
+    """GDN state-pool usable-slot target when a budget slide grew KV from ``cur_pages`` to
+    ``new_pages``.
+
+    Only the hybrid-radix cross-request snapshot cache (the portion of ``_linear_pool_num_slots``
+    above ``_linear_pool_min_slots``) is elastic; the non-evictable working set is fixed by
+    ``max_running_req``. A larger KV pool retains more simultaneous prefixes, so the snapshot
+    cache is scaled by the page-growth ratio (capped at 2x the startup cache) to keep prefix
+    reuse from evicting/recycling live GDN snapshots -- a recycled snapshot restored into a fresh
+    live slot gives the linear-attention recurrence stale prior state, which degenerates long
+    reasoning turns into repetition. Returns None when there is nothing elastic to grow (dense /
+    naive, or a KV shrink), so the caller leaves the pool at its current size."""
+    startup = _linear_pool_num_slots(config)
+    floor = _linear_pool_min_slots(config)
+    elastic0 = startup - floor
+    if elastic0 <= 0:
+        return None  # no snapshot cache to scale (dense / naive working-set-only pool)
+    ratio = new_pages / max(1, cur_pages)
+    if ratio <= 1.0:
+        return None  # shrink keeps the working set; nothing to lift the snapshot cache onto
+    new_elastic = math.ceil(min(2.0, ratio) * elastic0)
+    return floor + new_elastic - 1  # physical minus the padding sink -> usable count
 
 
 # Fraction of the free VRAM measured right before the GDN pool is allocated that the pool may
@@ -379,7 +500,8 @@ def fit_linear_pool_slots(config, free_bytes: int) -> int:
     )
     if per_req <= 0:
         return default
-    usable = int(free_bytes * _GDN_FIT_HEADROOM)
+    # The verify snapshots ride the same free VRAM as the slots, so they come off the top.
+    usable = int(free_bytes * _GDN_FIT_HEADROOM) - mtp_verify_bytes(config)
     fit = usable // per_req
     if fit < minimum:
         raise MemoryError(

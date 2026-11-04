@@ -7,7 +7,7 @@ from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_v
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
 
-from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla, gdn_verify_fla
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -121,6 +121,23 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _write_verify_conv(self, pool, li: int, conv_in: torch.Tensor,
+                           old_win: torch.Tensor, fla, rows: int) -> None:
+        """Cache the conv left-context of every verify step next to the recurrent states the
+        verify kernel just cached: the (kernel-1) raw conv inputs ENDING at that step. Steps near
+        the chunk start reach into ``old_win`` (the slot's window before this forward), which is
+        why the caller reads it before the conv update."""
+        bs = conv_in.shape[0] // rows
+        km1 = old_win.shape[-1]
+        # [bs, km1 + rows, conv_dim]: the old window, then this forward's inputs. The window ending
+        # at step r is the km1 inputs up to and including it -> hist[r + 1 : r + 1 + km1].
+        hist = torch.cat([old_win.transpose(1, 2), conv_in.view(bs, rows, -1)], dim=1)
+        buf = pool.verify_conv[li]
+        dst = fla.verify_idx.to(torch.long) * rows
+        for r in range(rows):
+            win = hist[:, r + 1 : r + 1 + km1].transpose(1, 2).contiguous()
+            buf.index_copy_(0, dst + r, win.to(buf.dtype))
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -165,6 +182,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
+            vrows = fla.verify_rows
+            # A verify step's first conv windows reach back before this forward's first row, so
+            # take the pre-update window while the slot still holds it.
+            old_win = (
+                pool.conv_states[li].index_select(0, fla.cache_indices.to(torch.long))
+                if vrows is not None
+                else None
+            )
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
@@ -172,25 +197,34 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
-            g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
-            # The chunk kernel reads + writes back initial_state[cache_indices] in place;
-            # fresh sequences (cached_len==0) must start from a zeroed slot.
-            if fla.fresh_state_indices is not None:
-                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
-            track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
-            )
-            if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+            if vrows is not None:
+                core_out = gdn_verify_fla(
+                    q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                    snap_buffer=pool.verify_rec[li], snap_indices=fla.verify_idx,
+                )
+                self._write_verify_conv(pool, li, conv_in, old_win, fla, vrows)
             else:
-                core_out = result
+                g, beta = self._gate_params(a, b)
+                g = g.reshape(1, total, self.num_v_heads)
+                beta = beta.float().reshape(1, total, self.num_v_heads)
+                # The chunk kernel reads + writes back initial_state[cache_indices] in place;
+                # fresh sequences (cached_len==0) must start from a zeroed slot.
+                if fla.fresh_state_indices is not None:
+                    pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+                track = fla.track_dst is not None
+                result = gdn_prefill_chunk_fla(
+                    q, k, v, g, beta,
+                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                    return_h=track,
+                )
+                if track:
+                    core_out, h = result
+                    self._write_track_snapshot(pool, li, conv_in, h, fla)
+                else:
+                    core_out = result
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

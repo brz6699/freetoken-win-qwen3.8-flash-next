@@ -21,6 +21,7 @@ Upstream FreeToken already targets MoE-offload inference, but its Windows path a
   | `turbo4` | ~516 | 0.9887 | longest contexts (100k+ tokens) |
 
   Storage is compressed; attention compute stays bf16. Indexer keys always stay bf16.
+- **KV host tier (`--kv-offload`)** — parks the bulk K/V rows (turbo4-packed / MLA-latent lines plus their dequant scales) in pinned host RAM as zero-copy registered banks: the attend/gather kernels read host rows through UVA device pointers, crossing PCIe only at the top-k positions the sparse selection names. VRAM keeps only what every step reads — the indexers' compressed-key slab, per-request pending rings, scratch rows — so the per-token VRAM price drops to the index-only term (QSA 780 B/token, MLA-latent ≈700 B/token): ~1/9 (Qwen) and ~1/5 (GLM) of the full price, e.g. a 1M-token GLM pool holds K+V in 0.69 GiB of VRAM (full price ≈3.4 GiB) with the 2.77 GiB body resident in RAM. On Windows the tier allocates **register-direct**: after the expert banks and PLE tables register ~97 GiB, the TCC driver's `cudaHostAlloc` accounting (fresh + registered counted together, ~92–104 GiB floating ceiling) fails every fresh attempt, and that *failed* mapped allocation is what makes later small device allocations OOM with GiB of VRAM free — registering the committed mmap skips that pool entirely (≥163 GiB proven in production) at the same PCIe roofline. Other platforms keep fresh `cudaHostAlloc` first.
 - **Multimodal (vision) support** behind an explicit `--vision-on` flag: vision tower loads only when requested; image requests reuse KV through content-hashed prefix keys (same image → KV reuse, different image → zero false hits), and the mm KV pages live in a RAM tier that swaps in/out against the GPU pool.
 - **Qwen3.8-Flash-Next serving profile** — QSA paged-KV pool with the tiered storage above, NVFP4 routed experts via the offload cache, and the mm content-key prefix cache exercised end-to-end by the `verification/` suite.
 
@@ -84,6 +85,7 @@ ft.exe serve --host 0.0.0.0 --port 8001 `
 - `--num-tokens` — paged KV pool size; 1048576 gives the 1M-token window (turbo4: ≈6.9 KiB/token → ≈6.8 GiB at full pool), 524288 trades window for a bigger expert cache (≈3.4 GiB).
 - `--moe-cache-size` — number of experts resident on-GPU (2048 / 3072 above).
 - `--kv-cache-dtype` — see tier table above.
+- `--kv-offload` — the K/V body (bulk rows + turbo4 scales) lives in pinned host RAM; VRAM keeps the indexer slab only (§-style numbers: QSA 780 B/token, MLA ≈700 B/token — a 1M-token pool measured at 6.09 GiB pinned on Qwen, 0.69 GiB device-side on GLM). Windows allocates register-direct (see the KV host tier bullet above for the TCC accounting ceiling it bypasses); the mm RAM tier's snapshot/restore follows the body's home automatically.
 - `--vision-on` — loads the vision tower (bf16 weights ≈0.84 GiB, measured at load); omit for text-only serving.
 - `--moe-prefill-hit-d2d` — serves prefill expert hits via device-to-device copies.
 
@@ -113,7 +115,7 @@ Vision: with `--vision-on`, image requests cost only **+8ms** over text (cold TT
 
 ## Tuning notes
 
-- **Pin ceiling**: under WDDM the driver caps GPU-accessible pinned host memory at roughly half of physical RAM; locked (working-set) pages count against the same budget. Keep `FREETOKEN_PIN_BUDGET_GB` below the ceiling minus the locked-layer share, and raise it in steps after freeing other RAM consumers.
+- **Pin ceiling**: under WDDM the driver caps GPU-accessible pinned host memory at roughly half of physical RAM; locked (working-set) pages count against the same budget. Keep `FREETOKEN_PIN_BUDGET_GB` below the ceiling minus the locked-layer share, and raise it in steps after freeing other RAM consumers. Under TCC the picture differs: `cudaHostRegister` of committed mmap has no such ceiling (bank production ≥163 GiB verified), while fresh `cudaHostAlloc` counts fresh + already-registered together against a floating ~92–104 GiB total — past ~97 GiB registered (banks + PLE), fresh attempts fail, and the KV host tier therefore allocates register-direct on Windows.
 - **Locked ≠ pinned**: locked banks (head/tail layers) decode on the CPU executor; pinned banks stream to the GPU. More pinned = faster decode; locking is the fallback when pinned would exceed the ceiling.
 - If startup OOMs on the last bank, lower `--num-tokens` first (turbo4: ≈6.9 KiB/token → ≈3.4 GiB KV pool at 512k, ≈6.8 GiB at 1M), then the budget.
 - **MTP is off by design**: with draft=3, measured verification overhead exceeds the cost of the main model generating those tokens directly — single-stream decode drops from ~40–50 tok/s to ~30. Under a VRAM-constrained setup the MTP machinery competes with the expert/KV budgets for the same scarce memory, so net gain is negative. This build ships without MTP.

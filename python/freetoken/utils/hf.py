@@ -62,7 +62,7 @@ def load_eos_token_ids(
     if (gguf_src := gguf_config_source(model_path)) is not None:
         from freetoken.models.gguf.tokenizer import gguf_eos_token_ids
 
-        return frozenset(gguf_eos_token_ids(gguf_src, tokenizer))
+        return frozenset(gguf_eos_token_ids(gguf_src))
 
     ids: set[int] = set()
     if tokenizer.eos_token_id is not None:
@@ -113,12 +113,15 @@ def load_generation_sampling(model_path: str) -> dict[str, Any]:
 
         meta = load_gguf_metadata(gguf_src)
         out: dict[str, Any] = {}
+        # GGUF stores these as fp32, so a written 0.95 arrives as 0.949999988079071. Round back
+        # to what the checkpoint declares rather than carrying the representation error into every
+        # request's SamplingParams (and into the MTP accept diagnostics that print it).
         if (v := meta.get("general.sampling.temp")) is not None:
-            out["temperature"] = float(v)
+            out["temperature"] = round(float(v), 6)
         if (v := meta.get("general.sampling.top_k")) is not None:
             out["top_k"] = int(v)
         if (v := meta.get("general.sampling.top_p")) is not None:
-            out["top_p"] = float(v)
+            out["top_p"] = round(float(v), 6)
         return out
 
     try:
