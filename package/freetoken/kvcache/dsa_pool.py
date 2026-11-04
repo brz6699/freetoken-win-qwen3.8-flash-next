@@ -200,12 +200,11 @@ class MLAKVCache(BaseKVCachePool):
 
     # -- host RAM tier (KV parked on host, swapped into VRAM on demand) --------------
     def _row_idx(self, slots: torch.Tensor) -> torch.Tensor:
-        # With a host body the payload already lives on host, so the tier round-trip is a
-        # host-side copy -- and CPU indices are accepted by CUDA index ops too (CUDA
-        # indices on a CPU view are not), so one host-side index serves both tiers.
+        # Body-device indices for the host tier: gather/index_select accept CPU indices on a
+        # CUDA target, but CUDA indices on a CPU view are rejected, so with a host body the
+        # indices must be CPU. Device-side slab ops (`index_copy_` on `_index_k_buffer`) require
+        # index/src/dst all on one device, so those call sites convert back with `.to(_device)`.
         idx = slots.to(torch.int64)
-        # .cpu() when the body is host-resident: a CUDA index on a CPU view raises
-        # "indices should be ... on the same device"; the reverse direction is accepted.
         return idx.cpu() if self._host_offload else idx.to(self._device)
 
     def snapshot_rows(self, slots: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -458,14 +457,19 @@ class DSAKVCache(MLAKVCache):
 
     def snapshot_rows(self, slots: torch.Tensor) -> dict[str, torch.Tensor]:
         # The DSA index slab rides the KV rows so a restored prefix re-selects the same top-k.
+        # `_index_k_buffer` is always device-resident (index keys stay on GPU even under kv-offload),
+        # so indices for slab ops are on-device regardless of body tier; `_row_idx` returns CPU
+        # indices only for the host-body gather (which tolerates CPU indices), so convert here.
         out = super().snapshot_rows(slots)
-        rows = self._index_slot_rows(slots)
+        rows = self._index_slot_rows(slots).to(self._device)
         out["idx"] = self._index_k_buffer[:, rows].cpu()
         return out
 
     def restore_rows(self, slots: torch.Tensor, data: dict[str, torch.Tensor]) -> None:
         super().restore_rows(slots, data)
-        rows = self._index_slot_rows(slots)
+        # index_copy_ requires index/src/dst all on the same device; the slab is CUDA, so
+        # rows must be a CUDA tensor even when the body is host-resident with CPU indices.
+        rows = self._index_slot_rows(slots).to(self._device)
         self._index_k_buffer.index_copy_(1, rows, data["idx"].to(self._device)[:, : rows.shape[0]])
 
 
