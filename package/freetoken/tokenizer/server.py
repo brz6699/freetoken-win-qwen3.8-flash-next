@@ -225,6 +225,7 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        gather_bytes=msg.gather_bytes,
                         mtp_steps=msg.mtp_steps,
                         mtp_drafts=msg.mtp_drafts,
                         mtp_accepted=msg.mtp_accepted,

@@ -56,6 +56,7 @@ from freetoken.gpu_select import (
     single_gpu_arg,
 )
 from freetoken.kernel.pinned import alloc_pinned_tensor
+from freetoken.moe.bench_profile import PROFILE_VERSION
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
 from freetoken.utils import init_logger
 
@@ -63,7 +64,7 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
@@ -284,7 +285,10 @@ def measure_pcie_bw(device: torch.device, nbytes: int = 256 << 20, iters: int = 
 
 def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.dtype]]:
     """Per-bank (elems_per_expert, dtype) for the flat offload host banks (the gather)."""
-    u8, bf16, f16, f8 = torch.uint8, torch.bfloat16, torch.float16, torch.float8_e4m3fn
+    u8, bf16, f32, f8 = torch.uint8, torch.bfloat16, torch.float32, torch.float8_e4m3fn
+    if fmt in ("gguf", "gguf_scaled"):
+        return {name: (math.prod(shape), dtype) for name, (shape, dtype) in _gguf_bank_shapes(fmt, opts, H, I).items()}
+
     if fmt == "bf16":
         return {"gate_up": (2 * I * H, bf16), "down": (H * I, bf16)}
     if fmt == "fp8_block":
@@ -295,8 +299,8 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
     if fmt == "nvfp4":
         return {
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 16), u8),
-            "gate_up_global": (2 * I, f16), "down_packed": (H * (I // 2), u8),
-            "down_scale": (H * (I // 16), u8), "down_global": (H, f16),
+            "gate_up_global": (2 * I, f32), "down_packed": (H * (I // 2), u8),
+            "down_scale": (H * (I // 16), u8), "down_global": (H, f32),
         }
     if fmt == "mxfp4_triton":
         return {
@@ -340,17 +344,33 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         gate_up.fill_(0.02)  # uninitialized bf16 can be denormal -> x86 FP slowdown
         down.fill_(0.02)
         return {"gate_up": gate_up, "down": down}
+    if fmt == "fp8_block":
+        def nb(n):
+            return (n + 127) // 128
+        b = {
+            "gate_up": pin(E, 2 * I, H, dtype=torch.float8_e4m3fn),
+            "gate_up_scale": pin(E, nb(2 * I), nb(H), dtype=torch.bfloat16),
+            "down": pin(E, H, I, dtype=torch.float8_e4m3fn),
+            "down_scale": pin(E, nb(H), nb(I), dtype=torch.bfloat16),
+        }
+        # e4m3 0x00 is a clean zero and the scales are unit-ish, so nothing lands in
+        # the fp32 denormal range (which would slow the GEMV and skew the timing).
+        b["gate_up"].view(torch.uint8).fill_(0x38)  # 1.0
+        b["down"].view(torch.uint8).fill_(0x38)
+        b["gate_up_scale"].fill_(1.0)
+        b["down_scale"].fill_(1.0)
+        return b
     if fmt == "nvfp4":
         b = {
             "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
             "gate_up_scale": pin(E, 2 * I, H // 16, dtype=torch.uint8),
-            "gate_up_global": pin(E, 2 * I, dtype=torch.float16),
+            "gate_up_global": pin(E, 2 * I, dtype=torch.float32),
             "down_packed": pin(E, H, I // 2, dtype=torch.uint8),
             "down_scale": pin(E, H, I // 16, dtype=torch.uint8),
-            "down_global": pin(E, H, dtype=torch.float16),
+            "down_global": pin(E, H, dtype=torch.float32),
         }
         b["gate_up_global"].fill_(1.0)
-        b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp16
+        b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32
         return b
     if fmt == "mxfp4_triton":  # transposed split-K layout
         b = {
@@ -394,14 +414,11 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     specs = _offload_bank_specs(fmt, H, I)
     cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
     total_bytes = 0
+    sources = {}
     for name, (elems, dtype) in specs.items():
-        src = alloc_pinned_tensor(E, elems, dtype=dtype)  # cudaHostAlloc (mapped) like the loaders
-        dst = torch.empty(E, elems, dtype=dtype, device=device)
-        cache.bank_sources[name] = [src]
-        cache.bank_caches[name] = dst
-        cache.banks.append(([src], dst))
+        sources[name] = [alloc_pinned_tensor(E, elems, dtype=dtype)]  # cudaHostAlloc (mapped) like the loaders
         total_bytes += E * elems * dtype.itemsize
-    cache._build_copy_plan()  # enable the fused path (production default) when aligned
+    cache.set_bank_sources(sources)  # builds the fused copy plan (production default) when aligned
 
     cache.evict_slots[:E].copy_(torch.arange(E, dtype=torch.int32, device=device))
     cache.src_indices[:E].copy_(torch.randperm(E, device=device).to(torch.int32))
@@ -647,7 +664,7 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                 if fmt == "nvfp4":  # WF_NVFP4 is the only use_vnni format
                     _note(entry, "isa tier labels are nominal: this W4A8 kernel rides AVX-VNNI "
                                  "regardless of the forced tier")
-                elif fmt in ("mxfp4_triton", "ds_fp4"):
+                elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block"):
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
             entry["expert_bytes"] = entry["expert_bytes"] or c["expert_bytes"]
@@ -779,7 +796,7 @@ def run_benchbw(
     _prog("done")
 
     result = {
-        "version": 4,
+        "version": PROFILE_VERSION,
         "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
         "host": socket.gethostname(),

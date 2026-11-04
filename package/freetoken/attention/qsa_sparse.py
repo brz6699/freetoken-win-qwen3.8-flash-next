@@ -281,6 +281,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.ring_slots = self._graph["table_idx"][:bs]
         md.token_to_req = self._graph["token_to_req"][:bs]
         md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
+        self._count_gather(md)
+
+    def _count_gather(self, md: QSASparseMetadata) -> None:
+        """Advisory gather accounting for the KV host tier: each sparse layer reads this
+        step's bounded selection window per request, never the whole history. Host-side
+        lengths only, so it costs no device sync on the replay path."""
+        sel = int(
+            torch.clamp(md.kv_len_cpu, max=self.select_width).to(torch.int64).sum()
+        )
+        self.kvcache.count_gather(sel * max(len(self._idx_slot), 1))
 
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Eager decode (not graph-staged): this step's rows, once per forward. The live
@@ -293,6 +303,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.seq_lens = md.kv_len_cpu.to(self.device, non_blocking=True)
         md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
         md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+        self._count_gather(md)
 
     # ----- dense layers -------------------------------------------------------------------
     def forward(

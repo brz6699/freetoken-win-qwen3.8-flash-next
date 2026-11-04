@@ -65,9 +65,15 @@ def create_moe_strategy(backend: str) -> BaseMoeBackend:
     return SUPPORTED_MOE_STRATEGIES[backend]()
 
 
+# The user-selectable ``--moe-strategy`` / ``--moe-strategy-<role>`` choices (argparse
+# appends "auto"). Derived from the registry so it tracks the registered backends.
+MOE_STRATEGIES = SUPPORTED_MOE_STRATEGIES.supported_names()
+
+
 __all__ = [
     "BaseMoeBackend",
     "create_moe_strategy",
+    "MOE_STRATEGIES",
     "SUPPORTED_MOE_STRATEGIES",
     "OFFLOAD_MOE_STRATEGIES",
     "is_offload_moe_strategy",

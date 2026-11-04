@@ -233,7 +233,7 @@ class _DenseReader:
             g = part["weight_global"].reshape(-1).to(torch.float32)
             if g.numel() != 1:
                 raise ValueError(f"{target}: weight_global has {g.numel()} elements, expected one per-tensor scale")
-            out["weight_global"] = g.to(torch.float16).expand(rows).contiguous()
+            out["weight_global"] = g.expand(rows).contiguous()
         if "input_scale" in part:
             out["input_scale"] = part["input_scale"].reshape(()).to(torch.float32)
         return out
@@ -381,9 +381,44 @@ def _moe_dims(model_config):
     )
 
 
+def _gguf_expert_pieces(model_path: str, config):
+    """GGUF routed experts: one combined tensor per projection per layer
+    (``blk.N.ffn_gate_exps`` with ggml dims ``[k, rows_per_expert, n_experts]``, experts in the
+    outer dim) sliced into one packed block per expert; float expert types come through dense."""
+    from freetoken.layers.quantization.ggml_types import is_quantized
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.models.gguf.tensors import float_tensor, packed_rows
+
+    L, E, _, _, dense = _moe_dims(config)
+    index = gguf_tensor_index(model_path)
+
+    def t(name: str):
+        return index[name if name in index else f"{name}.weight"]
+
+    def rows(info):
+        return packed_rows(info) if is_quantized(info.ggml_type) else float_tensor(info).reshape(-1, int(info.ne[0]))
+
+    for li in tqdm(range(L), desc="Loading GGUF experts", disable=not get_tp_info().is_primary()):
+        blk = f"blk.{dense + li}"
+        parts = {
+            role: rows(t(f"{blk}.{leaf}"))
+            for role, leaf in (("gate", "ffn_gate_exps"), ("up", "ffn_up_exps"), ("down", "ffn_down_exps"))
+        }
+        for e in range(E):
+            yield li, e, e + 1, {r: p[e * p.shape[0] // E : (e + 1) * p.shape[0] // E] for r, p in parts.items()}
+
+
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
-    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
+    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. GGUF
+    experts come from the GGUF-native reader. Other expert kinds use the generic readers."""
+    if kind is QuantKind.GGUF:
+        if parallel:
+            raise NotImplementedError(
+                "parallel reader not implemented for GGUF experts: GGUF is a single packed "
+                "file (not safetensors), so the common reader doesn't apply"
+            )
+        return _gguf_expert_pieces(model_path, config)
     if kind is not QuantKind.FP8_BLOCK:
         return None
     if get_tp_info().size > 1:

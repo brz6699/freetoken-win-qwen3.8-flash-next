@@ -57,6 +57,33 @@ def apply() -> None:
         for line in text.split("\n"):
             if line.lstrip().startswith(("build ", "default ")):
                 line = drive_colon.sub(r"\1$:\2", line)
+            # Four host-side fixes on the cuda compile rule
+            # (`command = $nvcc ...`; the cuda_home/nvcc var lines carry no space):
+            #  - `-include ftdefs.h`: cudafe++'s MSVC-emulation parser rejects
+            #    flashinfer's FLASHINFER_INLINE expansion shape and MSVC CRT
+            #    lacks the ushort typedef; the shim header fixes both (written by
+            #    env._ensure_jit_defs_header under the same short JIT root).
+            #  - `-Xcompiler /FI<defs>`: nvcc passes -include only to the .cu
+            #    preprocess pass; the cl compile of cudafe's host stub re-includes
+            #    the headers without it, so the shim must also arrive via /FI.
+            #  - cccl headers #error (C1189) under the traditional preprocessor;
+            #    cccl's own escape hatch macro silences it without changing
+            #    preprocessing semantics (/Zc:preprocessor itself breaks nvcc's
+            #    generated host stubs, so it stays off). Plain -D reaches both
+            #    host and device passes.
+            #  - /utf-8 stops C4819 spam under this box's cp936.
+            if line.lstrip().startswith("command = ") and "$nvcc " in line \
+                    and "CCCL_IGNORE_MSVC_TRADITIONAL" not in line:
+                base = os.environ.get("FLASHINFER_WORKSPACE_BASE") or "C:\\fi"
+                defs = os.path.join(base, "ftdefs.h")
+                line = line.replace(
+                    "$nvcc ",
+                    f'$nvcc -include "{defs}" '
+                    "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING "
+                    "-Xcompiler /utf-8 "
+                    f"-Xcompiler /FI{defs} ",
+                    1,
+                )
             out.append(line)
         p.write_text("\n".join(out))
 
@@ -141,6 +168,149 @@ def allow_ultrawide_fc2_tile() -> None:
     kw._candidate_tile_fits = patched
 
 
+def force_ninja_output_encoding() -> None:
+    """Decode flashinfer's captured ninja output as UTF-8 with lossy fallback.
+
+    ``cpp_ext.run_ninja`` captures ninja's output with ``text=True`` and no explicit
+    encoding, so Python decodes with the locale codec (gbk/cp936 on this zh-CN box).
+    The piped stream mixes encodings (ninja status lines + cl's localized cp936
+    messages), and strict cp936 dies mid-capture with UnicodeDecodeError
+    ("0xad ... illegal multibyte sequence") even though the ninja build itself
+    succeeds. Replacing the function with an identical copy that pins
+    ``encoding="utf-8", errors="replace"`` keeps the build outcome identical and makes
+    the capture total. jit/core.py binds ``run_ninja`` by value at import, so the
+    wrapper is installed in both namespaces. Same lazy timing rule as apply().
+    """
+    if os.name != "nt":
+        return
+    try:
+        import subprocess as sp
+
+        from flashinfer.jit import cpp_ext, core
+    except Exception:
+        return
+    orig = cpp_ext.run_ninja
+    if getattr(orig, "_ft_ninja_enc_patched", False):
+        return
+
+    def run_ninja_utf8(workdir, ninja_file, verbose, max_jobs=None):
+        workdir.mkdir(parents=True, exist_ok=True)
+        command = [
+            "ninja", "-v",
+            "-C", str(workdir.resolve()),
+            "-f", str(ninja_file.resolve()),
+        ]
+        num_workers = max_jobs if max_jobs is not None else cpp_ext._get_num_workers()
+        if num_workers is not None:
+            command += ["-j", str(num_workers)]
+        import sys
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            sp.run(
+                command,
+                stdout=None if verbose else sp.PIPE,
+                stderr=sp.STDOUT,
+                cwd=str(workdir.resolve()),
+                check=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except sp.CalledProcessError as e:
+            msg = "Ninja build failed."
+            if e.output:
+                msg += " Ninja output:\n" + e.output
+            raise RuntimeError(msg) from e
+
+    run_ninja_utf8._ft_ninja_enc_patched = True
+    cpp_ext.run_ninja = run_ninja_utf8
+    if hasattr(core, "run_ninja"):
+        core.run_ninja = run_ninja_utf8
+
+
+def compact_jit_uris() -> None:
+    """Deterministically shorten flashinfer JIT module uris so ninja accepts the build paths.
+
+    flashinfer names each attention JIT module with its full signature (``batch_prefill_
+    with_kv_cache_dtype_q_bf16_..._kv_stride_equal`` ~188 chars). That uri becomes BOTH the
+    ``generated/<uri>/`` source directory and the JitSpec name, and the spec name is doubled
+    in the artifact path (``cached_ops/<name>/<name>.so``, jit/core.py:460-468), so even from
+    a one-letter drive root the ``.so`` path is ~370-415 chars. Python-side writes survive
+    that via the ``\\?\\``-prefixed FLASHINFER_WORKSPACE_BASE, but ninja applies its own
+    ~260-char check after normalizing the prefix away and dies at the first Stat. Shortening
+    the uri fixes both the artifact path and the source-directory path at once.
+
+    The uri influences ONLY disk naming and the spec name -- generated .cu content comes
+    purely from kwargs/jinja templates -- so replacing long uris with
+    ``<family>_<md5[:10]>`` is safe: deterministic across runs (restarts still hit the JIT
+    cache), unique per distinct signature, and the result (~24 chars) fits ninja's limit and
+    even this box's plain MAX_PATH without any prefix.
+
+    Callers import these symbols by value (decode.py / prefill.py / pod.py re-bind them at
+    import time), so the wrapper is installed into every namespace currently holding the
+    original. Same lazy timing rule as apply(): import flashinfer only after the CUDA
+    context is up. Idempotent; no-op on non-Windows.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import hashlib
+        import importlib
+        import inspect
+
+        from flashinfer.jit.attention import modules as M
+    except Exception:
+        return
+
+    def compact(uri):
+        if not isinstance(uri, str) or len(uri) <= 100:
+            return uri
+        family = "_".join(uri.split("_", 2)[:2])
+        return family + "_" + hashlib.md5(uri.encode("utf-8")).hexdigest()[:10]
+
+    holders = [M]
+    for dotted in (
+        "flashinfer.jit.attention",
+        "flashinfer.jit",
+        "flashinfer.decode",
+        "flashinfer.prefill",
+        "flashinfer.pod",
+    ):
+        try:
+            holders.append(importlib.import_module(dotted))
+        except Exception:
+            pass
+
+    for fname in (
+        "gen_customize_batch_prefill_module",
+        "gen_customize_batch_decode_module",
+    ):
+        fn = getattr(M, fname, None)
+        if fn is None or getattr(fn, "_ft_uri_compact_patched", False):
+            continue
+        try:
+            idx = list(inspect.signature(fn).parameters).index("uri")
+        except Exception:
+            continue
+
+        def patched(*args, _orig=fn, _idx=idx, **kwargs):
+            if "uri" in kwargs:
+                kwargs = {**kwargs, "uri": compact(kwargs["uri"])}
+            elif len(args) > _idx and isinstance(args[_idx], str):
+                args = args[:_idx] + (compact(args[_idx]),) + args[_idx + 1:]
+            return _orig(*args, **kwargs)
+
+        patched._ft_uri_compact_patched = True
+        for mod in holders:
+            if getattr(mod, fname, None) is fn or getattr(mod, fname, None) is None:
+                try:
+                    setattr(mod, fname, patched)
+                except Exception:
+                    pass
+
+
 def trim_route_pack_smem() -> None:
     """Shrink flashinfer b12x route-pack tile heights so CUDA-graph capture fits SM120 smem.
 
@@ -174,4 +344,10 @@ def trim_route_pack_smem() -> None:
                 pass
 
 
-__all__ = ["apply", "trim_route_pack_smem", "allow_ultrawide_fc2_tile"]
+__all__ = [
+    "apply",
+    "trim_route_pack_smem",
+    "allow_ultrawide_fc2_tile",
+    "compact_jit_uris",
+    "force_ninja_output_encoding",
+]

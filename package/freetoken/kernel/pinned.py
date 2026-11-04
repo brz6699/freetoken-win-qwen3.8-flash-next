@@ -51,6 +51,42 @@ def host_register(addr: int, nbytes: int) -> None:
 
 
 @lru_cache(maxsize=1)
+def _load_cudart():
+    """A cudart handle for the one host call the compiled extension does not wrap.
+
+    The pyd links its own cudart, but registrations live in the DRIVER's table, so
+    cudaHostUnregister from any cudart clears ranges registered through the extension."""
+    import ctypes
+    from ctypes.util import find_library
+
+    tried = set()
+    for name in ("cudart64_13.dll", "cudart64_12.dll", find_library("cudart")):
+        if not name or name in tried:
+            continue
+        tried.add(name)
+        try:
+            lib = ctypes.CDLL(name)
+            lib.cudaHostUnregister
+            return lib
+        except (OSError, AttributeError):
+            continue
+    raise ImportError("no cudart exporting cudaHostUnregister")
+
+
+def host_unregister(addr: int) -> None:
+    """cudaHostUnregister a previously registered host range (pairs with host_register).
+
+    Closing a registered mmap without this leaves the driver-side registration on the
+    reused VA: the next bank landing on that address fails cudaHostRegister with
+    cudaErrorHostMemoryAlreadyRegistered."""
+    import ctypes
+
+    rc = _load_cudart().cudaHostUnregister(ctypes.c_void_p(addr))
+    if rc != 0:
+        raise RuntimeError(f"cudaHostUnregister rc={rc} for addr 0x{addr:x}")
+
+
+@lru_cache(maxsize=1)
 def _host_ptr_identity() -> bool:
     # cached per process: FreeToken pins one CUDA device per process (set at engine launch)
     return bool(_load_pinned_extension().host_ptr_identity())

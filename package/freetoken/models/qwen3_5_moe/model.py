@@ -74,6 +74,18 @@ class Qwen3_5DecoderLayer(BaseOP):
         return hidden, residual
 
 
+class FinalNormMixer:
+    """The ``hc``-free twin of qwen4_exp's top mixer: this family keeps one hidden stream, so
+    collapsing the residual to the lm_head input is just the final RMSNorm. ``mix`` keeps the
+    tuple shape the MTP backends unpack (``mix(residual)[0]``)."""
+
+    def __init__(self, norm: GemmaRMSNorm):
+        self.norm = norm
+
+    def mix(self, residual: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return (self.norm.forward(residual),)
+
+
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
@@ -87,13 +99,27 @@ class Qwen3_5Model(BaseOP):
             ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # plain objects, so neither shows up in the state dict: the mixer shim just delegates to
+        # ``norm`` above (already a child), and the head reference is set by the engine on --mtp.
+        self.hyper_connection_mixer = FinalNormMixer(self.norm)
+        self._mtp_head = None
+        self._mtp_hidden: torch.Tensor | None = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
+        batch = get_global_ctx().batch
+        x = embed_input_ids(self.embed_tokens, input_ids, batch)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
-        x, _ = self.norm.forward_add_residual(x, residual)
+        # fused add+norm leaves the summed hidden in ``residual`` and the normed one in ``x``. Both
+        # the LM head and the nextn head read the NORMED stream: llama.cpp assigns ``t_h_nextn``
+        # after ``output_norm`` (src/models/qwen35moe.cpp), so the head's ``hnorm`` always sees an
+        # already-normed h and never a raw sum whose scale drifts with sequence depth.
+        x, residual = self.norm.forward_add_residual(x, residual)
+        self._last_residual = residual
+        self._mtp_hidden = x
+        if self._mtp_head is not None:
+            self._mtp_head.write_ctx_kv(batch, x)
         return x
 
 
@@ -108,7 +134,26 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        # The nextn block these GGUFs carry, as a draft head. Built only with --mtp so an
+        # --mtp-off serve pays nothing (the loader then drops the mtp.* keys as well).
+        self.mtp = None
+        if getattr(config, "enable_mtp", False):
+            from .mtp import Qwen3_5MTP
+
+            self.mtp = Qwen3_5MTP(config)
         super().__init__()
+
+    def load_host_tables(self, engine_config) -> int:
+        """Load the draft head's routed experts; returns the pinned host bytes the engine
+        reserves from its pin budget (0 when they went GPU-resident or were not needed)."""
+        head = getattr(self, "mtp", None)
+        if head is None or getattr(engine_config, "use_dummy_weight", False):
+            return 0
+        from .mtp import load_mtp_experts
+
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+        quant = str(getattr(engine_config, "mtp_expert_quant", "none") or "none").lower()
+        return load_mtp_experts(engine_config.model_path, head.bank, device=device, quant=quant)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

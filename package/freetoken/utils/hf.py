@@ -40,7 +40,7 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     if not getattr(tokenizer, "chat_template", None):
         try:
             path = hf_hub_download(repo_id=model_path, filename="chat_template.json")
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 tokenizer.chat_template = json.load(f)["chat_template"]
         except Exception:
             pass
@@ -62,7 +62,7 @@ def load_eos_token_ids(
     if (gguf_src := gguf_config_source(model_path)) is not None:
         from freetoken.models.gguf.tokenizer import gguf_eos_token_ids
 
-        return frozenset(gguf_eos_token_ids(gguf_src, tokenizer))
+        return frozenset(gguf_eos_token_ids(gguf_src))
 
     ids: set[int] = set()
     if tokenizer.eos_token_id is not None:
@@ -113,12 +113,15 @@ def load_generation_sampling(model_path: str) -> dict[str, Any]:
 
         meta = load_gguf_metadata(gguf_src)
         out: dict[str, Any] = {}
+        # GGUF stores these as fp32, so a written 0.95 arrives as 0.949999988079071. Round back
+        # to what the checkpoint declares rather than carrying the representation error into every
+        # request's SamplingParams (and into the MTP accept diagnostics that print it).
         if (v := meta.get("general.sampling.temp")) is not None:
-            out["temperature"] = float(v)
+            out["temperature"] = round(float(v), 6)
         if (v := meta.get("general.sampling.top_k")) is not None:
             out["top_k"] = int(v)
         if (v := meta.get("general.sampling.top_p")) is not None:
-            out["top_p"] = float(v)
+            out["top_p"] = round(float(v), 6)
         return out
 
     try:
@@ -186,7 +189,9 @@ def _raw_config_json(model_path: str) -> dict:
         path = os.path.join(model_path, "config.json")
     else:
         path = hf_hub_download(repo_id=model_path, filename="config.json")
-    with open(path, encoding="utf-8") as f:
+    # utf-8-sig also swallows the BOM some Windows exporters leave on config.json;
+    # plain UTF-8 files decode identically.
+    with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -195,7 +200,7 @@ def sidecar_quantization_config(model_path: str) -> dict | None:
     sidecar = optional_hf_file(model_path, "hf_quant_config.json")
     if sidecar is None:
         return None
-    with open(sidecar, encoding="utf-8") as f:
+    with open(sidecar, encoding="utf-8-sig") as f:
         quant = json.load(f).get("quantization")
     if not isinstance(quant, dict):
         return None

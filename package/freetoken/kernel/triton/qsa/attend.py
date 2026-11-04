@@ -52,7 +52,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PACKED4: tl.constexpr,
+    HOST: tl.constexpr,
+    ET: tl.constexpr,
 ) -> None:
+    if HOST:
+        # The KV slab is pinned host memory (--kv-offload): the wrapper passed the address
+        # the GPU must dereference as a plain number, so rebuild the typed pointers here.
+        # Dequant scales only exist on the packed path, where they ride the compute dtype.
+        k_cache_ptr = k_cache_ptr.to(tl.int64).to(tl.pointer_type(ET))
+        v_cache_ptr = v_cache_ptr.to(tl.int64).to(tl.pointer_type(ET))
+        if PACKED4:
+            k_dscale_ptr = k_dscale_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+            v_dscale_ptr = v_dscale_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
     kv_head = tl.program_id(1)
@@ -470,13 +481,31 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
+    # A host-tier slab reaches the kernel as a mapped address, not a tensor (see ple.py).
+    host = not k_cache.is_cuda
+    if host:
+        from freetoken.kernel.pinned import device_ptr
+        from freetoken.kernel.triton.host_store import host_element_type
+
+        et = host_element_type(k_cache.dtype)
+        k_arg = int(device_ptr(k_cache))
+        v_arg = int(device_ptr(v_cache))
+        ds_k_arg = int(device_ptr(k_dscale)) if packed4 else k_arg
+        ds_v_arg = int(device_ptr(v_dscale)) if packed4 else v_arg
+    else:
+        et = tl.bfloat16
+        k_arg = k_cache
+        v_arg = v_cache
+        ds_k_arg = k_dscale if packed4 else k_cache
+        ds_v_arg = v_dscale if packed4 else v_cache
+
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
-        k_cache,
-        v_cache,
-        k_dscale if packed4 else k_cache,
-        v_dscale if packed4 else v_cache,
+        k_arg,
+        v_arg,
+        ds_k_arg,
+        ds_v_arg,
         logical_indices,
         block_table,
         token_to_req,
@@ -512,6 +541,8 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         PACKED4=packed4,
+        HOST=host,
+        ET=et,
         num_warps=partial_warps,
         num_stages=2,
     )

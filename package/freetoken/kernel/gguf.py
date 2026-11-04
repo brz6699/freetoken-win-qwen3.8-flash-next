@@ -51,7 +51,31 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    # torch decodes the ``cl``/``cc`` version banner with the console OEM code page,
+    # which on this box's installs is a code page Python cannot map (``cp1``); that
+    # raises UnicodeDecodeError before any compile starts. Force a lossy UTF-8 decode.
+    import torch.utils.cpp_extension as cpp_ext
+
+    if getattr(cpp_ext, "SUBPROCESS_DECODE_ARGS", None) is not None:
+        cpp_ext.SUBPROCESS_DECODE_ARGS = ("utf-8", "replace")
+
+    # /utf-8: CUDA 13.1's cudafe++ mis-parses torch's own headers when the host
+    # compile inherits the console's cp936 code page; -allow-unsupported-compiler:
+    # MSVC 14.4x is newer than the version band crt/host_config.h accepts.
+    # USE_CUDA: torch/all.h reaches compiled_autograd.h, whose ``if constexpr`` chain
+    # is only skipped when USE_CUDA is set -- without it MSVC's host pass hits the
+    # chain and fails on ``::std`` (C2872) because CCCL reopens ``namespace std``.
+    # /Zc:preprocessor is what CCCL asks for on that same path.
+    extra_cuda_cflags = [
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "-allow-unsupported-compiler",
+        "-DUSE_CUDA=1",
+        "-Xcompiler",
+        "/utf-8",
+        "-Xcompiler",
+        "/Zc:preprocessor",
+    ]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a

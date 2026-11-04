@@ -92,8 +92,8 @@ def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
 
 
 def global_rows(piece: torch.Tensor, rows: int) -> torch.Tensor:
-    """Per-expert global scale as one fp16 value per output row (a scalar per expert is broadcast)."""
-    flat = piece.reshape(piece.shape[0], -1).to(torch.float16)
+    """Per-expert global scale as one fp32 value per output row (a scalar per expert is broadcast)."""
+    flat = piece.reshape(piece.shape[0], -1).to(torch.float32)
     if flat.shape[1] == rows:
         return flat
     assert flat.shape[1] == 1, (flat.shape, rows)
@@ -136,6 +136,19 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
+    # Minimum row-byte alignment the kernel's tile load requires; arena/peb arithmetic
+    # ROUND_UPs to this so every gcd-lattice landing satisfies the READ contract.
+    row_align_bytes: ClassVar[int] = 16
+
+    @classmethod
+    def align_of(cls, kernels: "Any") -> int:
+        """LCM of the given kernels' ``row_align_bytes``; the atom the arena peb/cpp round to."""
+        from math import lcm
+
+        a = 1
+        for k in kernels:
+            a = lcm(a, k.row_align_bytes)
+        return a
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

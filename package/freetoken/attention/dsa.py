@@ -230,6 +230,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             # + device-read live lengths, once per step at the first layer.
             md.rows = self._decode_rows(batch).to(torch.int32)
             md.kvlen = md.kv_len_cpu.to(self.device, non_blocking=True)
+            self._count_gather(md)
         self.kvcache.store_kv(c_kv, k_rope, batch.out_loc, layer_id)
         if self.dsa_enabled and indexer_inputs is not None:
             # Scatter index keys unconditionally: short prefills serve through the
@@ -358,6 +359,20 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self._kvlen_buf[:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
         md.rows = self._rows_buf[:bs]
         md.kvlen = self._kvlen_buf[:bs]
+        self._count_gather(md)
+
+    def _count_gather(self, md: DSAMetadata) -> None:
+        """Advisory gather accounting for the KV host offload: with the indexer on each layer
+        reads ``index_topk`` latent rows per request (fewer when the history is shorter);
+        the dense ablation walks the whole history by definition. Host-side lengths only."""
+        lengths = md.kv_len_cpu
+        if self.dsa_enabled:
+            rows = torch.clamp(lengths, max=self.index_topk)
+        else:
+            rows = lengths
+        self.kvcache.count_gather(
+            int(rows.to(torch.int64).sum()) * max(self.kvcache.num_layers, 1)
+        )
 
     def prepare_for_capture(self, batch: Batch) -> None:
         # The capture batch is all dummy rows with no scheduler-staged

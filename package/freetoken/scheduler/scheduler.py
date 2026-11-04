@@ -57,6 +57,23 @@ def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
 
 
+def _augment_mamba_slots(config, cur_pages: int, targets: dict) -> None:
+    """Scale the GDN state-pool snapshot cache to a budget slide's KV growth, in place.
+
+    ``propose_targets`` trades KV pages against MoE slots inside the shared arena; the sibling
+    GDN pool (allocated outside the arena) keeps its startup size unless told otherwise. When the
+    slide grew KV, hand its enlarged prefix-retention onto the snapshot cache too, so the rebuild
+    resizes the linear-state pool in the same pass. No-op for dense/naive models and KV shrinks."""
+    from freetoken.kvcache.linear_state_pool import mamba_slots_for_growth
+
+    new_pages = targets.get("num_pages")
+    if new_pages is None:
+        return
+    slots = mamba_slots_for_growth(config, cur_pages, int(new_pages))
+    if slots is not None:
+        targets["num_mamba_slots"] = slots
+
+
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
@@ -85,6 +102,14 @@ class MtpBackend:
     def draft_device(self) -> torch.device:
         return self.sch.device
 
+    def _head_hidden(self, eng) -> torch.Tensor:
+        """The hidden the nextn head reads. llama.cpp takes ``t_h_nextn`` AFTER the model's final
+        norm (the same tensor the LM head sees), so a family that folds that step publishes it as
+        ``_mtp_hidden``; otherwise the head keeps taking the raw pre-mixer stream."""
+        model = eng.model.model
+        hidden = getattr(model, "_mtp_hidden", None)
+        return model._last_residual if hidden is None else hidden
+
     def anchor(self, batch, sample_args):
         raise NotImplementedError
 
@@ -104,7 +129,7 @@ class GpuMtpBackend(MtpBackend):
     def anchor(self, batch, sample_args):
         eng = self.sch.engine
         out = eng.forward_batch(batch, sample_args, eager_only=True)
-        return out, eng.model.model._last_residual
+        return out, self._head_hidden(eng)
 
     def draft_forward(self, db, res_j, fed_gpu):
         return self.sch.engine.mtp_forward(db, res_j, fed_gpu)
@@ -117,7 +142,8 @@ class GpuMtpBackend(MtpBackend):
             v_logits_all = eng.model.lm_head.forward(
                 eng.model.model.hyper_connection_mixer.mix(vres)[0]
             )  # [B*(K+1), vocab]
-        return vres, v_logits_all
+        # logits keep the mixer path; the head's h-input is the normed stream it was trained on
+        return self._head_hidden(eng), v_logits_all
 
     def rerun(self, batch):
         return self.sch.engine.forward_logits(batch)
@@ -137,7 +163,7 @@ class CpuMtpBackend(MtpBackend):
     def anchor(self, batch, sample_args):
         eng = self.sch.engine
         out = eng.forward_batch(batch, sample_args, eager_only=True)
-        return out, eng.model.model._last_residual
+        return out, self._head_hidden(eng)
 
     def draft_forward(self, db, res_j, fed_gpu):
         return self.sch.engine.mtp_forward(db, res_j, fed_gpu)
@@ -150,7 +176,7 @@ class CpuMtpBackend(MtpBackend):
             v_logits_all = eng.model.lm_head.forward(
                 eng.model.model.hyper_connection_mixer.mix(vres)[0]
             )
-        return vres, v_logits_all
+        return self._head_hidden(eng), v_logits_all
 
     def rerun(self, batch):
         return self.sch.engine.forward_logits(batch)
@@ -542,6 +568,17 @@ class Scheduler(SchedulerIOMixin):
                     if finished:
                         break
 
+                # A stop match breaks the stream mid-commit, but the commit already wrote KV for
+                # every token it shipped. Extend the ids to that length so the finish insert covers
+                # all of those columns; a shorter key leaves the tail owned by neither the tree nor
+                # the free list, which is what the idle integrity check reports.
+                if finished and req.input_ids.numel() < req.cached_len:
+                    n = int(req.input_ids.numel())
+                    keep = min(int(req.cached_len), int(req.max_device_len))
+                    tail = self.token_pool[req.table_idx, n:keep].cpu().to(req.input_ids.dtype)
+                    if tail.numel():
+                        req.append_host(tail)
+
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
@@ -589,6 +626,7 @@ class Scheduler(SchedulerIOMixin):
             slider.observe(used, total)
         if reply:
             mem = self._gpu_mem_bytes()
+            gather = self._gather_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
             for m in reply:
@@ -599,8 +637,10 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                m.gather_bytes = gather
         self.status_reporter.report_batch(
             batch,
+            delivered_tokens=len(reply),
             running_reqs=len(self.decode_manager.running_reqs),
             queue_reqs=len(self.prefill_manager.pending_list),
             kv_used_pages=used,
@@ -661,6 +701,13 @@ class Scheduler(SchedulerIOMixin):
             return None
         total = cm.swa_pool.swa_num_tokens - 1
         return total - cm.swa_available_size, total
+
+    def _gather_bytes(self) -> int:
+        """Cumulative bytes the KV host tier served to the sparse-index gathers (0 with the
+        tier off, or for a pool that keeps its rows on the GPU). Advisory, no device sync."""
+        pool = getattr(self.engine, "kv_cache", None)
+        count = getattr(pool, "gather_bytes", None)
+        return int(count()) if count is not None else 0
 
     def _gpu_mem_bytes(self) -> int:
         """Bytes this engine process holds on the GPU (torch's reserved caching-allocator
@@ -984,12 +1031,28 @@ class Scheduler(SchedulerIOMixin):
             logger.error(f"cache rebuild failed: {e!r} — rolling back to the previous geometry")
             try:
                 self.rebuild_cache(**prior)
-            except Exception as e2:  # noqa: BLE001 — rollback failed too; genuinely unrecoverable
-                logger.error(f"cache rebuild rollback failed: {e2!r} — server latched failed")
+            except Exception as e2:  # noqa: BLE001 — rollback failed too; degrade, don't latch
+                # A half-applied rollback still leaves the engine servable: every pool that
+                # DID resize is consistent within the byte envelope (both endpoints fit), and
+                # once the torn-down GraphRunner is fully dropped its replay guard routes
+                # later batches through the eager forward. Complete the teardown the rollback
+                # never reached and hand the freed segments back, so requests keep being
+                # served (eagerly) instead of the process latching failed with its arena +
+                # capture scratch pinned in VRAM while every request only sees a 503.
+                try:
+                    self.engine.graph_runner.destroy_cuda_graphs()
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001 — teardown is best-effort
+                    pass
+                logger.warning(
+                    f"cache rebuild rollback incomplete ({e2!r}) — serving eagerly "
+                    f"on the surviving geometry"
+                )
+                self._log_cache_geometry("Cache after incomplete rollback")
                 self._reply_rebuild(
                     msg.request_id,
-                    "failed",
-                    error=f"{e!r}; rollback to the prior geometry also failed: {e2!r}",
+                    "rejected",
+                    error=f"rebuild and rollback failed ({e!r}; {e2!r}); serving eagerly",
                 )
                 return
             logger.warning("cache rebuild rolled back to the previous geometry — still serving")
@@ -1046,12 +1109,19 @@ class Scheduler(SchedulerIOMixin):
             )
         else:
             from freetoken.engine.cache_budget import expert_bytes_per_slot
-            from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
+            from freetoken.layers.quantization.moe.base import MoEKernel
+            from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE, iter_offload_moe_layers
 
+            active_kernels = {
+                layer.quant_method.kernel
+                for layer in iter_offload_moe_layers(engine.model)
+                if getattr(layer, "quant_method", None) is not None
+            }
+            row_align = MoEKernel.align_of(active_kernels) if active_kernels else 128
             total_experts = mc.num_layers * mc.num_experts
             geometry = dict(
                 cache_per_page=cache_per_page,
-                per_expert_bytes=expert_bytes_per_slot(mc.bank_sources),
+                per_expert_bytes=expert_bytes_per_slot(mc.bank_sources, row_align),
                 num_experts=mc.num_experts,
                 total_experts=total_experts,
                 max_slots=(MARLIN_MAX_CACHE_SIZE if mc.quant_format == "nvfp4_marlin" else total_experts),
@@ -1083,15 +1153,25 @@ class Scheduler(SchedulerIOMixin):
         geo = self._current_cache_geometry()
         page_tokens = getattr(self, "_kv_page_tokens", 1)
         demand = getattr(self, "_kv_demand_tokens", 0)
+        cm = getattr(self, "cache_manager", None)
+        live_tokens = cm.page_usage()[0] * page_tokens if cm is not None else demand
         # Relax the shrink-only floor halfway toward what the pool actually holds each idle tick
         # (never below it), so a big old turn does not pin KV and starve the MoE cache later.
-        if not force:
-            cm = getattr(self, "cache_manager", None)
-            if cm is not None:
-                live_tokens = cm.page_usage()[0] * page_tokens
-                if demand > live_tokens:
-                    demand = live_tokens + (demand - live_tokens) // 2
-                    self._kv_demand_tokens = demand
+        if not force and demand > live_tokens:
+            demand = live_tokens + (demand - live_tokens) // 2
+            self._kv_demand_tokens = demand
+        # Queued prompts are concrete WAITING KV demand: invisible to the occupancy EMA until
+        # each is admitted, yet every one claims its full prompt span on admission. After an
+        # idle shrink a burst must lift the demand floor IMMEDIATELY -- cover live occupancy
+        # plus the queued prompts as a hard floor (propose_targets bumps the proposal to the
+        # demand floor after its clamps) instead of waiting for the EMA to catch up tick by
+        # tick while prepares over-fill the shrunk pool. With the queue drained this lift is
+        # inert and the half-relax above resumes decaying the floor again.
+        queued_tokens = sum(
+            int(getattr(p, "input_len", 0) or 0)
+            for p in getattr(getattr(self, "prefill_manager", None), "pending_list", ())
+        )
+        demand = max(demand, live_tokens + queued_tokens)
         hot_cap = getattr(self, "_hot_window_tokens", 0)
         demand_tokens = min(demand, hot_cap) if hot_cap > 0 else demand
         targets = slider.propose(
@@ -1121,6 +1201,8 @@ class Scheduler(SchedulerIOMixin):
             ):
                 return
             self._slide_last_queued = now
+        slider.confirm()
+        _augment_mamba_slots(self.config, geo["num_pages"], targets)
         logger.info_rank0(f"budget slide queued: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(
             request_id="budget-slide", mode="if_idle", **targets
@@ -1154,13 +1236,12 @@ class Scheduler(SchedulerIOMixin):
             self._process_one_msg(dq.popleft())
 
     def _grow_to_cover(self, need_tokens: int) -> bool:
-        """Ceil-rounded follow-up to grow-before-reject. propose_targets rounds a move to
-        the NEAREST joint lcm step, which can land a few pages below a concrete prompt's
+        """Ceil-rounded follow-up to grow-before-reject. propose_targets rounds a trade
+        to whole expert slots, which can land a few pages below a concrete prompt's
         footprint (observed: a 77610-token prompt against a 77312-token post-grow ceiling).
-        A hard admission demand must round UP, so price the residual against whole chunks
-        here and queue the exact target through the same rebuild slot."""
-        import math
-
+        A hard admission demand must round UP, so ceil the slot payment and hand over
+        the exact page count when the full trade survives the clamps, queueing through
+        the same rebuild slot."""
         try:
             cpp, _fixed, page_tokens, _mr = self.engine._pool_cls.kv_cost(self.config)
         except Exception:  # noqa: BLE001 — same optional-pool semantics as the builder
@@ -1182,7 +1263,17 @@ class Scheduler(SchedulerIOMixin):
             from freetoken.engine.cache_budget import expert_bytes_per_slot
             from freetoken.moe.offload_cache import MARLIN_MAX_CACHE_SIZE
 
-            peb = max(1, int(expert_bytes_per_slot(mc.bank_sources)))
+            # Price the trade with the SAME per-slot bytes the arena and the slider were
+            # sized with. A default-aligned recompute is smaller than the slider's value, so
+            # this follow-up would hand over fewer slot bytes than the envelope check later
+            # demands and the rebuild lands past the arena.
+            peb = max(
+                1,
+                int(
+                    getattr(self.engine, "_arena_per_expert_bytes", 0)
+                    or expert_bytes_per_slot(mc.bank_sources)
+                ),
+            )
             total_experts = mc.num_layers * mc.num_experts
             hi = min(
                 total_experts,
@@ -1191,18 +1282,41 @@ class Scheduler(SchedulerIOMixin):
             floor = min(
                 hi, max(mc.num_experts, 2 * mc.num_experts if mc.prefill_overlap else mc.num_experts)
             )
-            chunk_pages = math.lcm(cpp, peb) // cpp
-            steps = max(0, -(-(need_pages - cur_pages) // chunk_pages))
-            new_pages = min(cur_pages + steps * chunk_pages, max_pages)
             cur_moe = int(geo.get("moe_cache_size") or 0)
-            new_moe = max(floor, min(hi, cur_moe - (new_pages - cur_pages) * cpp // peb))
+            # Trade in whole EXPERT SLOTS (same lattice as propose_targets): CEIL the slot
+            # payment so the traded bytes cover the page delta, without the near-coprime
+            # blow-up lcm(cpp, peb) produced on latent-KV geometries (a 0.2 MiB page
+            # against a 13.5 MiB slot put its lcm far past the whole envelope).
+            delta_slots = -(-(need_pages - cur_pages) * cpp // peb)
+            new_moe = max(floor, min(hi, cur_moe - delta_slots))
+            new_pages = min(cur_pages + (cur_moe - new_moe) * peb // cpp, max_pages)
+            if new_pages < need_pages and floor <= cur_moe - delta_slots <= hi:
+                # Full trade survived the clamps: ceil-slots then floor-pages can still
+                # strand one page under the prompt; a hard admission bound hands over
+                # the exact count instead of bouncing the request for a missing page.
+                new_pages = min(need_pages, max_pages)
             targets = {"num_pages": int(new_pages), "moe_cache_size": int(new_moe)}
+        pending = self._pending_rebuild
+        if (
+            pending is not None
+            and pending.num_pages == targets["num_pages"]
+            and pending.moe_cache_size == targets.get("moe_cache_size")
+        ):
+            # The identical grow is already queued toward the idle safe point (a long
+            # decode holds it off). Every further admission that hits the same wall is
+            # satisfied by that same pending rebuild: return quiet, no re-log, no
+            # smoother reset -- the resize (and its reset) happens once, at land time.
+            return True
+        _augment_mamba_slots(self.config, cur_pages, targets)
         logger.info_rank0(f"budget slide admission grow: {targets}")
         self._pending_rebuild = CacheRebuildBackendMsg(
             request_id="budget-slide", mode="if_idle", **targets
         )
         if not (self.prefill_manager.runnable or self.decode_manager.runnable):
             self._execute_pending_rebuild()
+        slider = getattr(self, "_budget_slider", None)
+        if slider is not None:
+            slider.reset_for_resize()  # geometry changed without a propose/confirm cycle
         return True
 
     def _current_cache_geometry(self) -> dict:
@@ -1415,6 +1529,16 @@ class Scheduler(SchedulerIOMixin):
         is a single batched forward across requests, drafts and rollbacks loop per request."""
         if not (getattr(self.config, "enable_mtp", False) and batch.is_decode):
             return False
+        # Models whose class carries no MTP head (qwen3_5_moe and other plain-LLM layouts) cannot
+        # speculate; they must take the plain decode path instead of tripping on the missing head.
+        if getattr(self.engine.model, "mtp", None) is None:
+            if not getattr(self, "_mtp_headless_warned", False):
+                self._mtp_headless_warned = True
+                logger.info_rank0(
+                    "MTP: this model class carries no MTP head"
+                    " -- stepping back to plain decode"
+                )
+            return False
         if not batch.reqs:
             return False
         for req in batch.reqs:
@@ -1523,6 +1647,17 @@ class Scheduler(SchedulerIOMixin):
         vb.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
             vb.fla_metadata = build_fla_metadata(vb, dev)
+            if allocate:
+                # The verify caches one GDN snapshot per row it reads, so the commit can pick the
+                # accepted prefix's state instead of re-running that prefix. Each request gets a
+                # row-block by its position in the batch -- at most max_running_req are in flight.
+                gdn = self.engine.linear_state_pool
+                rows = ranges[0][1] - ranges[0][0]
+                gdn.ensure_verify_rows(rows, self.config.max_running_req)
+                vb.fla_metadata.verify_rows = rows
+                vb.fla_metadata.verify_idx = torch.arange(
+                    len(vb.padded_reqs), dtype=torch.int32, device=dev
+                )
         self.engine.attn_backend.prepare_metadata(vb)
         return vb, input_mapping
 
@@ -1604,7 +1739,13 @@ class Scheduler(SchedulerIOMixin):
             # emitted sequence follows the target exactly; an argmax draft would break that
             # correction. A greedy request collapses q_j to a near-delta at argmax (tiny T) so it
             # reduces exactly to the old argmax==argmax match with maximum acceptance.
-            T_draft = 1e-6 if req.sampling_params.is_greedy else 1.0
+            # q_j must be built by the SAME recipe as p_j (temperature, then top-k / top-p renorm)
+            # or the two supports never meet: the target's p is truncated to its top-k, so a draft
+            # drawn from an untruncated head distribution lands outside that set and gets p[d]=0 --
+            # a guaranteed reject. Renormalizing q over the head's own top-k keeps q a proper
+            # distribution (the correction stays exact) and puts drafts where p has mass.
+            sp = req.sampling_params
+            T_draft = 1e-6 if sp.is_greedy else (sp.temperature if sp.temperature > 0.0 else 1e-6)
             residual_i = residual_all[idx : idx + 1]
             drafts: list[torch.Tensor] = []
             d_probs: list[torch.Tensor] = []
@@ -1625,6 +1766,10 @@ class Scheduler(SchedulerIOMixin):
                 if diag_on:
                     d1_logits_first = d_logits
                 q_j = mtp_sampling.softmax(d_logits, T_draft)               # [1, vocab]
+                if sp.top_k >= 1:
+                    q_j = mtp_sampling.top_k_renorm_probs(q_j, sp.top_k)
+                if 0.0 < sp.top_p < 1.0:
+                    q_j = mtp_sampling.top_p_renorm_probs(q_j, sp.top_p)
                 d = mtp_sampling.sampling_from_probs(q_j).to(torch.int32).view(1)
                 drafts.append(d)
                 d_probs.append(q_j)
@@ -1634,13 +1779,9 @@ class Scheduler(SchedulerIOMixin):
 
         # 3. verify forward: every request contributes K+1 rows (anchor + K drafts) over its own
         # position window [L+1, L+K+2), assembled into ONE batched prefill forward.
-        snap_slots: list = []
-        if gdn is not None:
-            for req, L, T in starts:
-                slot = gdn.alloc(1)[0]
-                live = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-                gdn.copy_from(live, slot)
-                snap_slots.append(slot)
+        # The GDN state each request needs after the commit is one of the rows this verify forward
+        # is about to read, so the verify caches a snapshot per row (fla_metadata.verify_rows) and
+        # the commit below selects from them -- no pre-copy, no second forward.
         # Verify rows carry draft tokens (may be rejected): the context-KV hook must not write
         # them; the step-end rewrite installs the TRUE rows instead.
         mtp._ctx_write_off = True
@@ -1731,35 +1872,22 @@ class Scheduler(SchedulerIOMixin):
                     d_ids,
                     v_pred_all[idx * (K + 1) : (idx + 1) * (K + 1)].tolist(),
                     m,
+                    sp,
                 )
 
-        # 5. rollback per request whose tail was cut (settles GDN state to the committed prefix).
-        # Split the reject-path CPU cost: rollback_ms = GDN slot restore (memcpy), redraft_ms =
-        # recompute of the committed prefix. The reject-path doubling (~57->121ms at bs=1) shows
-        # up as step_ms - verify_ms; these two tell which half to attack.
+        # 5. settle each request's GDN state at its committed cut. Row m of the verify's snapshots
+        # IS the state after the accepted prefix, so this is one slice copy per request instead of
+        # restore-plus-recompute (the old reject-path doubling of step_ms over verify_ms). A full
+        # accept needs nothing: the live slot already holds the last verify row's state.
         rb_acc = 0.0
-        rd_acc = 0.0
         for idx, (req, L, T, m) in enumerate(rollback_needed):
-            slot_i = snap_slots[idx] if snap_slots else None
-            if m < K and slot_i is not None:
-                _t0 = time.perf_counter()
-                live = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-                gdn.copy_from(slot_i, live)
-                rb_acc += time.perf_counter() - _t0
-                _t1 = time.perf_counter()
-                rbatch, rmap = self._mtp_extend_batch(
-                    [req], [(L + 1, L + 1 + m + 1)], allocate=False
-                )
-                rbatch.moe_force_decode = True
-                rbatch.input_ids = self.token_pool[rmap]
-                self._mtp_backend.rerun(rbatch)
-                rd_acc += time.perf_counter() - _t1
-            if slot_i is not None:
-                _t2 = time.perf_counter()
-                gdn.free(slot_i)
-                rb_acc += time.perf_counter() - _t2
+            if m >= K or gdn is None:
+                continue
+            live = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+            _t0 = time.perf_counter()
+            gdn.load_verify_row(live, idx, m)
+            rb_acc += time.perf_counter() - _t0
         self._mtp_rb_acc = getattr(self, "_mtp_rb_acc", 0.0) + rb_acc * 1e3
-        self._mtp_rd_acc = getattr(self, "_mtp_rd_acc", 0.0) + rd_acc * 1e3
         mtp._ctx_write_off = False
 
         # 6. commit + emit per request: return the uncommitted whole-page tail the verify
@@ -1812,16 +1940,14 @@ class Scheduler(SchedulerIOMixin):
         if bs > 1 or self._mtp_step_count % every == 0:
             n = max(1, self._mtp_rb_n)
             rb_ms = getattr(self, "_mtp_rb_acc", 0.0) / n
-            rd_ms = getattr(self, "_mtp_rd_acc", 0.0) / n
             self._mtp_rb_acc = 0.0
-            self._mtp_rd_acc = 0.0
             self._mtp_rb_n = 0
             logger.info_rank0(
                 f"MTP step bs={bs} drafted={drafted_total} accepted={acc_total} "
                 f"bonus={bs} committed={sum(len(c) for c in committed_per_req)} "
                 f"acc_rate={acc_total / max(1, drafted_total):.2f} "
                 f"verify_ms={verify_ms:.1f} step_ms={step_ms:.1f} "
-                f"rollback_ms={rb_ms:.1f} redraft_ms={rd_ms:.1f}"
+                f"rollback_ms={rb_ms:.1f}"
             )
 
         next_tokens_gpu = torch.cat(bonus_gpu).to(torch.int32)
@@ -1833,7 +1959,8 @@ class Scheduler(SchedulerIOMixin):
             next_tokens_gpu, next_tokens_cpu, copy_done_event, committed_per_req
         )
 
-    def _mtp_head_diag_once(self, mtp_diag, d1_logits, v_logits, residual, anchor_i, d_ids, V, m):
+    def _mtp_head_diag_once(self, mtp_diag, d1_logits, v_logits, residual, anchor_i, d_ids, V, m,
+                            sp):
         """First-MTP-step head sanity: a 0%-acceptance run must tell a DEGENERATE head
         (NaN/inf/all-zero logits -> kernel/dtype bug) from a merely divergent one. Cheap:
         a few top-k over tiny slices, once per process."""
@@ -1858,6 +1985,62 @@ class Scheduler(SchedulerIOMixin):
                 "MTP DIAG head: " + _st(head) + f" top1={int(head.argmax())} top5={h_ids}"
                 " | model: " + _st(main) + f" top1={int(main.argmax())} top5={m_ids}"
                 f" | top5_overlap={overlap}/5 m={m}"
+            )
+            # Pairing check: draft j must be judged against verify row j, so its rank inside row j
+            # should be small (inside the request's top-k) while a wrong offset would show a better
+            # rank in a neighbouring row. Rank of the head's own top-1 against each row's argmax
+            # says the same thing without depending on the draft ids.
+            rows = [int(i) for i in V]
+            in_row, in_next = [], []
+            for j, did in enumerate(d_ids):
+                for cols, lst in ((j, in_row), (j + 1, in_next)):
+                    if cols < v_logits.shape[0]:
+                        row = v_logits[cols]
+                        lst.append(int((row > row[did]).sum()))
+            hit = [j for j, r in enumerate(rows) if r == int(head.argmax())]
+            logger.info_rank0(
+                "MTP DIAG pairing: row_argmax=" + str(rows)
+                + f" draft_ids={list(d_ids)} rank_in_own_row={in_row}"
+                + f" rank_in_next_row={in_next} top_k={sp.top_k}"
+                + f" head_top1_matches_rows={hit} m={m}"
+            )
+            # Expected acceptance for the FIRST draft on this real pair of distributions:
+            # E[accept] = sum min(p, q) for a draft ~ q with accept-prob min(1, p/q). Computed with
+            # the q recipe in use (renormed) and with the old bare softmax, so one restart says how
+            # much of the collapse was the recipe asymmetry and how much is a merely divergent head
+            # (also visible as the head's argmax percentile inside the target's ranking).
+            t = 1e-6 if sp.is_greedy else max(float(sp.temperature), 1e-6)
+
+            def _renorm(p, k, tp):
+                if k >= 1:
+                    v, i = torch.topk(p, min(int(k), p.shape[-1]), dim=-1)
+                    z = torch.zeros_like(p)
+                    z.scatter_(-1, i, v)
+                    p = z / z.sum(-1, keepdim=True)
+                if 0.0 < tp < 1.0:
+                    sv, si = torch.sort(p, descending=True, dim=-1)
+                    sel = sv * ((sv.cumsum(-1) - sv) < tp)
+                    z = torch.zeros_like(p)
+                    z.scatter_(-1, si, sel)
+                    p = z / z.sum(-1, keepdim=True)
+                return p
+
+            row0 = v_logits[0].float()
+            p0 = _renorm(torch.softmax(row0 / t, dim=-1), sp.top_k, sp.top_p)
+            h_soft = torch.softmax(head.float(), dim=-1)
+            q_new = _renorm(torch.softmax(head.float() / t, dim=-1), sp.top_k, sp.top_p)
+            hid = int(head.argmax())
+            ranks = []
+            for r in range(v_logits.shape[0]):
+                row = v_logits[r].float()
+                ranks.append(int((row > row[hid]).sum()))
+            logger.info_rank0(
+                "MTP DIAG accept: E[accept]_renormed_q="
+                + f"{float(torch.minimum(p0, q_new).sum()):.3f}"
+                + f" E[accept]_bare_q={float(torch.minimum(p0, h_soft).sum()):.3f}"
+                + f" head_top1={hid} rank_in_verify_rows={ranks}"
+                + f" p_of_head_top1={float(p0[hid]):.4f} q_of_head_top1={float(q_new[hid]):.4f}"
+                + f" (t={t:g} top_k={sp.top_k} top_p={sp.top_p})"
             )
             if mtp_diag:
                 logger.info_rank0(

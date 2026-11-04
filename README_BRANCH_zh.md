@@ -4,13 +4,14 @@ English version: [README.md](README.md).
 
 基于 [FreeToken](https://github.com/FlashML-org/FreeToken)(上游 main `58f4b9e`,packaged `__version__ = "0.1.3"`)的补丁分支,针对 **一张消费级 GPU + 大容量系统内存** 调优——例如 RTX 5090 32 GiB 配 ~254 GiB RAM——通过 OpenAI-/Anthropic-兼容 HTTP API 服务大型 MoE checkpoint。上游 Apache-2.0 LICENSE 保留;详见 [Provenance](#provenance)。
 
-下面这些功能是一个接一个堆起来的——每一条都是在前一条工作上跑起来之后才暴露出来的下一层问题。从左到右读可以看到推理链,只想查参数也可以直接跳到对应小节。这套 mechanism 同时支持两条 checkpoint track——`Qwen3.8-Flash-Next`(架构 `qwen4_exp`)是 Stage A–C 全程使用的 reference,`GLM-5.3-Flash`(架构 `glm5_next`)作为 parallel track,有自己的启动参数和实测数,见 [GLM-5.3-Flash 启动 track](#glm-53-flash-启动-track)。Stage A–C 与 Tuning notes 的内容除非另有注明,对两条 track 同样适用。
+下面这些功能是一个接一个堆起来的——每一条都是在前一条工作上跑起来之后才暴露出来的下一层问题。从左到右读可以看到推理链,只想查参数也可以直接跳到对应小节。这套 mechanism 同时支持两条 checkpoint track——`Qwen3.8-Flash-Next`(架构 `qwen4_exp`)是 Stage A–D 全程使用的 reference,`GLM-5.3-Flash`(架构 `glm5_next`)作为 parallel track,有自己的启动参数和实测数,见 [GLM-5.3-Flash 启动 track](#glm-53-flash-启动-track)。Stage A–D 与 Tuning notes 的内容除非另有注明,对两条 track 同样适用。
 
-三段叙事:
+四段叙事:
 
 - **Stage A — 在一张 PCIe-bound GPU 上装下长上下文 MoE。** 一个 24 GiB NVFP4 MoE checkpoint + 1M-token KV + encoder towers + GDN linear-state pools,在 32 GiB 卡上若 KV 还是 bf16 就装不下。先压 KV → **§1 turbo4 tier**。光压还不行,indexer 得能直接读 packed 后的格式,否则解压开销把省的 BW 吃回去 → **§2 QSA 扩展**。
 - **Stage B — Stage A 让 VRAM 装得下了,但流量在几小时内变化时固定 pool sizing 浪费 headroom。** 重启不可接受 → **§3 BudgetSlider**。Pool 滑起来之后,decode-path 上剩下的噪声就是 verify-phase routing 把 hot-expert LRU 拉偏,而且 BudgetSlider 读的 demand signal 也来自同一组计数 → **§4 verify-phase stats exclusion**。
 - **Stage C — 文本侧 decode 稳了:mm 内容也有 reuse 模式。** 同一张产品图或图表几小时后在 follow-up turn 里再来一次,每次重 prefill 同样像素浪费 ViT 时间 + KV 空间 → **§5 mm content-key cache**。然后不同 checkpoint 拼写不一样、PIL 读不了 mp4 → **§6 mm video dual-pad fix**。最后过夜的 mm KV 在 §3 shrink-only floor 下被踢出 VRAM → **§7 mm RAM tier swap-in/out**。
+- **Stage D — 压缩之后 KV 仍全量驻 VRAM,1M context 把卡上余量吃光。** KV 的真实访问是稀疏的:indexer 每步打分只读压缩索引行,bulk 内容行只在被 top-k 点名的位置被读——把低频读的 bulk 行也常驻 VRAM 是过度配置 → **§8 KV host tier(`--kv-offload`)**:body 下沉 pinned RAM,显存只留索引层。
 
 参考环境:RTX 5090 SM120 PCIe-bound + Qwen3.8-Flash-Next(-ABLITERATED)-NVFP4。每个功能点格式统一为 **(1) 在这套栈上观察到的问题**、**(2) 实现的功能设想**、**(3) 实测验证结果**。
 
@@ -104,6 +105,22 @@ Stage A 把 1M profile 跑起来了。下一个问题:流量组合在几小时�
 
 ---
 
+## Stage D — KV 本体下沉 pinned RAM
+
+### 8. KV host tier(`--kv-offload`)
+
+**(1)** Stage A 之后 KV 已是全栈里最大的可压缩项,但仍全量驻 VRAM:Qwen turbo4 ≈6.9 KiB/token(1M ≈6.8 GiB)、GLM MLA+turbo4 ≈3.4 KiB/token(1M ≈3.4 GiB)。32 GiB 卡上 1M context + expert cache + 激活并存时,GLM 实测 boot 后 free 只剩 ~3.3 GiB,首个 prefill 的激活峰值就贴着边界。而 KV 的访问模式是稀疏的:sparse indexer 每步打分只读压缩索引行,bulk 内容行只在被点名 top-k 的位置被读——把低频读的 bulk 行也常驻 VRAM 是过度配置。
+
+**(2)** `--kv-offload` 把 K/V body(paged 池的 bulk 行:turbo4 packed 行 / MLA latent 行,加上 turbo4 dequant scales)驻到 pinned host RAM——零拷贝:attend/gather kernel 经 UVA device pointer 直接读 host 行,只在 selection 点名的 top-k 位置跨 PCIe。显存侧只留每步必读的索引层:QSA 的 compressed-key slab(1/ratio shadow,`slot // index_ratio` 寻址,随 page 共享/eviction 免费跟随)、per-request pending ring、scratch 行、mrope 的 3 轴 rope-position 表。定价拆两本账:`kv_cost` 在 offload 时每 token 只计索引项(QSA 780 B/token、GLM ≈700 B/token),`host_bytes_per_token` 把 body 记进 host 账——同样的 `--num-tokens`,显存侧 KV 占用降到 ~1/9(Qwen 7.0→0.78 KiB/token)、~1/5(GLM 3.4→0.7 KiB/token)。`snapshot_rows`/`restore_rows`(§7 mm tier)自动跟随 body 位置(host 视图上行索引 `.cpu()`:CUDA 算子接受 CPU 索引,反向不接受)。Windows 上 host tier 分配走 **register-direct**(mmap→commit→cudaHostRegister,与 expert banks 同机制);非 Windows 平台保留 fresh cudaHostAlloc 优先(Linux 无 TCC 那个 fresh+registered 合并记账顶,fresh 通常一次成功且省去 boot 期 zero+register 两遍)。**为什么 Windows 必须绕开 fresh 池**:专家 banks + PLE 表先注册 ≈97 GiB 后,TCC 驱动对 cudaHostAlloc 的记账把 fresh+registered 合计(~92–104 GiB,随空闲 RAM 浮动),KV-tier 时点的 fresh 尝试注定失败,且**失败的那次 mapped 分配**会让后续小额 device 分配在显存富余时 OOM(实测 conv_states 44 MiB vs 8.61 GiB free 复现);register 路径无此顶(banks 生产 ≥163 GiB),PCIe 读路径与 fresh pinned 同 roofline。
+
+**(3)** RTX 5090 + 253.6 GiB RAM(TCC 模式)实测:
+
+- Qwen3.8-Flash-Next `--num-tokens 1048576 --kv-offload`(全价 ≈6.8 GiB):host tier pinned 6.00 GiB(body)+ 0.09 GiB(dscale),显存侧索引 shadow 780 B/token(≈0.72 GiB);graph capture bs=[1,2,4] 完成,首个 bs=4 prefill 时 mem-probe free 4.13 GiB——1M + 4096-slot MoE + kv-offload 空卡余量充足,首个 `/v1/chat/completions` 200 OK。
+- GLM-5.3-Flash `--num-tokens 1048576 --kv-offload`:boot 日志 `K + V = 0.69 GiB`(≈700 B/token,全价 ≈3.4 GiB 的 ~1/5),host body 2.75 GiB + dscale 0.02 GiB;init 后 free 3.40 GiB,graph capture bs=[1] 完成,API ready——1M context 在 GLM track 上也装得下。
+- host tier 就位(total mapped ≈102.8 GiB)之后 graph capture 的大额 device 分配照常成功 ⇒ 毒性确为失败事件本身,total-mapped 顶在边缘的状态对 device 分配无害。首次 prefill 可能被 triton autotune 的一次性 benchmark scratch(~256 MiB)在激活峰值上顶一下(triton 调优缓存落盘后第二次起不再出现,自愈型)。
+
+---
+
 ## 上游已提供 knob 的调优建议
 
 下列机制上游已有,本分支原样采纳并针对 PCIe-bound single-GPU 栈调参。
@@ -192,6 +209,7 @@ Flags worth understanding:
 - `--num-tokens` — paged KV pool size。turbo4 ≈6.9 KiB/token → full pool ≈6.8 GiB @1M,≈3.4 GiB @512k,≈0.4 GiB @65k。Pool 越小给 verify peak 留越多 contiguous VRAM headroom。
 - `--moe-cache-size` — GPU 上驻留的 expert 数量。Steady-state decode 大致跟 hit rate 涨到 ~3072,然后 flatten。
 - `--kv-cache-dtype` — 见 §1 tier table。
+- `--kv-offload` — K/V 本体(bulk 行 + turbo4 dscale)驻 pinned host RAM,显存侧只留索引层(§8):QSA 780 B/token、GLM ≈700 B/token。1M profile 实测:Qwen pinned 6.09 GiB / GLM 显存侧 K+V 0.69 GiB。Windows 走 register-direct(见 §8 的 TCC 记账顶说明);§7 mm tier 的 snapshot/restore 自动跟随 body 位置。
 - `--max-running-req N` — scheduler concurrency cap。Argparse prefix-match `--max-running-requests`,两种写法都接受。Default 让 bs 涨到 ladder cap;`4` 让 bs=4 graph 保持热。
 - `--text-model-only` — skip all encoder towers;它们的 VRAM 给 KV / expert caches。只想 skip certain kinds 用 `--mm-disable vision audio`。Vision / audio towers 默认 load,disabled 时 clean skip。上游已提供 flags。
 - `--moe-prefill-hit-d2d` — prefill expert hits 走 device-to-device copies。上游已提供。
@@ -225,6 +243,7 @@ Flags worth understanding:
 - Prefill throughput XLONG prompts ≈1.2–1.6k tok/s(由 per-chunk expert-stream BW 线性外推;chunk-size independent——整 expert table 每 chunk 流一遍)。1M cold prefill ≈11–15 min。Predicted,未对 reference oracle 实测。
 - Reasoning-leg `prompt_tokens=238` 在 standard representative prompt 上,跟 Qwen shape 一致。Reasoning-leg token budget ≥512。Multimodal image + video legs 走同一 mm content-key path;ViT weight bytes 不同(~0.6 GiB bf16 vs Qwen ~0.84 GiB),per-request overhead pattern 一致。
 - Cold boot ≈25 min first start:~3 min safetensors mmap + ~22 min NVFP4 expert serial stage 进 pinned arena。后续 restart 复用 page cache;observed ≈8 min。
+- `--kv-offload`(2026-11-04):`--num-tokens 1048576` 下 K+V 显存侧 0.69 GiB(≈700 B/token,全价 ≈3.4 GiB 的 ~1/5),host body 2.75 GiB + dscale 0.02 GiB 经 cudaHostRegister 直配;init 后 free 3.40 GiB,graph capture bs=[1] 完成,text-only(`--text-model-only`)与默认多模态两种模式均验证 boot + 首请求。§8 有完整机制说明。
 
 **Not-yet-measured items**——当作 predicted:bs≥4 scaling ratio、XLONG prefill throughput、bs=8 之外的 concurrency scaling(predicted flat,same BW ceiling 每 lane 线性吃)。
 

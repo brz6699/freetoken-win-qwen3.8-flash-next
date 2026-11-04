@@ -27,6 +27,7 @@ class SchedulerStatusReporter:
         self,
         batch: Batch,
         *,
+        delivered_tokens: int,
         running_reqs: int,
         queue_reqs: int,
         kv_used_pages: int,
@@ -47,7 +48,7 @@ class SchedulerStatusReporter:
             )
         elif batch.is_decode:
             self._report_decode(
-                batch,
+                delivered_tokens=delivered_tokens,
                 running_reqs=running_reqs,
                 queue_reqs=queue_reqs,
                 kv_used_pages=kv_used_pages,
@@ -92,8 +93,8 @@ class SchedulerStatusReporter:
 
     def _report_decode(
         self,
-        batch: Batch,
         *,
+        delivered_tokens: int,
         running_reqs: int,
         queue_reqs: int,
         kv_used_pages: int,
@@ -103,7 +104,9 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        # An MTP commit ships m+2 tokens per request in ONE forward, so the token/s figure has to
+        # sum delivered tokens; counting requests would understate it by the commit length.
+        self._decode_generated_tokens += delivered_tokens
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 
