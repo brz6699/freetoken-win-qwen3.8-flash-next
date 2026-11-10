@@ -107,7 +107,7 @@ TTFT：冷请求大致符合 `token 数 ÷ 3400` 秒（例如 ~16k token 的首�
 
 MoE 缓存阶梯（`--num-tokens` 保持配对值）：槽位 1024 → 2048 → 3072，长文稳态解码 ≈33 → 40 → 44 tok/s（短文 ≈52），累计 **+36%，质量零损失**——缓存存的是精确权重，增益全部来自命中率。超过配对值后曲线合拢（再挤一点收益，但要挤占 KV 池），到此为止。
 
-KV offload（`--kv-offload`，1M 上下文）：Qwen 显存侧索引 shadow 780 B/token（≈0.72 GiB，vs 全价 ~6.8 GiB），body 下沉 pinned host 6.00 GiB + dscale 0.09 GiB；graph capture bs=[1,2,4] 完成，首个 bs=4 prefill 时 free 4.13 GiB——省出的余量正是要留给 MoE 专家和 prefill 激活。GLM 同档：boot 日志 `K + V = 0.69 GiB`（≈700 B/token，全价 ~3.4 GiB 的 ~1/5），host body 2.75 GiB。host tier 就位（total mapped ~102.8 GiB）后 graph capture 的大额显存分配照常成功，验证了 Windows 侧 register-direct 绕开 TCC 记账顶这条路径的正确性。
+KV offload（`--kv-offload`，1M 上下文）：Qwen 显存侧索引 shadow 780 B/token（≈0.72 GiB，vs 全价 ~6.8 GiB），body 下沉 pinned host 6.00 GiB + dscale 0.09 GiB；graph capture bs=[1,2,4] 完成，首个 bs=4 prefill 时 free 4.13 GiB——省出的余量正是要留给 MoE 专家和 prefill 激活。GLM 同档：boot 日志 `K + V = 0.69 GiB`（≈700 B/token，全价 ~3.4 GiB 的 ~1/5），host body 2.75 GiB。host tier 就位后 graph capture 的大额显存分配照常成功，验证了 Windows 侧 register-direct 绕开 TCC 记账顶这条路径的正确性（整机宿主映射含专家 banks 那 ~97 GiB，非 kv-offload 本体；完整读数见 `README_BRANCH` §8）。
 
 视觉：带图请求相对纯文本仅 +8ms 左右——大头不是 ViT 前向，而是 MoE 专家缓存冷启动的固定开销，文本同样承担。大图（19200 patch）显存峰值 +984 MiB，首 token 2.9–4.2s。同内容重复请求走内存驻留区回填，不同图像零假命中（内容键 13/13 + 对抗 174/174 全绿）。超 32768 patch 守卫返回干净的 400（`context_length_exceeded`），流式模式以流内 error 帧承载。
 
