@@ -114,3 +114,17 @@ cache admission / 传输路由 / 双缓冲 / 软上限 / 交错 / 缩容策略 /
 由 verification agent 通过 inline CPU simulation 复核。test_hybrid_fetch ×2 / test_prefill_hit_d2d ×2
 / test_offload ×2 受 llama-server 占用 ~31 GiB VRAM 影响, 在剩余 1482 MiB 下走 CPU fallback 路径
 等效覆盖。
+
+## Round-8 (2026-11-10): 主 README 补齐 kv-offload + 同步 FP8/MTP/宿主内存核算
+本轮以文档补齐为主: 前几轮代码已逐步 merge, 但两份主 README(`README_zh.md` / `README.md`)止于 KV 分档表与视觉路径, **未写 `--kv-offload`**——kv-offload 只在 `README_BRANCH` §8。本次按主 README 其他功能的写法(遇到什么问题 → 如何解决 → 实测)把它补进两份主 README, 并同步一批已在 exp 树验证过、尚未提交的 kernel / 记忆体改动。
+
+1. **kv-offload 写进两份主 README**: `README_zh.md` "为什么做这个分支" 加要点条目(KV bulk 行 + turbo4 dscale 下沉 pinned host、显存只留索引层 QSA 780 B/token、定价拆 `kv_cost`/`host_bytes_per_token` 两本账、Windows register-direct 绕 TCC 记账顶); 启动命令 `--moe-cache-size` 3072→4096 并加 `--kv-offload` + 一句因果说明; 参数说明、实测数据各补一段; 环境变量表加 `FREETOKEN_FP8_GPU_RESERVE_GB`(默认 24)/`FREETOKEN_DISABLE_GLUON`。英文 `README.md` 补 Stage D / §8 全段(此前止于 Stage C / §7)、概览改 "four stages" 并加 Stage D 条、`--kv-offload` 参数条目、env 表两行。
+2. **FP8 计算改进**: `kernel/csrc/cpu_moe/cpu_moe_ext.cpp`(+重编 `_cpu_moe.pyd`)加 Block-FP8 W8A16 CPU GEMV(`WF_FP8_BLOCK`); `kernel/triton/fp8_blockscale_moe.py` 移植延迟-K 归约 decode GEMV, BLOCK_N 16→32; `layers/quantization/moe/fp8_block.py` 相应接线。
+3. **MTP 头**: `models/register.py` `_QWEN4_EXP_ROOTS`/`_QWEN4_EXP_UNQUANTIZED`(mtp→mtp.layers.0 重映射, 顶层 fc_*/hyper_connection_mixer 保 bf16); `models/qwen4_exp/weight.py` `_stack_mtp_experts` / 填 `MtpExpertBank`。
+4. **born-pinned host bank + 宿主内存核算**: `moe/host_banks.py` `born_pinned` 标志(cuda-backed 分配即 commit+lock); `moe/expert_banks.py` / `engine/engine.py` `_host_available_bytes` / `_fp8_gpu_reserve_bytes`(`FREETOKEN_FP8_GPU_RESERVE_GB` 默认 24)/ `FREETOKEN_PIN_BUDGET_GB` / Windows `GlobalMemoryStatusEx` + `trim_process_working_set`; `layers/quantization/scheme.py` `fp8_block_size()`; `_pinned_tensor.pyd` 重编; `setup.py` 打包新 `.pyd`。
+
+说明(避免误记): 本仓 Gluon SM120 W4A4(`kernel/gluon/`、`kernel/nvfp4_moe.py`、`kernel/triton/nvfp4_act_quant.py`, §9)与 YaRN-1M rope(`layers/rotary.py`)分别已在前序提交 `4756c61` / `a11fb8c`(W4A4)与 `4cddad0` 一带(YaRN)落地, 本轮 working tree 不再重复携带; `python/freetoken/**` 镜像同步上述 engine / cpu_moe_ext.cpp / fp8_block / scheme / weight / register 六个文件。
+
+改动文件(相对上一版提交): package 11 改 + python 镜像 6 改 + setup.py + 文档 3 改(README_zh.md / README.md / CHANGELOG.md); MANIFEST.sha256 重新生成。
+
+验证: 两份主 README + CHANGELOG 为纯文档; FP8 CPU GEMV 路径与 host-accounting 由 exp 树并发压力 + 重启 boot 日志核对; 本机 serve 由用户持有, 本轮未在此重跑。边界: W4A4 prefill kernel 的数值正确性 / 加速仍未单独测(短 prompt 未过 tokens/expert≥4 门槛, 实为 W4A16), 留待长 prompt A/B。

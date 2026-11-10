@@ -21,6 +21,7 @@
   | `turbo4` | ~516 | 0.9887 | 超长上下文（10 万 token 以上） |
 
   仅压缩存储，注意力计算保持 bf16。索引器 key 始终为 bf16。
+- **KV 本体下沉宿主内存（`--kv-offload`）** — turbo4 之后每 token KV 已压到 ~7 KiB，但 1M 上下文仍需 ~6.8 GiB，和 expert cache、prefill 激活挤在同一张 32 GB 卡上（GLM 实测 boot 后 free 仅剩 ~3.3 GiB，首个 prefill 的激活峰值贴着边界）。而 KV 的访问是稀疏的：sparse indexer 每步打分只读压缩索引行，bulk 内容行只在被 top-k 点名的位置才被读——把低频读的 bulk 行也常驻显存是过度配置。`--kv-offload` 把 K/V body（paged 池的 bulk 行 + turbo4 dequant scale）落到 pinned 宿主内存，attend/gather kernel 经 UVA device pointer 直读 host 行、只在 top-k 位置跨 PCIe；显存侧只保留每步必读的索引层（QSA compressed-key slab、per-request pending ring、scratch 行、mrope 三轴位置表）。定价拆两本账（`kv_cost` 在 offload 时每 token 只计索引项、`host_bytes_per_token` 把 body 记进 host 账），于是同样的 `--num-tokens` 下显存侧 KV 占用降到 ~1/9（Qwen 7.0→0.78 KiB/token）、~1/5（GLM 3.4→0.7 KiB/token），省出的余量直接喂给 MoE 专家缓存。Windows 上 host tier 走 **register-direct**（mmap→commit→cudaHostRegister，与专家 banks 同机制）绕开 TCC 驱动对 `cudaHostAlloc` 的 fresh+registered 合并记账顶——否则专家 banks + PLE 表先注册 ~97 GiB 后，KV-tier 时点的 fresh 分配注定失败，且那次失败的 mapped 分配会连带后续小额显存分配在显存富余时 OOM（实测 conv_states 44 MiB vs 8.61 GiB free 复现）。§8（`README_BRANCH` 的 Stage D）有完整机制与实测。
 - **多模态（视觉）支持**：视觉塔按需加载；图像请求通过内容哈希前缀 key 复用 KV（相同图像 → KV 复用，不同图像 → 零误命中），多模态的 KV / 状态快照存放在有上限的内存驻留区（`FREETOKEN_MM_TIER_MB`，建议保持 4096），与 GPU 池之间换入换出。两个方向都是分块的（每块 32768 token），保证恢复时不会出现撑爆紧张显存的大额临时分配。
 - **驻留区恢复不再漏页** — 从内存驻留区恢复时，请求会为自己的一整段前缀申请全新的页，而缓存树里同时还留着自己的一份匹配副本。现在每种缓存句柄都会报告自己的回收底线（`commit_floor()`）：树句柄返回 `cached_len`（借自树的那段归树所有），恢复句柄返回 0（整段都是请求自己的，重复的那部分在结束时必须释放）。这修掉了每次驻留区恢复稳定漏 304 页的问题，并且与模型形态无关——六种缓存句柄全部从基类继承该方法，已逐一验证。
 - **Qwen3.8-Flash-Next 服务配置** — QSA paged-KV 池配合上述分级存储、专家权重经 offload 缓存走 NVFP4 路线，以及由 `verification/` 套件端到端覆盖的多模态内容 key 前缀缓存。
@@ -55,9 +56,11 @@ ft-venv\Scripts\pip install .
 $env:FREETOKEN_MM_TIER_MB = "4096"
 ft-venv\Scripts\python.exe -m freetoken `
   --model-path E:\FreeToken\models\Qwen3.8-Flash-Next-ABLITERATED-NVFP4 `
-  --num-tokens 1048576 --moe-cache-size 3072 --kv-cache-dtype turbo4 `
-  --moe-prefill-hit-d2d --host 0.0.0.0 --port 8001 --max-running-req 4
+  --num-tokens 1048576 --moe-cache-size 4096 --kv-cache-dtype turbo4 `
+  --moe-prefill-hit-d2d --kv-offload --host 0.0.0.0 --port 8001 --max-running-req 4
 ```
+
+（`--kv-offload` 把 KV bulk 行下沉宿主内存后，1M 档显存不再被 KV 吃满，专家缓存才能从 3072 上探到 4096；不加这个 flag 时 1M + 4096 会 OOM。）
 
 上下文长度和专家缓存两个参数互相挤占，实测可用的搭配表（均为 `--max-running-req 4`）：
 
@@ -74,6 +77,7 @@ ft-venv\Scripts\python.exe -m freetoken `
 - `--kv-cache-dtype turbo4` — 见上文档位表；1M 的 KV 池靠它压到约 7 GiB（bf16 要 ~28 GiB）。
 - `--moe-cache-size` — GPU 侧专家缓存槽位数，按上面的表随上下文长度选取。
 - `--moe-prefill-hit-d2d` — prefill 命中时直接在显卡内部拷贝，不再从内存重取。
+- `--kv-offload` — K/V 本体（bulk 行 + turbo4 dequant scale）驻 pinned 宿主内存，显存侧只留索引层（每 token 只计 780 B 的 QSA 索引 shadow）。1M profile 靠它把显存让给 MoE；Windows 走 register-direct 绕开 TCC 记账顶。机制与实测见"为什么做这个分支"里的 kv-offload 条与 `README_BRANCH` §8。
 - `--max-running-req 4` — 与已捕获的计算图尺寸 [1, 2, 4] 匹配；bs=8 的捕获在这张卡上有风险，因为剩余约 1 GiB 显存还要覆盖每步中间结果、驻留区分块换入的临时缓冲和视觉编码峰值。
 
 之后按任意 OpenAI 兼容服务器的方式调用 `POST /v1/chat/completions` 即可。
@@ -102,6 +106,8 @@ bs=1 到 bs=4 的增益是真实的；再往上就进入显存预留区，计算
 TTFT：冷请求大致符合 `token 数 ÷ 3400` 秒（例如 ~16k token 的首轮 ≈ 5 s；~900k token 实测 32.5 s，开 prefill overlap）。命中缓存树/驻留区的请求秒级返回。needle 检索 322k/450k token × 深度 30/60/90% 共 6/6 全中（最差 90% 深度 35.2 s，其余 5–12 s）；解码稳态速度与上下文长度无关。
 
 MoE 缓存阶梯（`--num-tokens` 保持配对值）：槽位 1024 → 2048 → 3072，长文稳态解码 ≈33 → 40 → 44 tok/s（短文 ≈52），累计 **+36%，质量零损失**——缓存存的是精确权重，增益全部来自命中率。超过配对值后曲线合拢（再挤一点收益，但要挤占 KV 池），到此为止。
+
+KV offload（`--kv-offload`，1M 上下文）：Qwen 显存侧索引 shadow 780 B/token（≈0.72 GiB，vs 全价 ~6.8 GiB），body 下沉 pinned host 6.00 GiB + dscale 0.09 GiB；graph capture bs=[1,2,4] 完成，首个 bs=4 prefill 时 free 4.13 GiB——省出的余量正是要留给 MoE 专家和 prefill 激活。GLM 同档：boot 日志 `K + V = 0.69 GiB`（≈700 B/token，全价 ~3.4 GiB 的 ~1/5），host body 2.75 GiB。host tier 就位（total mapped ~102.8 GiB）后 graph capture 的大额显存分配照常成功，验证了 Windows 侧 register-direct 绕开 TCC 记账顶这条路径的正确性。
 
 视觉：带图请求相对纯文本仅 +8ms 左右——大头不是 ViT 前向，而是 MoE 专家缓存冷启动的固定开销，文本同样承担。大图（19200 patch）显存峰值 +984 MiB，首 token 2.9–4.2s。同内容重复请求走内存驻留区回填，不同图像零假命中（内容键 13/13 + 对抗 174/174 全绿）。超 32768 patch 守卫返回干净的 400（`context_length_exceeded`），流式模式以流内 error 帧承载。
 
@@ -139,6 +145,8 @@ MoE 缓存阶梯（`--num-tokens` 保持配对值）：槽位 1024 → 2048 → 
 | `FREETOKEN_PIN_BUDGET_GB` | CUDA-pinned 专家组的预算上限；超出后触发分离驻留（locked CPU 层） | 自动（约为物理内存的 0.4–0.5 倍） |
 | `FREETOKEN_MM_TIER_MB` | mm 内存驻留区上限（宿主侧多模态快照存储） | 4096 |
 | `FREETOKEN_LOAD_VISION` | 置 `1` 时加载视觉塔 | 关闭 |
+| `FREETOKEN_FP8_GPU_RESERVE_GB` | FP8 源 bank 预算里为 CUDA context + loader 暂存 + 基线余量留出的宿主内存（GB） | 24 |
+| `FREETOKEN_DISABLE_GLUON` | 置 `1` 时禁用 Gluon SM120 NVFP4 kernel，回落到 Triton 路径（W4A4 关闭） | 关闭 |
 
 ## Provenance
 

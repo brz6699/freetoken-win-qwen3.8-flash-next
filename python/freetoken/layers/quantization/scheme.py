@@ -92,6 +92,12 @@ def fp8_block_qat_scheme(scale: str) -> QuantScheme:
     return QuantScheme(QuantKind.FP8_BLOCK_QAT, WeightDesc("e4m3", (FP8_BLOCK, FP8_BLOCK), scale), {"weight"})
 
 
+def fp8_block_size(scheme: QuantScheme) -> int:
+    """The square block edge of an FP8_BLOCK scheme (128 for DeepSeek-V3 style exports)."""
+    assert scheme.kind is QuantKind.FP8_BLOCK, scheme
+    return scheme.weight.group[0]
+
+
 def mxfp8_scheme() -> QuantScheme:
     return QuantScheme(QuantKind.MXFP8, WeightDesc("e4m3", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale_inv"})
 

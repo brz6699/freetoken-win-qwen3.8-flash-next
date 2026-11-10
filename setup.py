@@ -10,6 +10,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 
 ROOT = Path(__file__).parent
+KERNEL_INCLUDE = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "include")
 
 
 def _check_toolchain() -> None:
@@ -28,8 +29,11 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
         )
     cuda_home = Path(CUDA_HOME)
     library_dirs = [str(cuda_home / "lib64")]
-    if (cuda_home / "lib").exists():
-        library_dirs.append(str(cuda_home / "lib"))
+    # CUDA 13 moved the Windows import libraries to lib/x64 (lib64 no longer exists).
+    for sub in ("lib", "lib/x64", "lib/Win32"):
+        p = cuda_home / sub
+        if p.exists():
+            library_dirs.append(str(p))
     return [str(cuda_home / "include")], library_dirs
 
 
@@ -44,7 +48,7 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/pinned_tensor.cpp",
             ],
-            include_dirs=cuda_include_dirs,
+            include_dirs=[KERNEL_INCLUDE, *cuda_include_dirs],
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17"],
@@ -59,7 +63,7 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
             ],
-            include_dirs=cuda_include_dirs,
+            include_dirs=[KERNEL_INCLUDE, *cuda_include_dirs],
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],

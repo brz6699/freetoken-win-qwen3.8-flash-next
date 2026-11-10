@@ -37,6 +37,8 @@ class ModelSpec:
 # Multimodal wrappers store the text tower under model.language_model.
 _LANGUAGE_MODEL_ROOT = (("model", "model.language_model"),)
 _QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
+# Qwen3.8-Flash-Next: the MTP head's one layer is stored under mtp.layers.0.; the model module is flat (mtp.*)
+_QWEN4_EXP_ROOTS = _QWEN_VL_ROOTS + (("mtp", "mtp.layers.0"),)
 _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # image and video share the vision tower; video arrives as sampled frames merged into one temporal grid (grid_thw t > 1)
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image", "video")),)
@@ -60,6 +62,14 @@ _QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 # Qwen3.8's per-layer hyper-connections fuse the down projection with the block-inject rows.
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
+)
+# The top-level MTP modules (fc_*, hyper_connection_mixer) carry no layers.0 in the checkpoint, so
+# the mtp root remaps them off the quantization_config's not_convert names; they ship bf16.
+_QWEN4_EXP_UNQUANTIZED = (
+    "mtp.layers.0.fc_embedding",
+    "mtp.layers.0.fc_hidden",
+    "mtp.layers.0.hyper_connection_mixer.input_mix_weight_down",
+    "mtp.layers.0.hyper_connection_mixer.input_mix_weight_up",
 )
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
@@ -189,10 +199,11 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Qwen4ExpForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen4_exp",
         "Qwen4ExpForConditionalGeneration",
-        checkpoint_roots=_QWEN_VL_ROOTS,
+        checkpoint_roots=_QWEN4_EXP_ROOTS,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        unquantized_modules=_QWEN4_EXP_UNQUANTIZED,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the

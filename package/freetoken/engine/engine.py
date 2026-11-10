@@ -5,6 +5,7 @@ import errno
 import gc
 import math
 import os
+import platform
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -455,6 +456,14 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+            if self._host_tables_bytes:
+                # The table's shard read left tens of GiB of file cache in this process's
+                # working set; demote it before the bank fill so the fill's own serial
+                # reads start from a clean available-RAM baseline (see expert_banks fill trim).
+                from freetoken.moe.expert_banks import trim_process_working_set
+
+                if trim_process_working_set():
+                    logger.info_rank0("engine: flushed working set after host-table load")
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -1069,6 +1078,12 @@ class Engine:
                     )
             except PinFailed as exc:
                 raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+            # PR #602: charge GPU-resident FP8 source-bank bytes to the expert/KV accounting so the
+            # caches sized afterwards do not over-allocate against VRAM already held by sources.
+            resident_bytes = sum(t.nbytes for per_layer in banks.sources.values() for t in per_layer if t.is_cuda)
+            if resident_bytes:
+                self._weights_bytes += resident_bytes
+                self._post_weights_free -= resident_bytes
             from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
             self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
@@ -1965,19 +1980,88 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    if fmt in _WFMT_IDS and _WFMT_IDS[fmt] > getattr(_cpu_moe, "max_weight_format_id", lambda: 4)():
+        return False
     return fmt == "mxfp4" or fmt in _WFMT_IDS
+
+
+def _windows_available_physical_bytes() -> int:
+    """Live *available* physical RAM on native Windows, or 0 if it cannot be measured.
+
+    A register bank's pages are locked resident in physical RAM, so the ceiling for how much
+    more this process can cudaHostRegister is bounded by LIVE available physical, not by a
+    fixed fraction of total RAM -- and it shrinks automatically when another serve is already
+    pinning memory (the contention case behind the historical 40/48 mmap death).
+
+    The plain kernel32 ``GlobalMemoryStatusEx`` call is tried first (no dependency), but on
+    some TCC/WDDM hosts it returns a zeroed struct, so fall back to psutil, which reads the
+    same figure and does work on those hosts."""
+    try:
+        import ctypes
+        import ctypes.wintypes as _wt
+
+        class _MSX(ctypes.Structure):
+            _fields_ = (
+                ("dwLength", _wt.DWORD),
+                ("dwMemoryLoad", _wt.DWORD),
+                ("ullTotalPhys", ctypes.c_size_t),
+                ("ullAvailPhys", ctypes.c_size_t),
+                ("ullTotalPageFile", ctypes.c_size_t),
+                ("ullAvailPageFile", ctypes.c_size_t),
+                ("ullTotalVirtual", ctypes.c_size_t),
+                ("ullAvailVirtual", ctypes.c_size_t),
+            )
+
+        stat = _MSX()
+        stat.dwLength = ctypes.sizeof(_MSX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) and stat.ullAvailPhys > 0:
+            return int(stat.ullAvailPhys)
+    except Exception:
+        pass
+    try:
+        import psutil
+
+        avail = int(psutil.virtual_memory().available)
+        if avail > 0:
+            return avail
+    except Exception:
+        pass
+    return 0
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
+    The banks use the register path (lazy ``mmap`` -> fill -> ``cudaHostRegister``), and a
+    registered bank's pages are locked resident in physical RAM, so the ceiling is LIVE
+    available physical (minus a small safety margin), NOT the separate lower ``cudaHostAlloc``
+    (torch pin_memory) pool and NOT a fixed fraction of total RAM. Measuring live available
+    means the budget shrinks on its own when another serve is already pinning memory -- the
+    contention that produced the historical WinError-1455 (commit-exhausted) mmap death --
+    instead of assuming a clean box every serve start. On this WDDM+TCC host a clean-process
+    register probe held >=200 GiB while ~235 GiB was live-available (>=85%), so we budget 0.85
+    of live-available: high enough that the real checkpoints (the 47.7 GiB PLE + 112.5 GiB FP8
+    banks, or the 159.8 GiB GLM NVFP4 banks) stay fully pinned on the GPU offload path, yet
+    low enough that a genuinely oversized model still splits head+tail layers to CPU decode.
+
+    ``reserved`` is host bytes already registered OUTSIDE the expert banks (qwen4_exp's PLE
+    table). Because the PLE is registered before this is called, live available already
+    excludes it; adding ``reserved`` back into the ceiling (``avail + reserved``) restores it
+    so it is not double-counted, and the final ``- reserved`` then returns just the bank
+    headroom. The user can override the whole figure with FREETOKEN_PIN_BUDGET_GB."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
+    elif platform.system() == "Windows":
+        avail = _windows_available_physical_bytes()
+        if not avail:
+            return None
+        # live available physical; +reserved restores the already-registered PLE so the
+        # register ceiling (0.85 of what a clean process could pin) isn't double-counted.
+        cap = int(0.85 * (avail + reserved))
     elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
         return None
     else:
-        cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+        cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.70)
     return max(0, cap - reserved)
 
 

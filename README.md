@@ -4,13 +4,14 @@ Chinese version: [README.md](README_BRANCH_zh.md).
 
 A patched branch of [FreeToken](https://github.com/FlashML-org/FreeToken) (upstream main `58f4b9e`, packaged `__version__ = "0.1.3"`) tuned for **one consumer GPU + lots of system RAM** — e.g. RTX 5090 32 GB with ~254 GiB RAM — serving large MoE checkpoints through an OpenAI-/Anthropic-compatible HTTP API. Upstream Apache-2.0 LICENSE preserved; see [Provenance](#provenance).
 
-The features below stack on each other; each was discovered while making the previous one work on this stack. Read left-to-right if you want the reasoning chain, jump to one if you only need the parameter. Two checkpoint tracks share these mechanisms — `Qwen3.8-Flash-Next` (architecture `qwen4_exp`) is the reference throughout Stages A–C, and `GLM-5.3-Flash` (architecture `glm5_next`) runs as a parallel track with its own launch parameters and measured numbers under [GLM-5.3-Flash serve track](#glm-53-flash-serve-track). Everything in Stages A–C and the Tuning notes applies identically to both tracks unless noted.
+The features below stack on each other; each was discovered while making the previous one work on this stack. Read left-to-right if you want the reasoning chain, jump to one if you only need the parameter. Two checkpoint tracks share these mechanisms — `Qwen3.8-Flash-Next` (architecture `qwen4_exp`) is the reference throughout Stages A–C, and `GLM-5.3-Flash` (architecture `glm5_next`) runs as a parallel track with its own launch parameters and measured numbers under [GLM-5.3-Flash serve track](#glm-53-flash-serve-track). Everything in Stages A–D and the Tuning notes applies identically to both tracks unless noted.
 
-The narrative arc, in three stages:
+The narrative arc, in four stages:
 
 - **Stage A — fit a long-context MoE onto one PCIe-bound GPU.** A 24 GiB NVFP4 MoE checkpoint plus 1M-token KV plus encoder towers plus GDN linear-state pools does not fit in 32 GiB if KV is bf16. Compress KV first → **§1 turbo4 tier**. The compression only helps if the indexer can read it without paying a separate dequant pass → **§2 QSA extension**.
 - **Stage B — keep decode steady when traffic shifts within hours.** Now VRAM fits, but the KV/MoE split sized at startup drifts out of balance as bursty agent traffic rolls through. Resizing means restart, which is unacceptable. → **§3 BudgetSlider**. With pools sliding cleanly, the remaining decode-path noise is verify-phase routing contaminating the hot-expert LRU → **§4 verify-phase stats exclusion**.
 - **Stage C — reuse multimodal context across hour-long gaps.** Steady text decode is in place; agent traffic also carries repeated images/videos. Without reuse each turn re-prefills identical pixels. → **§5 mm content-key cache**. Then different checkpoints spell pad tokens differently and PIL can't read mp4 → **§6 mm video dual-pad fix**. Finally even warmed mm KV gets evicted overnight from VRAM-only cache → **§7 mm RAM tier swap-in/out**.
+- **Stage D — sink the KV body to pinned host RAM.** turbo4 already cuts KV to ~7 KiB/token, but a 1M pool still needs ~6.8 GiB, and it competes for the same 32 GiB as the expert cache and prefill activations (GLM boots with ~3.3 GiB free, the first prefill's activation peak grazing the edge). KV access is sparse — the indexer is read every step, bulk content rows only at top-k positions — so keeping low-frequency bulk rows resident in VRAM is over-provisioning. Move the body to pinned host RAM, keep only the index layer on-GPU → **§8 KV host tier (`--kv-offload`)**. On Windows the tier must allocate **register-direct** to dodge a TCC-driver accounting ceiling that otherwise makes the fresh host alloc fail and poison later small device allocs into OOM.
 
 Reference rig for every number below: RTX 5090 SM120 PCIe-bound + Qwen3.8-Flash-Next(-ABLITERATED)-NVFP4. Each feature follows the same shape: **(1) Problem observed**, **(2) Mechanism implemented**, **(3) Measured verification**.
 
@@ -104,6 +105,18 @@ Text-side decode is steady now. Agent traffic also carries images and videos, wh
 
 ---
 
+## Stage D — Sink the KV body to pinned host RAM
+
+### 8. KV host tier (`--kv-offload`)
+
+**(1)** After turbo4, per-token KV is ~7 KiB, but a 1M-token pool still costs ~6.8 GiB — on the same 32 GiB card that also has to hold the expert cache and prefill activations. GLM measured: boot leaves only ~3.3 GiB free and the first prefill's activation peak grazes that edge. Yet KV access is sparse: the sparse indexer reads only the compressed index rows every step, and the bulk content rows are touched only at the top-k positions the selection names. Keeping low-frequency bulk rows pinned in VRAM is over-provisioning.
+
+**(2)** `--kv-offload` parks the K/V body (paged-pool bulk rows + turbo4 dequant scales) in pinned host RAM; attend/gather kernels read host rows through UVA device pointers, crossing PCIe only at top-k positions. VRAM keeps only what every step reads — the QSA compressed-key slab, per-request pending rings, scratch rows, the mrope three-axis position table. Pricing splits into two ledgers: `kv_cost` counts only the index term per token when offloaded, `host_bytes_per_token` charges the body to the host account. Under the same `--num-tokens` the VRAM-side KV footprint drops to ~1/9 (Qwen 7.0→0.78 KiB/token) and ~1/5 (GLM 3.4→0.7 KiB/token); the freed margin goes straight to the MoE expert cache. On Windows the host tier allocates **register-direct** (mmap→commit→cudaHostRegister, same mechanism as the expert banks): once expert banks + PLE tables have registered ~97 GiB, the TCC driver counts fresh + already-registered `cudaHostAlloc` together against a floating ~92–104 GiB ceiling, so every fresh attempt at KV-tier time fails — and that *failed* mapped allocation is what makes later small device allocations OOM even with GiB of VRAM free (reproduced: conv_states 44 MiB vs 8.61 GiB free). Registering the committed mmap skips that pool entirely (≥163 GiB proven in production) at the same PCIe roofline. Other platforms keep fresh `cudaHostAlloc` first. Full mechanism + numbers in [`README_BRANCH`](README_BRANCH.md) §8.
+
+**(3)** Qwen, 1M context: VRAM-side index shadow 780 B/token (≈0.72 GiB vs ~6.8 GiB full price), body sunk to pinned host 6.00 GiB + dscale 0.09 GiB; graph capture bs=[1,2,4] completes, first bs=4 prefill leaves 4.13 GiB free — the freed margin is exactly what the MoE experts and prefill activations needed. GLM same profile: boot log `K + V = 0.69 GiB` (≈700 B/token, ~1/5 of the ~3.4 GiB full price), host body 2.75 GiB. Once the host tier is up (total mapped ~102.8 GiB) the large graph-capture device allocations succeed normally — confirming the Windows register-direct path around the TCC accounting ceiling.
+
+---
+
 ## Tuning notes for upstream-provided knobs
 
 The mechanisms below exist upstream and this branch adopts them unchanged but tuned for PCIe-bound single-GPU stacks.
@@ -191,6 +204,7 @@ Flags worth understanding:
 - `--quant-backend moe.nvfp4=b12x` — select the b12x Triton backend for NVFP4 MoE decode. Without it the auto-selector may pick `marlin` on SM80/99 or fall through to torch `_scaled_mm`. On SM120 with this checkpoint, `b12x` is the right choice; pair with `--moe-prefill-hit-d2d` so prefill hits reuse GPU-side copies. Accepts per-layer overrides: `linear=marlin,moe=b12x`.
 - `--num-tokens` — paged KV pool size. turbo4 ≈6.9 KiB/token → ≈6.8 GiB full pool at 1M, ≈3.4 GiB at 512k, ≈0.4 GiB at 65k. Smaller pool leaves contiguous VRAM headroom for verify peak.
 - `--moe-cache-size` — experts resident on GPU. Steady-state decode scales roughly with hit rate up to ~3072, then flattens.
+- `--kv-offload` — sink the K/V body (bulk rows + turbo4 scales) to pinned host RAM; VRAM keeps only the indexer slab (QSA 780 B/token, MLA-latent ≈700 B/token). Lets the 1M profile lift `--moe-cache-size` from 3072 to 4096; without it 1M + 4096 OOMs. Windows allocates register-direct to bypass the TCC accounting ceiling (see §8).
 - `--kv-cache-dtype` — see tier table under feature point 1.
 - `--max-running-req N` — scheduler concurrency cap. Argparse prefix-matches `--max-running-requests`; both spellings work. Default lets bs grow up to ladder cap; `4` keeps the bs=4 graph hot.
 - `--text-model-only` — skip all encoder towers; their VRAM goes to KV / expert caches. Use `--mm-disable vision audio` instead when only some kinds should be skipped. Vision / audio towers load by default and skip cleanly when disabled. Upstream-provided flags.
@@ -279,6 +293,8 @@ Scripts under `verification/` are standalone; run from package root with venv Py
 | `FREETOKEN_PIN_BUDGET_GB` | cap for CUDA-pinned expert banks; exceeding triggers split residency (locked CPU layers) | auto (~0.4–0.5 × RAM) |
 | `FREETOKEN_MM_TIER_MB` | mm RAM tier byte budget for swap-in/out eviction | 1024 |
 | `FREETOKEN_HOT_WINDOW_TOKENS` | caps demand_tokens signal so KV grows to soft ceiling instead of pure shrink-only | unset (shrink-only preserved) |
+| `FREETOKEN_FP8_GPU_RESERVE_GB` | host RAM held out of the FP8 source-bank budget for CUDA context + loader staging + baseline headroom (GB) | 24 |
+| `FREETOKEN_DISABLE_GLUON` | set `1` to disable the Gluon SM120 NVFP4 kernel, falling back to Triton (W4A4 off) | off |
 
 ## Provenance
 

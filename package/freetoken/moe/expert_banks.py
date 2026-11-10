@@ -97,6 +97,63 @@ def build_expert_banks(
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
     hb = alloc_layer_banks(specs, num_layers)
     banks = {role: [b.tensor for b in hb[role]] for role in specs}
+    # FP8 source-bank host/GPU fit (PR #602, Windows-adapted): when usable host RAM genuinely
+    # cannot hold the FP8 source banks, keep the overflowing layers' sources on the GPU. The
+    # existing prefill/decode copy paths read a CUDA source bank transparently (device-to-device),
+    # so decode stays on the GPU path instead of falling back to the CPU executor. Only the
+    # offload FP8 load is affected; converter/dummy/FTW keep their existing placement.
+    gpu_layers: set = set()
+    # born-pinned banks (FREETOKEN_BANK_CUDA_ALLOC=1) commit + lock every page at allocation,
+    # so fills add nothing and moving sources to the GPU saves nothing -- the host cost is
+    # already sunk. On WDDM Windows the register path is what needs the overflow escape hatch:
+    # serial reads also march the shard data through the file cache, so psutil-available
+    # declines ~2x the bank size per layer and saturates physical RAM around 40/48 layers
+    # (measured 2026-11-05; Qwen3.8-Flash-Next-FP8 128-shard serial build).
+    born_pinned_banks = all(per_layer[0].born_pinned for per_layer in hb.values())
+    audit_fp8 = device.type == "cuda" and method.kind is QuantKind.FP8_BLOCK
+    fit_host_ram = (
+        layer_sink is None
+        and not dummy
+        and device.type == "cuda"
+        and method.kind is QuantKind.FP8_BLOCK
+        and not born_pinned_banks
+    )
+    layer_bytes = sum(per_layer[0].nbytes for per_layer in hb.values())
+    if fit_host_ram and layer_bytes:
+        available = _host_available_bytes()
+        if available is not None:
+            # Baseline headroom only (CUDA context, loader staging, co-resident growth): PLE is
+            # registered before this point so `available` already excludes it, and the shard page
+            # cache lands in standby which `available` counts as reclaimable (live-probed).
+            budget = available - _fp8_gpu_reserve_bytes()
+            # minimum layers to move to GPU so the host banks (+ one staging layer) fit in budget
+            gpu_layers = set(
+                range(
+                    min(
+                        num_layers,
+                        max(0, (layer_bytes * (num_layers + 1) - budget + layer_bytes - 1) // layer_bytes),
+                    )
+                )
+            )
+            if gpu_layers:
+                # cap by free GPU so the sources don't crowd out the KV cache / activations
+                free_gpu = torch.cuda.mem_get_info(device)[0]
+                max_gpu = max(0, (free_gpu // layer_bytes) - 2)
+                if len(gpu_layers) > max_gpu:
+                    logger.info(
+                        f"expert banks: GPU can host {max_gpu} FP8 layers "
+                        f"({free_gpu / 2**30:.2f} GiB free), capping host overflow from {len(gpu_layers)}"
+                    )
+                    gpu_layers = set(range(min(num_layers, max_gpu)))
+            if gpu_layers:
+                for role, per_layer in banks.items():
+                    for layer_id in gpu_layers:
+                        per_layer[layer_id] = torch.zeros_like(per_layer[layer_id], device=device)
+                logger.info(
+                    f"expert banks: keeping {len(gpu_layers)} FP8 source layers "
+                    f"({len(gpu_layers) * layer_bytes / 2**30:.2f} GiB) on GPU to fit host RAM "
+                    f"(available {available / 2**30:.1f} GiB, reserve {_fp8_gpu_reserve_bytes() / 2**30:.0f} GiB)"
+                )
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
@@ -126,6 +183,28 @@ def build_expert_banks(
             # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
             if written[layer_id, e0:e1].any():
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
+            first_touch = not written[layer_id].any()
+            if audit_fp8 and first_touch:
+                # The serial reader mmaps every shard, so each layer's freshly read bytes sit in
+                # this process's file cache and count against `available` (fresh cache, not yet
+                # standby): available declines ~2x the bank size per layer and the load saturated
+                # physical RAM around layer 39/48, with the worker hard-dying mid-register. Trim
+                # after EVERY layer so the live cache mass stays at ~one layer's worth (a reused
+                # ~2.3 GiB buffer): trimmed pages become reclaimable standby, which stays in RAM
+                # while physical headroom exists (re-hits then cost no disk) and is counted as
+                # available. Locked (registered) bank pages are untouched.
+                trim_process_working_set()
+            if fit_host_ram and first_touch and layer_id not in gpu_layers:
+                # Recheck during the long load: registration and co-resident processes change what
+                # still fits. Move the layer to the GPU only if VRAM can hold it whole -- the GPU
+                # is shared with weights/caches, and a failed zeros_like kills the entire load.
+                avail = _host_available_bytes()
+                tight = avail is not None and avail - _fp8_gpu_reserve_bytes() < 2 * layer_bytes
+                if tight and torch.cuda.mem_get_info(device)[0] >= layer_bytes + (1 << 30):
+                    for role, per_layer in banks.items():
+                        per_layer[layer_id] = torch.zeros_like(per_layer[layer_id], device=device)
+                    gpu_layers.add(layer_id)
+                    logger.info(f"expert banks: keeping FP8 layer {layer_id} on GPU after host RAM changed")
             written[layer_id, e0:e1] = 1
             out = {role: banks[role][layer_id][e0:e1] for role in specs}
             got = method.pack(piece, out)
@@ -142,7 +221,7 @@ def build_expert_banks(
         _fill(layer_sink)
     elif torch.cuda.is_available():
         with PinPipeline() as pins:
-            _fill(pins)
+            _fill(lambda layer_id, layer_banks: pins(layer_id, layer_banks) if layer_id not in gpu_layers else None)
     else:
         _fill(None)
 
@@ -154,6 +233,55 @@ def build_expert_banks(
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
+
+
+def trim_process_working_set() -> bool:
+    """Demote this process's file-cache pages to the reclaimable standby list (Windows).
+
+    The serial shard reader maps the checkpoint shards into this process, so a full
+    expert build puts ~112 GiB of shard bytes into its working set; psutil-available
+    counts that fresh cache as consumed. Flushing the working set returns the
+    already-read pages to standby. Committed bank pages are locked by the pin pipeline
+    once their layer completes, so only cache and staging pages move.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi = ctypes.WinDLL("psapi.dll")
+        psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+        return bool(psapi.EmptyWorkingSet(kernel32.GetCurrentProcess()))
+    except Exception:
+        return False
+
+
+def _host_available_bytes() -> int | None:
+    """Usable host RAM right now. Linux: /proc/meminfo MemAvailable minus free CMA (CMA cannot back
+    registered banks). Windows: psutil MemAvailable-equivalent. None if neither is readable."""
+    try:
+        with open("/proc/meminfo") as f:
+            mem = {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
+        return max(0, mem["MemAvailable"] - mem.get("CmaFree", 0))
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _fp8_gpu_reserve_bytes() -> int:
+    """Host RAM kept out of the FP8 source-bank budget: CUDA context + loader staging + baseline
+    growth during the load. Measured NOT to include the shard page cache: it lands in standby,
+    which psutil `available` already counts as reclaimable (live probe: reading 41 GiB of shards
+    moved available 74.8 -> 74.9 GiB). Default 24 GiB; FREETOKEN_FP8_GPU_RESERVE_GB overrides."""
+    return int(float(os.environ.get("FREETOKEN_FP8_GPU_RESERVE_GB", "24")) * (1 << 30))
 
 
 def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:

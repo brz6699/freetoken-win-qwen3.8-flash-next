@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_scheme
+from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_size
 from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
 FP8 = torch.float8_e4m3fn
@@ -22,10 +22,10 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     cpu_format = "fp8_block"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
-        if cfg.scheme is not None and fp8_block_scheme(cfg.scheme) != BLOCK:
+        if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
             return f"fp8 block MoE kernel serves {BLOCK}x{BLOCK} expert blocks only"
         reason = gated_epilogue_reason(cfg)
         if reason:
@@ -67,3 +67,9 @@ class TritonFp8BlockMoEKernel(MoEKernel):
 @register_method(QuantKind.FP8_BLOCK, LayerKind.MOE)
 class Fp8BlockMoEMethod(MoEMethod):
     candidates = (TritonFp8BlockMoEKernel,)
+
+    def create_weights(self, layer) -> None:
+        raise NotImplementedError("fp8 block experts are served from the offload cache, not resident")
+
+    def resident_view(self, layer) -> ExpertView:
+        raise NotImplementedError("fp8 block experts are not resident")

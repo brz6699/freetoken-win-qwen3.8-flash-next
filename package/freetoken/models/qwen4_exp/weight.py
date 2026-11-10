@@ -407,33 +407,74 @@ def nvfp4_expert_spec(model_path: str, config):
 # ======================================================================================
 
 _MTP_EXPERT_SUFFIXES = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+# The official block-fp8 release stores the head's experts per-expert: e4m3 weight + 128x128 block scale per projection
+_MTP_EXPERT_KEY_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale_inv)$"
+)
+
+
+def _stack_mtp_experts(parts: dict[tuple[int, str, str], torch.Tensor], bank) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert e4m3 weights with 128x128 block scales -> bf16 ``[E, 2I, H]`` gate_up (gate|up rows) and ``[E, H, I]`` down."""
+    e, i, h = bank.num_experts, bank.moe_inter, bank.hidden
+    gate_up = torch.empty(e, 2 * i, h, dtype=bank.dtype)
+    down = torch.empty(e, h, i, dtype=bank.dtype)
+    for ex in range(e):
+        for proj, rows, cols, out in (
+            ("gate_proj", i, h, gate_up[ex, :i]),
+            ("up_proj", i, h, gate_up[ex, i:]),
+            ("down_proj", h, i, down[ex]),
+        ):
+            w = parts[(ex, proj, "weight")]
+            s = parts[(ex, proj, "weight_scale_inv")]
+            if w.shape != (rows, cols) or s.shape != (rows // 128, cols // 128):
+                raise ValueError(
+                    f"MTP expert {ex} {proj}: weight {tuple(w.shape)} scale {tuple(s.shape)},"
+                    f" expected {(rows, cols)} / {(rows // 128, cols // 128)}"
+                )
+            deq = w.to(torch.float32) * s.to(torch.float32).repeat_interleave(128, 0).repeat_interleave(128, 1)
+            out.copy_(deq.to(bank.dtype))
+    return gate_up, down
 
 
 def load_mtp_experts(
     model_path: str, bank, device: torch.device | None = None, quant: str = "none"
 ) -> int:
-    """Fill the MTP head's stacked bf16 routed experts into its ``MtpExpertBank``.
+    """Fill the MTP head's routed experts into its ``MtpExpertBank``.
 
-    The checkpoint stores the head's routed experts as two stacked tensors
-    (``mtp.layers.0.mlp.experts.gate_up_proj`` ``[E, 2I, H]`` and ``.down_proj``
-    ``[E, H, I]``, bf16 -- not the NVFP4 per-expert packing of the main model). With
+    The checkpoint stores the head's routed experts as either two stacked bf16 tensors
+    (``mtp.layers.0.mlp.experts.gate_up_proj`` ``[E, 2I, H]`` and ``.down_proj`` ``[E, H, I]``,
+    the NVFP4 release) or per-expert e4m3 ``{gate,up,down}_proj.weight`` with 128x128
+    ``weight_scale_inv`` (the official block-fp8 release, dequantized to bf16 here). With
     ``device`` the bank stays GPU-resident (drafts pay zero PCIe, the engine prices
     ``bank.gpu_bytes`` into its GPU budget); on OOM or without a device it lives in pinned
     host RAM. Returns the pinned host bytes the engine reserves from its pin budget
     (0 when the bank went GPU-resident)."""
     folder = download_hf_weight(model_path)
-    found: dict[str, torch.Tensor] = {}
+    stacked: dict[str, torch.Tensor] = {}
+    per_expert: dict[tuple[int, str, str], torch.Tensor] = {}
     for path in iter_weight_files(folder):
         with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():
-                if not key.startswith("mtp.") or not key.endswith(_MTP_EXPERT_SUFFIXES):
+                if not key.startswith("mtp."):
                     continue
-                found[key.rsplit(".", 1)[-1]] = f.get_tensor(key)
-        if len(found) == len(_MTP_EXPERT_SUFFIXES):
+                if key.endswith(_MTP_EXPERT_SUFFIXES):
+                    stacked[key.rsplit(".", 1)[-1]] = f.get_tensor(key)
+                    continue
+                m = _MTP_EXPERT_KEY_RE.match(key)
+                if m is not None:
+                    per_expert[(int(m["expert"]), m["proj"], m["kind"])] = f.get_tensor(key)
+        if len(stacked) == len(_MTP_EXPERT_SUFFIXES) or len(per_expert) == bank.num_experts * 6:
             break
-    if len(found) != len(_MTP_EXPERT_SUFFIXES):
-        raise ValueError(f"MTP expert bank needs both stacked tensors, found {sorted(found)}")
-    bank.load(found["gate_up_proj"], found["down_proj"], device=device, quant=quant)
+    if len(stacked) == len(_MTP_EXPERT_SUFFIXES):
+        gate_up, down = stacked["gate_up_proj"], stacked["down_proj"]
+    elif len(per_expert) == bank.num_experts * 6:
+        gate_up, down = _stack_mtp_experts(per_expert, bank)
+    else:
+        raise ValueError(
+            "MTP expert bank needs the stacked gate_up_proj/down_proj tensors or the per-expert"
+            f" fp8 weight+scale keys, found {len(stacked)} stacked / {len(per_expert)} per-expert"
+        )
+    bank.load(gate_up, down, device=device, quant=quant)
     nbytes = bank.stored_bytes
     logger.info_rank0(
         f"MTP expert bank: {nbytes / (1 << 30):.2f} GiB ({quant} storage),"
