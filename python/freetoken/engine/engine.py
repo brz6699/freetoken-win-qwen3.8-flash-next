@@ -456,6 +456,14 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+            if self._host_tables_bytes:
+                # The table's shard read left tens of GiB of file cache in this process's
+                # working set; demote it before the bank fill so the fill's own serial
+                # reads start from a clean available-RAM baseline (see expert_banks fill trim).
+                from freetoken.moe.expert_banks import trim_process_working_set
+
+                if trim_process_working_set():
+                    logger.info_rank0("engine: flushed working set after host-table load")
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -1070,6 +1078,12 @@ class Engine:
                     )
             except PinFailed as exc:
                 raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+            # PR #602: charge GPU-resident FP8 source-bank bytes to the expert/KV accounting so the
+            # caches sized afterwards do not over-allocate against VRAM already held by sources.
+            resident_bytes = sum(t.nbytes for per_layer in banks.sources.values() for t in per_layer if t.is_cuda)
+            if resident_bytes:
+                self._weights_bytes += resident_bytes
+                self._post_weights_free -= resident_bytes
             from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
             self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)

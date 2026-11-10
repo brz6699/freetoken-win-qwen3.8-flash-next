@@ -37,6 +37,19 @@ def _decode_fp8_moe_kernel(
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
 ):
+    """Deferred-K-reduction decode GEMV, ported from ``_decode_nvfp4_marlin_kernel``.
+
+    The kernel this replaces ran a cross-lane ``tl.sum`` EVERY K-iter, so weight loads of
+    successive iters could not pipeline. Here the scaled products accumulate into a
+    [BLOCK_N, BLOCK_K] fp32 partial every iter (elementwise FMA only; the per-128-block row
+    scale folds in as ``a * sc``) and the whole K reduction happens ONCE after the loop.
+    The scale is constant inside a scale block (BLOCK_K == 128), so folding it in per
+    element is exact by construction: out = sum_k w[n,k] * a[k] * s[n, k//128].
+    Needs ``BLOCK_N >= 32`` to pay off: at BLOCK_N=16 the wide fp32 partial costs more than
+    the pipelining buys (down GEMM ~12% slower than the legacy kernel at the same tile).
+    Measured on the 5090 at production dims with CUDA-graph replay + profiler device time,
+    against pre-port production (legacy kernel, BLOCK_N=16): -4% per layer-token at M=1,
+    -5 to -8% at M=4."""
     route_id = tl.program_id(0)
     n_block = tl.program_id(1)
     token_id = route_id // TOP_K
@@ -51,7 +64,7 @@ def _decode_fp8_moe_kernel(
     w_slot = w_ptr + slot * stride_we
     s_slot = s_ptr + slot * stride_se
 
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    partial = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     for kb in range(tl.cdiv(K, BLOCK_K)):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
@@ -67,7 +80,9 @@ def _decode_fp8_moe_kernel(
             ))
         sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(tl.float32)
         a = tl.load(a_base + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
-        acc += tl.sum(w * a[None, :], axis=1) * sc
+        partial += w * (a[None, :] * sc[:, None])
+
+    acc = tl.sum(partial, axis=1)
 
     if MUL_ROUTED_WEIGHT:
         acc *= tl.load(topk_weights_ptr + token_id * stride_twm + route_k * stride_twk)
@@ -75,14 +90,26 @@ def _decode_fp8_moe_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 
+# Fixed config (decode is CUDA-graph captured: no autotune). Only CUDA-graph-replay and
+# profiler-device-time numbers are trustworthy here; the first sweep looked flat because it
+# measured Triton's ~13-24 us Python launch cost instead of kernel time.
+# BLOCK_N=32 vs 16 == pre-port production: total per layer-token -4% at M=1, -5..-8% at M=4.
+# At M=1 the gain is carried by the down GEMM (gate_up alone still prefers 16 by ~1%), and most
+# of it comes from the wider tile rather than the deferred reduction -- legacy-BN32 already
+# captures ~4.3% of the 5.1%. The split between the two effects is not stable across runs; the
+# total is. num_stages left at default: stages=2 made no measurable difference at BN=32.
+_DECODE_BLOCK_N = 32
+_DECODE_WARPS = 4
+
+
 def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is_route):
     M, top_k = topk_ids.shape
     N = w.shape[1]
     total_routes = M * top_k
     w = e4m3_kernel_view(w)
-    # bs=1 has few routes -> small BLOCK_N raises program count for SM occupancy.
-    BLOCK_N = 16
-    grid = (total_routes, triton.cdiv(N, BLOCK_N))
+    # grid rows = routes * N/BLOCK_N; at bs=1 that is ~800 programs at BLOCK_N=32, which still
+    # fills the 5090's SMs, and the wider tile amortizes the [BLOCK_N, BLOCK_K] fp32 partial.
+    grid = (total_routes, triton.cdiv(N, _DECODE_BLOCK_N))
     _decode_fp8_moe_kernel[grid](
         a, w, s, c, topk_weights, topk_ids, total_routes, N, w.shape[2],
         a.stride(0), a.stride(1),
@@ -90,9 +117,10 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
         s.stride(0), s.stride(1), s.stride(2),
         c.stride(0), c.stride(1), c.stride(2),
         topk_weights.stride(0), topk_weights.stride(1), topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=128, TOP_K=top_k,
+        BLOCK_N=_DECODE_BLOCK_N, BLOCK_K=128, TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), num_warps=4,
+        compute_type=_TL.get(c.dtype, tl.bfloat16),
+        num_warps=_DECODE_WARPS,
     )
 
 
@@ -100,8 +128,9 @@ def fused_experts_decode_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, activation="silu", act_alpha=1.0, act_limit=float("inf"),
 ) -> torch.Tensor:
-    """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
-    banks (resident: expert id; offload: cache slot)."""
+    """Decode-step inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert banks
+    (resident: expert id; offload: cache slot). Selected by ``is_prefill``, NOT by M==1: a
+    batched decode step reaches here with M up to max_running_req, so tune at M>1 too."""
     from freetoken.kernel import moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
 
