@@ -12,6 +12,10 @@ from .scheme import QuantKind
 
 logger = init_logger(__name__)
 
+# select_kernel runs once per module and every same-shape layer makes the same choice, so the
+# same line would print dozens of times at load; remember which selections were already logged.
+_logged_selections: set[str] = set()
+
 
 class KernelSelectionError(RuntimeError):
     pass
@@ -38,7 +42,10 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
             continue
         if kernel.worth_it(cfg):
             if skipped:
-                logger.info("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
+                msg = f"kernel {kernel.name} selected; skipped {'; '.join(skipped)}"
+                if msg not in _logged_selections:
+                    _logged_selections.add(msg)
+                    logger.info("%s", msg)
             return kernel
         if fallback is None:
             fallback = kernel
