@@ -220,6 +220,9 @@ def convert_anthropic_prompt(
             elif block.type == "image":
                 content_parts.append(_image_part(block.source))
                 continue
+            elif block.type == "video":
+                content_parts.append(_video_part(block.source))
+                continue
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -348,6 +351,19 @@ def _image_part(source: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError(f"unsupported image source type: {stype!r}")
     return {
         "type": "image",
+        "freetoken_ref": {"kind": "b64" if stype == "base64" else "url", "data": data},
+    }
+
+
+def _video_part(source: dict[str, Any] | None) -> dict[str, Any]:
+    src = source or {}
+    stype = src.get("type")
+    data = src.get("data") if stype == "base64" else src.get("url")
+    if not data:
+        # an unsupported video source must fail the request, not degrade to a text-only answer
+        raise ValueError(f"unsupported video source type: {stype!r}")
+    return {
+        "type": "video",
         "freetoken_ref": {"kind": "b64" if stype == "base64" else "url", "data": data},
     }
 

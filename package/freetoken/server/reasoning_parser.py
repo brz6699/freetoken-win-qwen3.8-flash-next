@@ -403,12 +403,36 @@ class ThinkReasoningParser(BaseReasoningParser):
     ``tool_start_token`` (as ``DeepSeekV32ReasoningParser`` does) if that surfaces.
     """
 
-    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+    def __init__(
+        self,
+        force_reasoning: bool = False,
+        stream_reasoning: bool = True,
+        *,
+        tool_start_token: Optional[str] = None,
+    ) -> None:
         super().__init__(
             think_start_token=THINK_START_TOKEN,
             think_end_token=THINK_END_TOKEN,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token=tool_start_token,
+        )
+
+
+class Qwen3ReasoningParser(ThinkReasoningParser):
+    """Qwen3 reasoning with recovery for an omitted </think> before XML tools.
+
+    Qwen's chat template starts generation inside <|im_start|> and asks for
+    <tool_call> XML. Models occasionally transition directly to that block.
+    Preserve the block for the Qwen tool-call parser, which still decides whether
+    it is a valid structured call.
+    """
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
         )
 
 
@@ -876,7 +900,7 @@ class ReasoningParser:
     ReasoningParserEnum: Dict[str, Type[BaseReasoningParser]] = {
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
-        "qwen3": ThinkReasoningParser,
+        "qwen3": Qwen3ReasoningParser,
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,

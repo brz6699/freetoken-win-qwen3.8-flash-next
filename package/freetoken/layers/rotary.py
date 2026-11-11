@@ -91,8 +91,12 @@ def _mrope_torch(
     for t, heads in ((query, query.shape[1] // head_size), (key, key.shape[1] // head_size)):
         v = t.view(nnz, heads, head_size)
         lo, hi = v[..., :half].float(), v[..., half:rotary_dim].float()
-        v[..., :half] = (lo * cos - hi * sin).to(v.dtype)
-        v[..., half:rotary_dim] = (hi * cos + lo * sin).to(v.dtype)
+        # Compute both halves before writing: float() aliases FP32 inputs.
+        lo_new = lo * cos - hi * sin
+        hi_new = hi * cos + lo * sin
+        v[..., :half] = lo_new.to(v.dtype)
+        v[..., half:rotary_dim] = hi_new.to(v.dtype)
+        # [SPOT-CHECK] marker: confirm #641 write-back site
 
 
 MROPE_LAYOUTS = ("contiguous", "interleaved", "interleaved_glm")
@@ -335,7 +339,10 @@ def get_rope(
     def build() -> RotaryEmbedding:
         table = rope_cos_sin_table(head_dim, rotary_dim, max_position, base, rope_scaling)
         if mrope_section is not None:
-            assert rope_map is None or rope_map.get("rope_type", "default") == "default"
+            # mrope consumes the table generically (section_table picks the axis row per slot),
+            # so a YaRN-scaled table is fine; proportional is still rejected below by the
+            # rotary_dim-wide-table assert.
+            assert rope_map is None or rope_map.get("rope_type", "default") in ("default", "yarn")
             return MRotaryEmbedding(
                 head_dim, rotary_dim, table,
                 is_neox=is_neox, mrope_section=tuple(mrope_section),

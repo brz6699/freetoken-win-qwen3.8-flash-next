@@ -139,6 +139,10 @@ class MoEKernel(ABC):
     # Minimum row-byte alignment the kernel's tile load requires; arena/peb arithmetic
     # ROUND_UPs to this so every gcd-lattice landing satisfies the READ contract.
     row_align_bytes: ClassVar[int] = 16
+    # Whether ``apply`` treats a slot of -1 as an inactive route (zero output, no read of any slot).
+    # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
+    # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
+    supports_inactive_slots: ClassVar[bool] = False
 
     @classmethod
     def align_of(cls, kernels: "Any") -> int:

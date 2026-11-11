@@ -33,11 +33,11 @@ class GraphCaptureBuffer:
 
     @classmethod
     def init(
-        cls, bs: int, vocab_size: int, device: torch.device, mrope: bool = False
+        cls, bs: int, vocab_size: int, device: torch.device, dummy_loc: int, mrope: bool = False
     ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
+            out_loc=torch.full((bs,), dummy_loc, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
             mrope_positions=(
                 torch.zeros(3, bs, dtype=torch.int32, device=device) if mrope else None
@@ -161,8 +161,12 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
+        # capture runs the forward eagerly and stores K/V, so aim out_loc at the dummy page as
+        # replay does for padded rows; slot 0 is a real page (#877). The dummy row's page_table is
+        # pre-filled with the dummy page location (engine.py), so column 0 reads it back.
+        dummy_loc = int(get_global_ctx().page_table[self.dummy_req.table_idx, 0])
         self.buffer = GraphCaptureBuffer.init(
-            self.max_graph_bs, vocab_size, self.device, mrope=self.mrope
+            self.max_graph_bs, vocab_size, self.device, dummy_loc, mrope=self.mrope
         )
         self._reset_moe_offload_cache()
 

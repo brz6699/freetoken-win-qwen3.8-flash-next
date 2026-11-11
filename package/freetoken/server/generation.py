@@ -128,6 +128,15 @@ GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | T
 
 
 @dataclass
+class GenUsage:
+    """Token counts of a streaming generation so far. generate_events() updates it from each engine reply before it yields that reply's events."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+
+
+@dataclass
 class GenResult:
     reasoning: str
     content: str
@@ -544,7 +553,7 @@ def _record_generation(
 
 
 async def generate_events(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, usage: GenUsage | None = None
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
@@ -555,7 +564,9 @@ async def generate_events(
     first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(
+            uid, spec, state, usage if usage is not None else GenUsage()
+        ):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
@@ -596,7 +607,9 @@ async def generate_full(
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, usage: GenUsage
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -608,9 +621,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     carry the output ordinal (0, 1, ...) in tool_index. Formats whose detector
     cannot parse incrementally (supports_streaming=False) keep the previous
     buffer-everything-then-parse-at-the-end behavior."""
-    prompt_tokens = 0
-    completion_tokens = 0
-    cached_tokens = 0
     raw_output = ""
     pending = ""
     parse_tools = spec.parse_tools
@@ -704,9 +714,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
-        prompt_tokens += ack.prompt_tokens_delta
-        completion_tokens += ack.completion_tokens_delta
-        cached_tokens += ack.cached_tokens
+        usage.prompt_tokens += ack.prompt_tokens_delta
+        usage.completion_tokens += ack.completion_tokens_delta
+        usage.cached_tokens += ack.cached_tokens
         content_delta = ack.incremental_output
         raw_output += content_delta
         if reasoning_parser is not None and content_delta:
@@ -791,13 +801,13 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         raw_log.record_generation(
             uid, stream=True, raw=raw_output,
             finish_reason=finish_reason,
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens, matched_stop=engine_matched_stop,
+            prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
+            cached_tokens=usage.cached_tokens, matched_stop=engine_matched_stop,
             sampling=getattr(spec, "sampling_params", None),
         )
     yield GenDone(
-        finish_reason, prompt_tokens, completion_tokens,
-        matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        finish_reason, usage.prompt_tokens, usage.completion_tokens,
+        matched_stop=engine_matched_stop, cached_tokens=usage.cached_tokens,
     )
 
 

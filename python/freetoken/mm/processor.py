@@ -64,6 +64,21 @@ def _find_all(ids: list[int], target: list[int]) -> list[int]:
     return found
 
 
+def _split_patterns(placeholder: list[int] | list[list[int]]) -> list[list[int]]:
+    """Normalize a placeholder into equal-length token patterns to match: one image pad, or separate image/video pads."""
+    if placeholder and isinstance(placeholder[0], list):
+        return placeholder  # type: ignore[return-value]
+    return [placeholder]  # type: ignore[list-item]
+
+
+def _find_any(ids: list[int], patterns: list[list[int]]) -> list[int]:
+    """Start index of every non-overlapping occurrence of any pattern, merged and in prompt order."""
+    found: list[int] = []
+    for pat in patterns:
+        found.extend(_find_all(ids, pat))
+    return sorted(found)
+
+
 class MMProcessor(ABC):
     """How a checkpoint's images become items, tokens and positions; apply is the family-agnostic driver, subclasses fill the hooks.
 
@@ -71,8 +86,9 @@ class MMProcessor(ABC):
     Image preprocessing must stay on the CPU with one fixed implementation: radix keys and the embedding cache are content hashes of pixel_values, and resize results differ across backends/devices.
     """
 
-    # the token sequence the chat template renders once per image
-    placeholder: list[int]
+    # the token sequence the chat template renders once per media item: a single pad id, or
+    # separate image/video pad ids as a list of equal-length patterns (families that serve video)
+    placeholder: list[int] | list[list[int]]
 
     def __init__(self, model_path: str, mm: MultimodalConfig) -> None:
         self.model_path = model_path
@@ -93,6 +109,12 @@ class MMProcessor(ABC):
         """Keyword arguments for the checkpoint processor call: the family's reading of the mm knobs, then mm.processor_kwargs on top; families with a token budget override this."""
         return dict(mm.processor_kwargs)
 
+    def _decode_part(self, raw: bytes) -> Any:
+        """Decode one fetched media blob into what ``process`` consumes: a single RGB PIL image by default; a family that serves video overrides this to return sampled frames."""
+        from PIL import Image
+
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+
     @abstractmethod
     def process(self, images: list[Any]) -> list[MMItem]:
         """One MMItem per image with feature and hash; offsets are assigned by apply."""
@@ -110,20 +132,19 @@ class MMProcessor(ABC):
         """The smallest encodable item of each modality the family serves, for warming the encoders."""
 
     def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
-        """Swap each image placeholder for its replacement sequence and precompute rope positions."""
-        from PIL import Image
-
+        """Swap each media placeholder for its replacement sequence and precompute rope positions."""
         ids = input_ids.tolist()
-        target = self.placeholder
-        slots = _find_all(ids, target)
+        patterns = _split_patterns(self.placeholder)
+        plen = len(patterns[0])
+        slots = _find_any(ids, patterns) if len(patterns) > 1 else _find_all(ids, patterns[0])
         if len(slots) != len(images):
             raise ValueError(
-                f"prompt renders {len(slots)} image placeholders but the request "
-                f"carries {len(images)} images"
+                f"prompt renders {len(slots)} vision placeholders but the request "
+                f"carries {len(images)} media items"
             )
 
-        pils = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
-        items = self.process(pils)
+        parts = [self._decode_part(raw) for raw in images]
+        items = self.process(parts)
         out: list[int] = []
         cursor = 0
         for slot, item in zip(slots, items):
@@ -138,7 +159,7 @@ class MMProcessor(ABC):
             out.extend(full)
             item.offsets = [[base + lo, base + hi] for lo, hi in spans]
             item.validate()
-            cursor = slot + len(target)
+            cursor = slot + plen
         out.extend(ids[cursor:])
         new_ids = torch.tensor(out, dtype=input_ids.dtype)
 
@@ -147,15 +168,20 @@ class MMProcessor(ABC):
 
 
 def image_positions(
-    length: int, blocks: list[tuple[int, int, int, int]]
+    length: int, blocks: list[tuple[int, ...]]
 ) -> tuple[torch.Tensor, int]:
-    """t/h/w positions: text advances all three rows, an image freezes t and spreads h/w over its grid, then the running position jumps by max(h, w).
+    """t/h/w positions: text advances all three rows together; an image freezes t and spreads h/w over its grid, a video (t>1) advances t by the frame index; then the running position jumps by the block's largest spatial extent (HF's get_rope_index rule), which makes decode positions continue cleanly after the block.
 
-    blocks are (offset, n_tokens, grid_h, grid_w) in prompt order; delta shifts decode positions (sequence index + delta)."""
+    blocks are ``(offset, n_tokens, grid_h, grid_w)`` (a single-frame image, t=1) or ``(offset, n_tokens, t, grid_h, grid_w)`` in prompt order; delta shifts decode positions (sequence index + delta)."""
     pos = torch.empty((3, length), dtype=torch.int32)
     st = 0
     cursor = 0
-    for offset, n_tokens, h_m, w_m in blocks:
+    for block in blocks:
+        if len(block) == 4:
+            offset, n_tokens, h_m, w_m = block
+            t = 1
+        else:
+            offset, n_tokens, t, h_m, w_m = block
         run = offset - cursor
         if run:
             text = torch.arange(st, st + run, dtype=torch.int32)
@@ -163,9 +189,15 @@ def image_positions(
             st += run
             cursor = offset
         idx = torch.arange(n_tokens, dtype=torch.int32)
-        pos[0, cursor : cursor + n_tokens] = st
-        pos[1, cursor : cursor + n_tokens] = st + idx // w_m
-        pos[2, cursor : cursor + n_tokens] = st + idx % w_m
+        if t == 1:
+            pos[0, cursor : cursor + n_tokens] = st
+            pos[1, cursor : cursor + n_tokens] = st + idx // w_m
+            pos[2, cursor : cursor + n_tokens] = st + idx % w_m
+        else:
+            hw = h_m * w_m
+            pos[0, cursor : cursor + n_tokens] = st + idx // hw
+            pos[1, cursor : cursor + n_tokens] = st + (idx % hw) // w_m
+            pos[2, cursor : cursor + n_tokens] = st + idx % w_m
         st += max(h_m, w_m)
         cursor += n_tokens
     run = length - cursor
